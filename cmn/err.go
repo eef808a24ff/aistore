@@ -27,6 +27,7 @@ type (
 	ErrorRemoteBucketDoesNotExist nodeBckPair
 	ErrorCloudBucketOffline       nodeBckPair
 	ErrorBucketDoesNotExist       nodeBckPair
+	ErrorInvalidBucketProvider    nodeBckPair
 	ErrorBucketIsBusy             nodeBckPair
 
 	ErrorCapacityExceeded struct {
@@ -78,7 +79,7 @@ type (
 		ETLErrorContext
 	}
 	ETLErrorContext struct {
-		Tid     string
+		TID     string
 		UUID    string
 		ETLName string
 		PodName string
@@ -89,6 +90,7 @@ type (
 var (
 	ErrSkip           = errors.New("skip")
 	ErrStartupTimeout = errors.New("startup timeout")
+	ErrForwarded      = errors.New("forwarded")
 )
 
 func _errBucket(msg, node string) string {
@@ -140,6 +142,7 @@ func IsUnreachable(err error, status int) bool {
 func NewErrorBucketAlreadyExists(bck Bck, node string) *ErrorBucketAlreadyExists {
 	return &ErrorBucketAlreadyExists{node: node, bck: bck}
 }
+
 func (e *ErrorBucketAlreadyExists) Error() string {
 	return _errBucket(fmt.Sprintf("bucket %s already exists", e.bck), e.node)
 }
@@ -147,8 +150,9 @@ func (e *ErrorBucketAlreadyExists) Error() string {
 func NewErrorRemoteBucketDoesNotExist(bck Bck, node string) *ErrorRemoteBucketDoesNotExist {
 	return &ErrorRemoteBucketDoesNotExist{node: node, bck: bck}
 }
+
 func (e *ErrorRemoteBucketDoesNotExist) Error() string {
-	if e.bck.IsCloud(AnyCloud) {
+	if e.bck.IsCloud() {
 		return _errBucket(fmt.Sprintf("cloud bucket %s does not exist", e.bck), e.node)
 	}
 	return _errBucket(fmt.Sprintf("remote ais bucket %s does not exist", e.bck), e.node)
@@ -157,6 +161,7 @@ func (e *ErrorRemoteBucketDoesNotExist) Error() string {
 func NewErrorCloudBucketOffline(bck Bck, node string) *ErrorCloudBucketOffline {
 	return &ErrorCloudBucketOffline{node: node, bck: bck}
 }
+
 func (e *ErrorCloudBucketOffline) Error() string {
 	return _errBucket(fmt.Sprintf("bucket %s is currently unreachable", e.bck), e.node)
 }
@@ -164,13 +169,23 @@ func (e *ErrorCloudBucketOffline) Error() string {
 func NewErrorBucketDoesNotExist(bck Bck, node string) *ErrorBucketDoesNotExist {
 	return &ErrorBucketDoesNotExist{node: node, bck: bck}
 }
+
 func (e *ErrorBucketDoesNotExist) Error() string {
 	return _errBucket(fmt.Sprintf("bucket %s does not exist", e.bck), e.node)
+}
+
+func NewErrorInvalidBucketProvider(bck Bck, node string) *ErrorInvalidBucketProvider {
+	return &ErrorInvalidBucketProvider{node: node, bck: bck}
+}
+
+func (e *ErrorInvalidBucketProvider) Error() string {
+	return _errBucket(fmt.Sprintf("invalid provider %q of bucket %s", e.bck.Provider, e.bck), e.node)
 }
 
 func NewErrorBucketIsBusy(bck Bck, node string) *ErrorBucketIsBusy {
 	return &ErrorBucketIsBusy{node: node, bck: bck}
 }
+
 func (e *ErrorBucketIsBusy) Error() string {
 	return _errBucket(fmt.Sprintf("bucket %s is currently busy, please retry later", e.bck), e.node)
 }
@@ -200,6 +215,7 @@ func (e *ErrorCapacityExceeded) Error() string {
 func (e InvalidCksumError) Error() string {
 	return fmt.Sprintf("checksum: expected [%s], actual [%s]", e.expectedHash, e.actualHash)
 }
+
 func NewInvalidCksumError(eHash, aHash string) InvalidCksumError {
 	return InvalidCksumError{actualHash: aHash, expectedHash: eHash}
 }
@@ -211,6 +227,7 @@ func NewNoMountpathError(mpath string) NoMountpathError { return NoMountpathErro
 func (e InvalidMountpathError) Error() string {
 	return "invalid mountpath [" + e.mpath + "]; " + e.cause
 }
+
 func NewInvalidaMountpathError(mpath, cause string) InvalidMountpathError {
 	return InvalidMountpathError{mpath: mpath, cause: cause}
 }
@@ -279,10 +296,9 @@ func NewETLError(ctx *ETLErrorContext, format string, a ...interface{}) *ETLErro
 }
 
 func (e *ETLError) Error() string {
-	var s []string
-
-	if e.Tid != "" {
-		s = append(s, fmt.Sprintf("t[%s]", e.Tid))
+	s := make([]string, 0, 3)
+	if e.TID != "" {
+		s = append(s, fmt.Sprintf("t[%s]", e.TID))
 	}
 	if e.UUID != "" {
 		s = append(s, fmt.Sprintf("uuid=%q", e.UUID))
@@ -294,7 +310,7 @@ func (e *ETLError) Error() string {
 		s = append(s, fmt.Sprintf("pod=%q", e.PodName))
 	}
 	if e.SvcName != "" {
-		s = append(s, fmt.Sprintf("svc=%q", e.SvcName))
+		s = append(s, fmt.Sprintf("service=%q", e.SvcName))
 	}
 
 	return fmt.Sprintf("[%s] %s", strings.Join(s, ","), e.Reason)
@@ -309,7 +325,7 @@ func (e *ETLError) withUUID(uuid string) *ETLError {
 
 func (e *ETLError) withTarget(tid string) *ETLError {
 	if tid != "" {
-		e.Tid = tid
+		e.TID = tid
 	}
 	return e
 }
@@ -339,7 +355,12 @@ func (e *ETLError) WithContext(ctx *ETLErrorContext) *ETLError {
 	if ctx == nil {
 		return e
 	}
-	return e.withUUID(ctx.UUID).withTarget(ctx.Tid).WithPodName(ctx.PodName).withETLName(ctx.ETLName).withSvcName(ctx.SvcName)
+	return e.
+		withTarget(ctx.TID).
+		withUUID(ctx.UUID).
+		WithPodName(ctx.PodName).
+		withETLName(ctx.ETLName).
+		withSvcName(ctx.SvcName)
 }
 
 ////////////////////////////
@@ -371,6 +392,12 @@ func IsErrObjNought(err error) bool {
 	return false
 }
 
-func IsObjNotExist(err error) bool    { return os.IsNotExist(err) }
+func IsObjNotExist(err error) bool {
+	if os.IsNotExist(err) {
+		return true
+	}
+	_, ok := err.(*NotFoundError)
+	return ok
+}
 func IsErrBucketLevel(err error) bool { return IsErrBucketNought(err) }
 func IsErrObjLevel(err error) bool    { return IsErrObjNought(err) }

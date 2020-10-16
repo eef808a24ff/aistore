@@ -9,24 +9,32 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"text/tabwriter"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmd/cli/templates"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/xaction"
 	"github.com/urfave/cli"
 )
 
 type (
 	daemonTemplateStats struct {
 		DaemonID string
-		Stats    []*cmn.BaseXactStatsExt
+		Stats    []*xaction.BaseXactStatsExt
 	}
 
 	xactionTemplateCtx struct {
 		Stats   *[]daemonTemplateStats
 		Verbose bool
+	}
+
+	targetMpath struct {
+		DaemonID string
+		Avail    []string
+		Disabled []string
 	}
 )
 
@@ -70,7 +78,7 @@ var (
 		},
 		subcmdShowXaction: {
 			jsonFlag,
-			allItemsFlag,
+			allXactionsFlag,
 			activeFlag,
 			verboseFlag,
 		},
@@ -86,6 +94,9 @@ var (
 		},
 		subcmdShowRemoteAIS: {
 			noHeaderFlag,
+		},
+		subcmdShowMpath: {
+			jsonFlag,
 		},
 	}
 
@@ -204,19 +215,31 @@ var (
 					Action:       showRemoteAISHandler,
 					BashComplete: daemonCompletions(completeTargets),
 				},
+				{
+					Name:         subcmdShowMpath,
+					Usage:        "show mountpath list for targets",
+					ArgsUsage:    optionalTargetIDArgument,
+					Flags:        showCmdsFlags[subcmdShowMpath],
+					Action:       showMpathHandler,
+					BashComplete: daemonCompletions(completeTargets),
+				},
 			},
 		},
 	}
 )
 
 func showBucketHandler(c *cli.Context) (err error) {
-	bck, objName, err := parseBckObjectURI(c.Args().First(), true /*query*/)
-	if err != nil {
+	var (
+		bck     cmn.Bck
+		objPath = c.Args().First()
+	)
+
+	if isWebURL(objPath) {
+		bck = parseURLtoBck(objPath)
+	} else if bck, err = parseBckURI(c, objPath, true); err != nil {
 		return
 	}
-	if objName != "" {
-		return objectNameArgumentNotSupported(c, objName)
-	}
+
 	var props *cmn.BucketProps
 	if bck, props, err = validateBucket(c, bck, "", true); err != nil {
 		return
@@ -303,7 +326,7 @@ func showXactionHandler(c *cli.Context) (err error) {
 		return err
 	}
 	var xactStats api.NodesXactMultiStats
-	latest := !flagIsSet(c, allItemsFlag)
+	latest := !flagIsSet(c, allXactionsFlag)
 	if xactID != "" {
 		latest = false
 	}
@@ -368,14 +391,12 @@ func showXactionHandler(c *cli.Context) (err error) {
 }
 
 func showObjectHandler(c *cli.Context) (err error) {
-	var (
-		fullObjName = c.Args().Get(0) // empty string if no arg given
-	)
+	fullObjName := c.Args().Get(0) // empty string if no arg given
 
 	if c.NArg() < 1 {
 		return missingArgumentsError(c, "object name in format bucket/object")
 	}
-	bck, object, err := parseBckObjectURI(fullObjName)
+	bck, object, err := parseBckObjectURI(c, fullObjName)
 	if err != nil {
 		return
 	}
@@ -446,4 +467,55 @@ func showRemoteAISHandler(c *cli.Context) (err error) {
 	}
 	tw.Flush()
 	return
+}
+
+func showMpathHandler(c *cli.Context) (err error) {
+	daemonID := c.Args().First()
+	smap, err := api.GetClusterMap(defaultAPIParams)
+	if err != nil {
+		return err
+	}
+	var nodes []*cluster.Snode
+	if daemonID != "" {
+		tgt := smap.GetTarget(daemonID)
+		if tgt == nil {
+			return fmt.Errorf("target ID %q invalid - no such target", daemonID)
+		}
+		nodes = []*cluster.Snode{tgt}
+	} else {
+		nodes = make([]*cluster.Snode, 0, len(smap.Tmap))
+		for _, tgt := range smap.Tmap {
+			nodes = append(nodes, tgt)
+		}
+	}
+	wg := &sync.WaitGroup{}
+	mpCh := make(chan *targetMpath, len(nodes))
+	erCh := make(chan error, len(nodes))
+	for _, node := range nodes {
+		wg.Add(1)
+		go func(node *cluster.Snode) {
+			defer wg.Done()
+			mpl, err := api.GetMountpaths(defaultAPIParams, node)
+			if err != nil {
+				erCh <- err
+			} else {
+				mpCh <- &targetMpath{DaemonID: node.ID(), Avail: mpl.Available, Disabled: mpl.Disabled}
+			}
+		}(node)
+	}
+	wg.Wait()
+	close(erCh)
+	close(mpCh)
+	for err := range erCh {
+		return err
+	}
+	mpls := make([]*targetMpath, 0, len(nodes))
+	for mp := range mpCh {
+		mpls = append(mpls, mp)
+	}
+	sort.Slice(mpls, func(i, j int) bool {
+		return mpls[i].DaemonID < mpls[j].DaemonID // ascending by node id/name
+	})
+	useJSON := flagIsSet(c, jsonFlag)
+	return templates.DisplayOutput(mpls, c.App.Writer, templates.TargetMpathListTmpl, useJSON)
 }

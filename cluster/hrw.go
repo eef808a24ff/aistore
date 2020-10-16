@@ -7,7 +7,6 @@ package cluster
 import (
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/fs"
@@ -37,18 +36,25 @@ func (e *NoNodesError) Error() string {
 	return fmt.Sprintf("no available targets, %s%s", e.smap.StringEx(), skip)
 }
 
-// Requires elements of smap.Tmap to have their idDigest initialized
-func HrwTarget(uname string, smap *Smap) (si *Snode, err error) {
+// Returns the target with highest HRW that is "available"(e.g, is not under maintenance).
+func HrwTarget(uname string, smap *Smap, inMaintenance ...bool) (si *Snode, err error) {
 	var (
-		max    uint64
-		digest = xxhash.ChecksumString64S(uname, cmn.MLCG32)
+		max             uint64
+		digest          = xxhash.ChecksumString64S(uname, cmn.MLCG32)
+		skipMaintenance = true
 	)
-	for _, sinfo := range smap.Tmap {
+	if len(inMaintenance) != 0 {
+		skipMaintenance = !inMaintenance[0]
+	}
+	for _, tsi := range smap.Tmap {
 		// Assumes that sinfo.idDigest is initialized
-		cs := xoshiro256.Hash(sinfo.idDigest ^ digest)
+		if skipMaintenance && tsi.InMaintenance() {
+			continue
+		}
+		cs := xoshiro256.Hash(tsi.idDigest ^ digest)
 		if cs >= max {
 			max = cs
-			si = sinfo
+			si = tsi
 		}
 	}
 	if si == nil {
@@ -57,58 +63,87 @@ func HrwTarget(uname string, smap *Smap) (si *Snode, err error) {
 	return
 }
 
+// Utility struct to generate a list of N first Snodes sorted by their weight
+type hrwList struct {
+	hs  []uint64
+	sis Nodes
+	n   int
+}
+
+func newHrwList(count int) *hrwList {
+	return &hrwList{hs: make([]uint64, 0, count), sis: make(Nodes, 0, count), n: count}
+}
+
+// Adds Snode with `weight`. The result is sorted on the fly with insertion sort
+// and it makes sure that the length of resulting list never exceeds `count`
+func (hl *hrwList) add(weight uint64, sinfo *Snode) {
+	l := len(hl.sis)
+	if l == hl.n && weight <= hl.hs[l-1] {
+		return
+	}
+	if l == hl.n {
+		hl.hs[l-1] = weight
+		hl.sis[l-1] = sinfo
+	} else {
+		hl.hs = append(hl.hs, weight)
+		hl.sis = append(hl.sis, sinfo)
+		l++
+	}
+	idx := l - 1
+	for idx > 0 && hl.hs[idx-1] < hl.hs[idx] {
+		hl.hs[idx], hl.hs[idx-1] = hl.hs[idx-1], hl.hs[idx]
+		hl.sis[idx], hl.sis[idx-1] = hl.sis[idx-1], hl.sis[idx]
+		idx--
+	}
+}
+
+func (hl *hrwList) get() Nodes {
+	return hl.sis
+}
+
 // Sorts all targets in a cluster by their respective HRW (weights) in a descending order;
 // returns resulting subset (aka slice) that has the requested length = count.
 // Returns error if the cluster does not have enough targets.
-//
-// TODO: avoid allocating `arr`
+// If count == length of Smap.Tmap, the function returns as many targets as possible.
 func HrwTargetList(uname string, smap *Smap, count int) (sis Nodes, err error) {
 	cnt := smap.CountTargets()
 	if cnt < count {
 		err = fmt.Errorf("insufficient targets: required %d, available %d, %s", count, cnt, smap)
 		return
 	}
-	var (
-		arr = make([]struct {
-			node *Snode
-			hash uint64
-		}, cnt)
-		digest = xxhash.ChecksumString64S(uname, cmn.MLCG32)
-		i      int
-	)
-	sis = make(Nodes, count)
-	for _, sinfo := range smap.Tmap {
-		cs := xoshiro256.Hash(sinfo.idDigest ^ digest)
-		arr[i] = struct {
-			node *Snode
-			hash uint64
-		}{sinfo, cs}
-		i++
+	digest := xxhash.ChecksumString64S(uname, cmn.MLCG32)
+	hlist := newHrwList(count)
+
+	for _, tsi := range smap.Tmap {
+		cs := xoshiro256.Hash(tsi.idDigest ^ digest)
+		if tsi.InMaintenance() {
+			continue
+		}
+		hlist.add(cs, tsi)
 	}
-	sort.Slice(arr, func(i, j int) bool { return arr[i].hash > arr[j].hash })
-	for i := 0; i < count; i++ {
-		sis[i] = arr[i].node
+	sis = hlist.get()
+	if count != cnt && len(sis) < count {
+		err = fmt.Errorf("insufficient targets: required %d, available %d, %s", count, len(sis), smap)
+		return nil, err
 	}
-	return
+	return sis, nil
 }
 
 func HrwProxy(smap *Smap, idToSkip string) (pi *Snode, err error) {
-	var (
-		max     uint64
-		skipped int
-	)
-	for id, sinfo := range smap.Pmap {
-		if id == idToSkip {
-			skipped++
+	var max uint64
+	for pid, psi := range smap.Pmap {
+		if pid == idToSkip {
 			continue
 		}
-		if _, ok := smap.NonElects[id]; ok {
-			skipped++
+		if psi.Flags.IsSet(SnodeNonElectable) {
 			continue
 		}
-		if sinfo.idDigest >= max {
-			max = sinfo.idDigest
-			pi = sinfo
+		if psi.InMaintenance() {
+			continue
+		}
+		if psi.idDigest >= max {
+			max = psi.idDigest
+			pi = psi
 		}
 	}
 	if pi == nil {
@@ -122,8 +157,10 @@ func HrwIC(smap *Smap, uuid string) (pi *Snode, err error) {
 		max    uint64
 		digest = xxhash.ChecksumString64S(uuid, cmn.MLCG32)
 	)
-	for pid := range smap.IC {
-		psi := smap.GetProxy(pid)
+	for _, psi := range smap.Pmap {
+		if psi.InMaintenance() || !psi.IsIC() {
+			continue
+		}
 		cs := xoshiro256.Hash(psi.idDigest ^ digest)
 		if cs >= max {
 			max = cs
@@ -131,7 +168,7 @@ func HrwIC(smap *Smap, uuid string) (pi *Snode, err error) {
 		}
 	}
 	if pi == nil {
-		err = fmt.Errorf("IC is empty %v, %s", smap.IC, smap)
+		err = fmt.Errorf("IC is empty %s: %s", smap, smap.StrIC(nil))
 	}
 	return
 }
@@ -143,12 +180,15 @@ func HrwTargetTask(uuid string, smap *Smap) (si *Snode, err error) {
 		max    uint64
 		digest = xxhash.ChecksumString64S(uuid, cmn.MLCG32)
 	)
-	for _, sinfo := range smap.Tmap {
+	for _, tsi := range smap.Tmap {
+		if tsi.InMaintenance() {
+			continue
+		}
 		// Assumes that sinfo.idDigest is initialized
-		cs := xoshiro256.Hash(sinfo.idDigest ^ digest)
+		cs := xoshiro256.Hash(tsi.idDigest ^ digest)
 		if cs >= max {
 			max = cs
-			si = sinfo
+			si = tsi
 		}
 	}
 	if si == nil {
@@ -175,38 +215,4 @@ func HrwMpath(uname string) (mi *fs.MountpathInfo, digest uint64, err error) {
 		}
 	}
 	return
-}
-
-func HrwIterMatchingObjects(t Target, bck *Bck, template cmn.ParsedTemplate, apply func(lom *LOM) error) error {
-	var (
-		iter   = template.Iter()
-		config = cmn.GCO.Get()
-		smap   = t.GetSowner().Get()
-	)
-
-	for objName, hasNext := iter(); hasNext; objName, hasNext = iter() {
-		lom := &LOM{T: t, ObjName: objName}
-		if err := lom.Init(bck.Bck, config); err != nil {
-			return err
-		}
-		si, err := HrwTarget(lom.Uname(), smap)
-		if err != nil {
-			return err
-		}
-
-		if si.ID() != t.Snode().ID() {
-			continue
-		}
-		if err := lom.Load(); err != nil {
-			if !cmn.IsObjNotExist(err) {
-				return err
-			}
-		}
-
-		if err := apply(lom); err != nil {
-			return err
-		}
-	}
-
-	return nil
 }

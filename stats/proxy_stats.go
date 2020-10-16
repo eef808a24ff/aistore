@@ -12,11 +12,8 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
+	jsoniter "github.com/json-iterator/go"
 )
-
-//
-// NOTE Naming Convention: "*.n" - counter, "*.µs" - latency, "*.size" - size (in bytes)
-//
 
 type (
 	Prunner struct {
@@ -41,7 +38,7 @@ func (r *Prunner) Run() error                  { return r.runcommon(r) }
 func (r *Prunner) Get(name string) (val int64) { return r.Core.get(name) }
 
 // All stats that proxy currently has are CoreStats which are registered at startup
-func (r *Prunner) Init(p cluster.Proxy) *atomic.Bool {
+func (r *Prunner) Init(p cluster.Node) *atomic.Bool {
 	r.Core = &CoreStats{}
 	r.Core.init(24)
 	r.Core.statsTime = cmn.GCO.Get().Periodic.StatsTime
@@ -72,6 +69,7 @@ func (r *Prunner) GetWhatStats() interface{} {
 
 // statslogger interface impl
 func (r *Prunner) log(uptime time.Duration) {
+	jsonCompat := jsoniter.ConfigCompatibleWithStandardLibrary
 	r.Core.UpdateUptime(uptime)
 	if idle := r.Core.copyT(r.ctracker, []string{"kalive", PostCount, Uptime}); !idle {
 		b, _ := jsonCompat.Marshal(r.ctracker)

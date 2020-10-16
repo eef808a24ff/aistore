@@ -35,8 +35,10 @@ import (
 //   bucket that contains the object, etc.
 //
 
-const fmtNestedErr = "nested err: %v"
-const lomInitialVersion = "1"
+const (
+	fmtNestedErr      = "nested err: %v"
+	lomInitialVersion = "1"
+)
 
 type (
 	// NOTE: sizeof(lmeta) = 88 as of 5/26
@@ -70,6 +72,8 @@ type (
 var (
 	lomLocker nameLocker
 	maxLmeta  atomic.Int64
+
+	_ cmn.ObjHeaderMetaProvider = &LOM{}
 )
 
 func InitTarget() {
@@ -112,13 +116,13 @@ func (lom *LOM) Config() *cmn.Config {
 	}
 	return lom.config
 }
-func (lom *LOM) MirrorConf() *cmn.MirrorConf { return &lom.Bprops().Mirror }
-func (lom *LOM) CksumConf() *cmn.CksumConf   { return lom.bck.CksumConf() }
-func (lom *LOM) VerConf() *cmn.VersionConf   { return &lom.Bprops().Versioning }
+func (lom *LOM) MirrorConf() *cmn.MirrorConf  { return &lom.Bprops().Mirror }
+func (lom *LOM) CksumConf() *cmn.CksumConf    { return lom.bck.CksumConf() }
+func (lom *LOM) VersionConf() cmn.VersionConf { return lom.bck.VersionConf() }
 
 func (lom *LOM) CopyMetadata(from *LOM) {
 	lom.md.copies = nil
-	if lom.MirrorConf().Enabled && lom.Bck().Equal(from.Bck(), true /* must have same BID*/) {
+	if lom.isMirror(from) {
 		lom.setCopiesMd(from.FQN, from.ParsedFQN.MpathInfo)
 		for fqn, mpathInfo := range from.GetCopies() {
 			lom.addCopyMd(fqn, mpathInfo)
@@ -144,28 +148,12 @@ func (lom *LOM) CloneCopiesMd() int {
 	return num
 }
 
-func (lom *LOM) PopulateHdr(hdr http.Header) http.Header {
-	if hdr == nil {
-		hdr = make(http.Header, 4)
-	}
-	if lom.Cksum() != nil {
-		if ty, val := lom.Cksum().Get(); ty != cmn.ChecksumNone {
-			hdr.Set(cmn.HeaderObjCksumType, ty)
-			hdr.Set(cmn.HeaderObjCksumVal, val)
-		}
-	}
-	if lom.Version() != "" {
-		hdr.Set(cmn.HeaderObjVersion, lom.Version())
-	}
-	if lom.AtimeUnix() != 0 {
-		hdr.Set(cmn.HeaderObjAtime, cmn.UnixNano2S(lom.AtimeUnix()))
-	}
-	for k, v := range lom.CustomMD() {
-		hdr.Add(cmn.HeaderObjCustomMD, strings.Join([]string{k, v}, "="))
-	}
-	return hdr
+// see also: transport.FromHdrProvider()
+func (lom *LOM) ToHTTPHdr(hdr http.Header) http.Header {
+	return cmn.ToHTTPHdr(lom, hdr)
 }
-func (lom *LOM) ParseHdr(hdr http.Header) {
+
+func (lom *LOM) FromHTTPHdr(hdr http.Header) {
 	// NOTE: We never set the `Cksum` from the header
 	//  (although we send it) - it should be computed.
 
@@ -226,6 +214,8 @@ func (lom *LOM) GetCopies() fs.MPI {
 	return lom.md.copies
 }
 
+// given an existing (on-disk) object, determines whether it is a _copy_
+// (compare with isMirror below)
 func (lom *LOM) IsCopy() bool {
 	if lom.IsHRW() {
 		return false
@@ -234,11 +224,20 @@ func (lom *LOM) IsCopy() bool {
 	return ok
 }
 
+// determines whether the two LOM _structures_ represent objects that must be _copies_ of each other
+// (compare with IsCopy above)
+func (lom *LOM) isMirror(dst *LOM) bool {
+	return lom.MirrorConf().Enabled &&
+		lom.ObjName == dst.ObjName &&
+		lom.Bck().Equal(dst.Bck(), true /* must have same BID*/, true /* same backend */)
+}
+
 func (lom *LOM) setCopiesMd(copyFQN string, mpi *fs.MountpathInfo) {
 	lom.md.copies = make(fs.MPI, 2)
 	lom.md.copies[copyFQN] = mpi
 	lom.md.copies[lom.FQN] = lom.ParsedFQN.MpathInfo
 }
+
 func (lom *LOM) addCopyMd(copyFQN string, mpi *fs.MountpathInfo) {
 	if lom.md.copies == nil {
 		lom.md.copies = make(fs.MPI, 2)
@@ -246,6 +245,7 @@ func (lom *LOM) addCopyMd(copyFQN string, mpi *fs.MountpathInfo) {
 	lom.md.copies[copyFQN] = mpi
 	lom.md.copies[lom.FQN] = lom.ParsedFQN.MpathInfo
 }
+
 func (lom *LOM) delCopyMd(copyFQN string) {
 	delete(lom.md.copies, copyFQN)
 	if len(lom.md.copies) <= 1 {
@@ -323,7 +323,7 @@ func (lom *LOM) DelExtraCopies(fqn ...string) (removed bool, err error) {
 // NOTE: uname for LOM must be already locked.
 func (lom *LOM) syncMetaWithCopies() (err error) {
 	var copyFQN string
-	if !lom.IsHRW() || !lom.HasCopies() { // must have copies and be at the default location
+	if !lom.HasCopies() {
 		return nil
 	}
 	for {
@@ -349,7 +349,7 @@ func (lom *LOM) RestoreObjectFromAny() (exists bool) {
 	}
 
 	availablePaths, _ := fs.Get()
-	buf, slab := lom.T.GetMMSA().Alloc()
+	buf, slab := lom.T.MMSA().Alloc()
 	for path, mpathInfo := range availablePaths {
 		if path == lom.ParsedFQN.MpathInfo.Path {
 			continue
@@ -413,14 +413,14 @@ func (lom *LOM) CopyObject(dstFQN string, buf []byte) (dst *LOM, err error) {
 		}
 		dst.SetCksum(dstCksum.Clone())
 	}
-	if lom.IsHRW() && lom.MirrorConf().Enabled && lom.Bck().Equal(dst.Bck(), true /* must have same BID*/) {
+	if lom.isMirror(dst) {
 		if err = lom.AddCopy(dst.FQN, dst.ParsedFQN.MpathInfo); err != nil {
 			if _, ok := lom.md.copies[dst.FQN]; !ok {
 				if errRemove := os.Remove(dst.FQN); errRemove != nil {
 					glog.Errorf("nested err: %v", errRemove)
 				}
 			}
-			// as lom.syncMetaWithCopies() may have made changes
+			// `lom.syncMetaWithCopies()` may have made changes notwithstanding
 			if errPersist := lom.Persist(); errPersist != nil {
 				glog.Errorf("nested err: %v", errPersist)
 			}
@@ -614,6 +614,7 @@ func (lom *LOM) ComputeCksumIfMissing() (cksum *cmn.Cksum, err error) {
 	cksumHash, err = lom.ComputeCksum()
 	if cksumHash != nil && err == nil {
 		cksum = cksumHash.Clone()
+		lom.SetCksum(cksum)
 	}
 	return
 }
@@ -634,9 +635,9 @@ func (lom *LOM) ComputeCksum(cksumTypes ...string) (cksum *cmn.CksumHash, err er
 	if file, err = os.Open(lom.FQN); err != nil {
 		return
 	}
-	buf, slab := lom.T.GetMMSA().Alloc(lom.Size())
+	buf, slab := lom.T.MMSA().Alloc(lom.Size())
 	_, cksum, err = cmn.CopyAndChecksum(ioutil.Discard, file, buf, cksumType)
-	debug.AssertNoErr(file.Close())
+	cmn.Close(file)
 	slab.Free(buf)
 	if err != nil {
 		return nil, err
@@ -698,7 +699,7 @@ func (lom *LOM) Init(bck cmn.Bck, config ...*cmn.Config) (err error) {
 			return fmt.Errorf("lom-init %s: namespace mismatch (%s != %s)", lom.FQN, bck.Ns, lom.ParsedFQN.Bck.Ns)
 		}
 	}
-	bowner := lom.T.GetBowner()
+	bowner := lom.T.Bowner()
 	lom.bck = NewBckEmbed(bck)
 	if err = lom.bck.Init(bowner, lom.T.Snode()); err != nil {
 		return
@@ -766,7 +767,7 @@ func (lom *LOM) Load(adds ...bool) (err error) {
 func (lom *LOM) checkBucket() error {
 	debug.Assert(lom.loaded) // cannot check bucket without first calling lom.Load()
 	var (
-		bmd             = lom.T.GetBowner().Get()
+		bmd             = lom.T.Bowner().Get()
 		bprops, present = bmd.Get(lom.bck)
 	)
 	if !present { // bucket does not exist
@@ -893,15 +894,13 @@ const (
 	minSize2Evict = cmn.KiB * 256
 )
 
-var (
-	minEvict = int(minSize2Evict / unsafe.Sizeof(lmeta{}))
-)
+var minEvict = int(minSize2Evict / unsafe.Sizeof(lmeta{}))
 
 func lomCacheCleanup(t Target, d time.Duration) (evictedCnt, totalCnt int) {
 	var (
 		caches         = lomCaches()
 		now            = time.Now()
-		bmd            = t.GetBowner().Get()
+		bmd            = t.Bowner().Get()
 		wg             = &sync.WaitGroup{}
 		evicted, total atomic.Uint32
 	)
@@ -1032,6 +1031,7 @@ func (lom *LOM) TryLock(exclusive bool) bool {
 	)
 	return nlc.TryLock(lom.Uname(), exclusive)
 }
+
 func (lom *LOM) Lock(exclusive bool) {
 	var (
 		_, idx = lom.Hkey()
@@ -1039,6 +1039,7 @@ func (lom *LOM) Lock(exclusive bool) {
 	)
 	nlc.Lock(lom.Uname(), exclusive)
 }
+
 func (lom *LOM) DowngradeLock() {
 	var (
 		_, idx = lom.Hkey()
@@ -1046,6 +1047,7 @@ func (lom *LOM) DowngradeLock() {
 	)
 	nlc.DowngradeLock(lom.Uname())
 }
+
 func (lom *LOM) TryUpgradeLock() bool {
 	var (
 		_, idx = lom.Hkey()
@@ -1053,6 +1055,7 @@ func (lom *LOM) TryUpgradeLock() bool {
 	)
 	return nlc.TryUpgradeLock(lom.Uname())
 }
+
 func (lom *LOM) Unlock(exclusive bool) {
 	var (
 		_, idx = lom.Hkey()

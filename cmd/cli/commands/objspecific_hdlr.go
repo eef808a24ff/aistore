@@ -7,6 +7,7 @@ package commands
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/NVIDIA/aistore/cmn"
@@ -24,6 +25,7 @@ var (
 			lengthFlag,
 			checksumFlag,
 			isCachedFlag,
+			forceFlag,
 		},
 		commandPut: append(
 			checksumFlags,
@@ -40,6 +42,7 @@ var (
 		commandPromote: {
 			recursiveFlag,
 			overwriteFlag,
+			keepOrigFlag,
 			targetFlag,
 			verboseFlag,
 		},
@@ -51,6 +54,7 @@ var (
 			offsetFlag,
 			lengthFlag,
 			checksumFlag,
+			forceFlag,
 		},
 	}
 
@@ -61,7 +65,7 @@ var (
 			ArgsUsage:    optionalObjectsArgument,
 			Flags:        objectSpecificCmdsFlags[commandEvict],
 			Action:       evictHandler,
-			BashComplete: bucketCompletions(bckCompletionsOpts{multiple: true, provider: cmn.AnyCloud}),
+			BashComplete: bucketCompletions(bckCompletionsOpts{multiple: true}),
 		},
 		{
 			Name:         commandGet,
@@ -106,12 +110,13 @@ var (
 )
 
 func prefetchHandler(c *cli.Context) (err error) {
-	printDryRunHeader(c)
-
 	var (
-		bck        cmn.Bck
-		objectName string
+		bck     cmn.Bck
+		objName string
+		objPath string
 	)
+
+	printDryRunHeader(c)
 
 	if c.NArg() == 0 {
 		return incorrectUsageMsg(c, "missing bucket name")
@@ -119,18 +124,20 @@ func prefetchHandler(c *cli.Context) (err error) {
 	if c.NArg() > 1 {
 		return incorrectUsageMsg(c, "too many arguments")
 	}
-
-	if bck, objectName, err = parseBckObjectURI(c.Args().First()); err != nil {
+	objPath = c.Args().First()
+	if isWebURL(objPath) {
+		bck = parseURLtoBck(objPath)
+	} else if bck, objName, err = parseBckObjectURI(c, objPath); err != nil {
 		return
 	}
 	if bck.IsAIS() {
-		return fmt.Errorf("prefetch command doesn't support local buckets")
+		return fmt.Errorf("cannot prefetch from ais buckets (the operation applies to Cloud buckets only)")
 	}
 	if bck, _, err = validateBucket(c, bck, "", false); err != nil {
 		return
 	}
-	//FIXME: it can be easily handled
-	if objectName != "" {
+	// FIXME: it can be easily handled
+	if objName != "" {
 		return incorrectUsageMsg(c, "object name not supported, use list flag or range flag")
 	}
 
@@ -141,7 +148,11 @@ func prefetchHandler(c *cli.Context) (err error) {
 	return missingArgumentsError(c, "object list or range")
 }
 
-func evictHandler(c *cli.Context) error {
+func evictHandler(c *cli.Context) (err error) {
+	var (
+		bck     cmn.Bck
+		objName string
+	)
 	printDryRunHeader(c)
 
 	if c.NArg() == 0 {
@@ -150,12 +161,15 @@ func evictHandler(c *cli.Context) error {
 
 	// default bucket or bucket argument given by the user
 	if c.NArg() == 1 {
-		bck, objName, err := parseBckObjectURI(c.Args().First())
-		if err != nil {
-			return err
+		objPath := c.Args().First()
+		if isWebURL(objPath) {
+			bck = parseURLtoBck(objPath)
+		} else if bck, objName, err = parseBckObjectURI(c, objPath); err != nil {
+			return
 		}
+
 		if bck.IsAIS() {
-			return fmt.Errorf("evict command doesn't support local buckets")
+			return fmt.Errorf("cannot evict ais buckets (the operation applies to Cloud buckets only)")
 		}
 
 		if bck, _, err = validateBucket(c, bck, "", false); err != nil {
@@ -188,29 +202,8 @@ func evictHandler(c *cli.Context) error {
 }
 
 func getHandler(c *cli.Context) (err error) {
-	var (
-		bck         cmn.Bck
-		objName     string
-		fullObjName = c.Args().Get(0) // empty string if arg not given
-		outFile     = c.Args().Get(1) // empty string if arg not given
-	)
-	if c.NArg() < 1 {
-		return missingArgumentsError(c, "object name in the form bucket/object", "output file")
-	}
-	if c.NArg() < 2 && !flagIsSet(c, isCachedFlag) {
-		return missingArgumentsError(c, "output file")
-	}
-	bck, objName, err = parseBckObjectURI(fullObjName)
-	if err != nil {
-		return err
-	}
-	if bck, _, err = validateBucket(c, bck, fullObjName, false); err != nil {
-		return
-	}
-	if objName == "" {
-		return incorrectUsageMsg(c, "%q: missing object name", fullObjName)
-	}
-	return getObject(c, bck, objName, outFile, false /*silent*/)
+	outFile := c.Args().Get(1) // empty string if arg not given
+	return getObject(c, outFile, false /*silent*/)
 }
 
 func putHandler(c *cli.Context) (err error) {
@@ -227,7 +220,7 @@ func putHandler(c *cli.Context) (err error) {
 	if c.NArg() < 2 {
 		return missingArgumentsError(c, "object name in the form bucket/[object]")
 	}
-	bck, objName, err = parseBckObjectURI(fullObjName)
+	bck, objName, err = parseBckObjectURI(c, fullObjName)
 	if err != nil {
 		return
 	}
@@ -257,7 +250,7 @@ func concatHandler(c *cli.Context) (err error) {
 		fileNames[i] = c.Args().Get(i)
 	}
 
-	bck, objName, err = parseBckObjectURI(fullObjName)
+	bck, objName, err = parseBckObjectURI(c, fullObjName)
 	if err != nil {
 		return
 	}
@@ -284,8 +277,11 @@ func promoteHandler(c *cli.Context) (err error) {
 	if c.NArg() < 2 {
 		return missingArgumentsError(c, "object name in the form bucket/[object]")
 	}
+	if !filepath.IsAbs(fqn) {
+		return incorrectUsageMsg(c, "promoted source (file or directory) must have an absolute path")
+	}
 
-	bck, objName, err = parseBckObjectURI(fullObjName)
+	bck, objName, err = parseBckObjectURI(c, fullObjName)
 	if err != nil {
 		return
 	}
@@ -296,27 +292,5 @@ func promoteHandler(c *cli.Context) (err error) {
 }
 
 func catHandler(c *cli.Context) (err error) {
-	var (
-		bck         cmn.Bck
-		objName     string
-		fullObjName = c.Args().Get(0) // empty string if arg not given
-	)
-	if c.NArg() < 1 {
-		return missingArgumentsError(c, "object name in the form bucket/object", "output file")
-	}
-	if c.NArg() > 1 {
-		return incorrectUsageError(c, fmt.Errorf("too many arguments"))
-	}
-
-	bck, objName, err = parseBckObjectURI(fullObjName)
-	if err != nil {
-		return
-	}
-	if bck, _, err = validateBucket(c, bck, fullObjName, false /* optional */); err != nil {
-		return
-	}
-	if objName == "" {
-		return incorrectUsageMsg(c, "%q: missing object name", fullObjName)
-	}
-	return getObject(c, bck, objName, fileStdIO, true /*silent*/)
+	return getObject(c, fileStdIO, true /*silent*/)
 }

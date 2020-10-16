@@ -13,8 +13,8 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/dbdriver"
-	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/transport"
 )
 
 type RecvType int
@@ -25,7 +25,13 @@ const (
 	Migrated
 )
 
-type GFNType int
+type (
+	GFNType int
+	GFN     interface {
+		Activate() bool
+		Deactivate()
+	}
+)
 
 const (
 	GFNGlobal GFNType = iota
@@ -36,6 +42,7 @@ type CloudProvider interface {
 	Provider() string
 	MaxPageSize() uint
 	GetObj(ctx context.Context, fqn string, lom *LOM) (err error, errCode int)
+	GetObjReader(ctx context.Context, lom *LOM) (r io.ReadCloser, expectedCksm *cmn.Cksum, err error, errCode int)
 	PutObj(ctx context.Context, r io.Reader, lom *LOM) (version string, err error, errCode int)
 	DeleteObj(ctx context.Context, lom *LOM) (error, int)
 	HeadObj(ctx context.Context, lom *LOM) (objMeta cmn.SimpleKVs, err error, errCode int)
@@ -45,62 +52,93 @@ type CloudProvider interface {
 	ListBuckets(ctx context.Context, query cmn.QueryBcks) (buckets cmn.BucketNames, err error, errCode int)
 }
 
-// a callback called by EC PUT jogger after the object is processed and
-// all its slices/replicas are sent to other targets
+// Callback called by EC PUT jogger after the object is processed and
+// all its slices/replicas are sent to other targets.
 type OnFinishObj = func(lom *LOM, err error)
 
-type GFN interface {
-	Activate() bool
-	Deactivate()
-}
+type (
+	DataMover interface {
+		RegRecv() error
+		SetXact(xact Xact)
+		Open()
+		Close(err error)
+		UnregRecv()
+		Send(obj *transport.Obj, roc cmn.ReadOpenCloser, tsi *Snode) error
+		ACK(hdr transport.ObjHdr, cb transport.ObjSentCB, tsi *Snode) error
+	}
+	PutObjectParams struct {
+		Reader       io.ReadCloser
+		WorkFQN      string
+		RecvType     RecvType
+		Cksum        *cmn.Cksum // Checksum to check.
+		Started      time.Time
+		WithFinalize bool // Determines if we should also finalize the object.
+		SkipEncode   bool // Do not run EC encode after finalizing.
+	}
+	CopyObjectParams struct {
+		BckTo     *Bck
+		ObjNameTo string
+		Buf       []byte
+		DM        DataMover
+		DP        LomReaderProvider // optional
+		DryRun    bool
+	}
+	SendToParams struct {
+		Reader    cmn.ReadOpenCloser
+		BckTo     *Bck
+		ObjNameTo string
+		Tsi       *Snode
+		DM        DataMover
+		Locked    bool
+		HdrMeta   cmn.ObjHeaderMetaProvider
+	}
+	PromoteFileParams struct {
+		SrcFQN    string
+		Bck       *Bck
+		ObjName   string
+		Cksum     *cmn.Cksum
+		Overwrite bool
+		KeepOrig  bool
+		Verbose   bool
+	}
+)
 
-type PutObjectParams struct {
-	LOM          *LOM
-	Reader       io.ReadCloser
-	WorkFQN      string
-	RecvType     RecvType
-	Cksum        *cmn.Cksum // checksum to check
-	Started      time.Time
-	WithFinalize bool // determines if we should also finalize the object
-	SkipEncode   bool // Do not run EC encode after finalizing
-}
-
-type Node interface {
-	Snode() *Snode
-	GetBowner() Bowner
-	GetSowner() Sowner
-	ClusterStarted() bool
-	NodeStarted() bool
-	NodeStartedTime() time.Time
-	Client() *http.Client
-}
-
-// NOTE: For implementations, please refer to ais/tgtifimpl.go and ais/httpcommon.go
+// NOTE: For implementations, please refer to `ais/tgtifimpl.go` and `ais/httpcommon.go`.
 type Target interface {
 	Node
-	FSHC(err error, path string)
-	GetMMSA() *memsys.MMSA
-	GetSmallMMSA() *memsys.MMSA
-	GetFSPRG() fs.PathRunGroup
-	GetDB() dbdriver.Driver
-	Cloud(*Bck) CloudProvider
-	RunLRU(id string, force bool, bcks ...cmn.Bck)
 
-	GetObject(w io.Writer, lom *LOM, started time.Time) error
-	PutObject(params PutObjectParams) error
-	EvictObject(lom *LOM) error
-	CopyObject(lom *LOM, bckTo *Bck, buf []byte, localOnly bool) (bool, error)
-	GetCold(ctx context.Context, lom *LOM, prefetch bool) (error, int)
-	PromoteFile(srcFQN string, bck *Bck, objName string, cksum *cmn.Cksum,
-		overwrite, safe, verbose bool) (lom *LOM, err error)
-	LookupRemoteSingle(lom *LOM, si *Snode) bool
+	// Memory related functions.
+	MMSA() *memsys.MMSA
+	SmallMMSA() *memsys.MMSA
+
+	// Cloud related functions.
+	Cloud(*Bck) CloudProvider
 	CheckCloudVersion(ctx context.Context, lom *LOM) (vchanged bool, err error, errCode int)
 
-	GetGFN(gfnType GFNType) GFN
-	Health(si *Snode, timeout time.Duration, query url.Values) ([]byte, error, int)
-	RebalanceNamespace(si *Snode) ([]byte, int, error)
+	// Object related functions.
+	GetObject(w io.Writer, lom *LOM, started time.Time) error
+	PutObject(lom *LOM, params PutObjectParams) error
+	EvictObject(lom *LOM) error
+	DeleteObject(ctx context.Context, lom *LOM, evict bool) (error, int)
+	CopyObject(lom *LOM, params CopyObjectParams, localOnly bool) (bool, int64, error)
+	GetCold(ctx context.Context, lom *LOM, prefetch bool) (error, int)
+	PromoteFile(params PromoteFileParams) (lom *LOM, err error)
+	LookupRemoteSingle(lom *LOM, si *Snode) bool
+
+	// File-system related functions.
+	FSHC(err error, path string)
+	RunLRU(id string, force bool, bcks ...cmn.Bck)
+
+	// Getting other interfaces.
+	DB() dbdriver.Driver
+	GFN(gfnType GFNType) GFN
+
+	// Other.
 	BMDVersionFixup(r *http.Request, bck cmn.Bck, sleep bool)
-	K8sNodeName() string
+	RebalanceNamespace(si *Snode) ([]byte, int, error)
+	Health(si *Snode, timeout time.Duration, query url.Values) ([]byte, error, int)
+	// TODO: Remove when we are able to access registry directly in other packages (e.g. etl)
+	AbortAllXacts(tys ...string)
 }
 
 type RebManager interface {

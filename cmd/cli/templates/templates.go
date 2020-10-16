@@ -40,14 +40,15 @@ const (
 		SmapHeader +
 		"{{ range $key, $value := .Smap.Tmap }}" + SmapBody + "{{end}}\n" +
 		"Non-Electable:\n" +
-		"{{ range $key, $ := .Smap.NonElects }} ProxyID: {{$key}}\n{{end}}\n" +
+		"{{ range $key, $si := .Smap.Pmap }} " +
+		"{{ if (eq $si.NonElectable true) }} ProxyID: {{$key}}\n{{end}}" +
 		"PrimaryProxy: {{.Smap.Primary.ID}}\t Proxies: {{len .Smap.Pmap}}\t Targets: {{len .Smap.Tmap}}\t Smap Version: {{.Smap.Version}}\n"
 
 	// Proxy Info
 	ProxyInfoHeader = "PROXY\t MEM USED %\t MEM AVAIL\t CPU USED %\t UPTIME\t STATUS\n"
 	ProxyInfoBody   = "{{$value.Snode.ID}}\t {{$value.SysInfo.PctMemUsed | printf `%.2f`}}\t " +
 		"{{FormatBytesUnsigned $value.SysInfo.MemAvail 2}}\t {{$value.SysInfo.PctCPUUsed | printf `%.2f`}}\t " +
-		"{{FormatDur (ExtractStat $value.Stats `up.µs.time`)}}\t " +
+		"{{FormatDur (ExtractStat $value.Stats `up.ns.time`)}}\t " +
 		"{{$value.Status}}\n"
 
 	ProxyInfoBodyTmpl       = "{{ range $key, $value := .Status.Pmap }}" + ProxyInfoBody + "{{end}}"
@@ -57,27 +58,28 @@ const (
 
 	AllProxyInfoBody = "{{FormatDaemonID $value.Snode.ID $.Smap}}\t {{$value.SysInfo.PctMemUsed | printf `%.2f`}}\t " +
 		"{{FormatBytesUnsigned $value.SysInfo.MemAvail 2}}\t {{$value.SysInfo.PctCPUUsed | printf `%.2f`}}\t " +
-		"{{FormatDur (ExtractStat $value.Stats `up.µs.time`)}}\t " +
+		"{{FormatDur (ExtractStat $value.Stats `up.ns.time`)}}\t " +
 		"{{$value.Status}}\n"
 	AllProxyInfoBodyTmpl = "{{ range $key, $value := .Status.Pmap }}" + AllProxyInfoBody + "{{end}}"
 	AllProxyInfoTmpl     = ProxyInfoHeader + AllProxyInfoBodyTmpl
 
 	// Target Info
-	TargetInfoHeader = "TARGET\t MEM USED %\t MEM AVAIL\t CAP USED %\t CAP AVAIL\t CPU USED %\t REBALANCE\t UPTIME\t STATUS\n"
-	TargetInfoBody   = "{{$value.Snode.ID}}\t " +
-		"{{$value.SysInfo.PctMemUsed | printf `%.2f`}}\t {{FormatBytesUnsigned $value.SysInfo.MemAvail 2}}\t " +
+	TargetInfoHeader   = "TARGET\t MEM USED %\t MEM AVAIL\t CAP USED %\t CAP AVAIL\t CPU USED %\t REBALANCE\t UPTIME\t STATUS\n"
+	TargetInfoIDSingle = "{{$value.Snode.ID}}\t "
+	TargetInfoIDAll    = "{{FormatDaemonID $value.Snode.ID $.Smap}}\t "
+	TargetInfoBody     = "{{$value.SysInfo.PctMemUsed | printf `%.2f`}}\t {{FormatBytesUnsigned $value.SysInfo.MemAvail 2}}\t " +
 		"{{CalcCap $value `percent` | printf `%d`}}\t {{$capacity := CalcCap $value `capacity`}}{{FormatBytesUnsigned $capacity 3}}\t " +
 		"{{$value.SysInfo.PctCPUUsed | printf `%.2f`}}\t " +
 		"{{FormatXactStatus $value.TStatus }}\t " +
-		"{{FormatDur (ExtractStat $value.Stats `up.µs.time`)}}\t " +
+		"{{FormatDur (ExtractStat $value.Stats `up.ns.time`)}}\t " +
 		"{{$value.Status}}\n"
 
-	TargetInfoBodyTmpl       = "{{ range $key, $value := .Status.Tmap }}" + TargetInfoBody + "{{end}}"
+	TargetInfoBodyTmpl       = "{{ range $key, $value := .Status.Tmap }}" + TargetInfoIDAll + TargetInfoBody + "{{end}}"
 	TargetInfoTmpl           = TargetInfoHeader + TargetInfoBodyTmpl
-	TargetInfoSingleBodyTmpl = "{{$value := . }}" + TargetInfoBody
+	TargetInfoSingleBodyTmpl = "{{$value := . }}" + TargetInfoIDSingle + TargetInfoBody
 	TargetInfoSingleTmpl     = TargetInfoHeader + TargetInfoSingleBodyTmpl
 
-	ClusterSummary = "Summary:\n Proxies:\t{{len .Smap.Pmap}} ({{len .Smap.NonElects}} - unelectable)\n " +
+	ClusterSummary = "Summary:\n Proxies:\t{{len .Smap.Pmap}} ({{CountNonElectable .Smap.Pmap}} - unelectable)\n " +
 		"Targets:\t{{len .Smap.Tmap}}\n Primary Proxy:\t{{.Smap.Primary.ID}}\n Smap Version:\t{{.Smap.Version}}\n"
 
 	ClusterInfoTmpl = AllProxyInfoTmpl + "\n" + TargetInfoTmpl + "\n" + ClusterSummary
@@ -118,7 +120,8 @@ const (
 	ClientConfTmpl = "\n{{$obj := .Client}}Client Config\n" +
 		" Timeout:\t{{$obj.TimeoutStr}}\n" +
 		" Long Timeout:\t{{$obj.TimeoutLongStr}}\n" +
-		" List Time:\t{{$obj.ListObjectsStr}}\n"
+		" List Time:\t{{$obj.ListObjectsStr}}\n" +
+		" Flags:\t{{FormatFeatureFlags $obj.Features}}\n"
 	ProxyConfTmpl = "\n{{$obj := .Proxy}}Proxy Config\n" +
 		" Non Electable:\t{{$obj.NonElectable}}\n" +
 		" Primary URL:\t{{$obj.PrimaryURL}}\n" +
@@ -166,8 +169,6 @@ const (
 		" IPv4 IntraData:\t{{$obj.IPv4IntraData}}\n\n" +
 		" HTTP\n" +
 		" Protocol:\t{{$obj.HTTP.Proto}}\n" +
-		" Reverse Proxy:\t{{$obj.HTTP.RevProxy}}\n" +
-		" Reverse Proxy Cache:\t{{$obj.HTTP.RevProxyCache}}\n" +
 		" Certificate:\t{{$obj.HTTP.Certificate}}\n" +
 		" Key:\t{{$obj.HTTP.Key}}\n" +
 		" UseHTTPS:\t{{$obj.HTTP.UseHTTPS}}\n" +
@@ -209,7 +210,7 @@ const (
 		" Number of parity slices:\t{{$obj.ParitySlices}}\n" +
 		" Rebalance batch size:\t{{$obj.BatchSize}}\n" +
 		" Compression options:\t{{$obj.Compression}}\n"
-	GlobalConfTmpl = "Config Directory: {{.Confdir}}\nCloud Provider: {{.Cloud.Provider}}\n"
+	GlobalConfTmpl = "Config Directory: {{.Confdir}}\nCloud Providers: {{ range $key := .Cloud.Providers}} {{$key}} {{end}}\n"
 
 	// hidden config sections: replication
 	// Application Config has this sections but /deploy/dev/local/aisnode_config.sh does not expose them
@@ -323,6 +324,24 @@ const (
 		"{{range $transform := .}}" +
 		"{{$transform.ID}}\t{{$transform.Name}}\n" +
 		"{{end}}"
+
+	// Command `show mountpath`
+	TargetMpathListTmpl = "{{range $p := . }}" +
+		"{{ $p.DaemonID }}\n" +
+		"{{if and (eq (len $p.Avail) 0) (eq (len $p.Disabled) 0)}}" +
+		"\tNo mountpath\n" +
+		"{{else}}" +
+		"{{if ne (len $p.Avail) 0}}" +
+		"\tAvailable:\n" +
+		"{{range $mp := $p.Avail }}" +
+		"\t\t{{ $mp }}\n" +
+		"{{end}}{{end}}" +
+		"{{if ne (len $p.Disabled) 0}}" +
+		"\tDisabled:\n" +
+		"{{range $mp := $p.Disabled }}" +
+		"\t\t{{ $mp }}\n" +
+		"{{end}}{{end}}" +
+		"{{end}}{{end}}"
 )
 
 var (
@@ -369,6 +388,8 @@ var (
 		"FormatBool":          fmtBool,
 		"JoinList":            fmtStringList,
 		"JoinListNL":          func(lst []string) string { return fmtStringListGeneric(lst, "\n") },
+		"FormatFeatureFlags":  fmtFeatureFlags,
+		"CountNonElectable":   countNonElectable,
 	}
 
 	HelpTemplateFuncMap = template.FuncMap{
@@ -410,10 +431,8 @@ type (
 	}
 )
 
-var (
-	// interface guard
-	_ forMarshaler = SmapTemplateHelper{}
-)
+// interface guard
+var _ forMarshaler = SmapTemplateHelper{}
 
 func (sth SmapTemplateHelper) forMarshal() interface{} {
 	return sth.Smap
@@ -472,33 +491,31 @@ func fmtObjStatus(obj *cmn.BucketEntry) string {
 	return "moved"
 }
 
-var (
-	ConfigSectionTmpl = map[string]string{
-		"global":               GlobalConfTmpl,
-		"mirror":               MirrorConfTmpl,
-		"log":                  LogConfTmpl,
-		"client":               ClientConfTmpl,
-		"periodic":             PeriodConfTmpl,
-		"timeout":              TimeoutConfTmpl,
-		"proxy":                ProxyConfTmpl,
-		"lru":                  LRUConfTmpl,
-		"disk":                 DiskConfTmpl,
-		"rebalance":            RebalanceConfTmpl,
-		"checksum":             CksumConfTmpl,
-		"versioning":           VerConfTmpl,
-		"fspath":               FSpathsConfTmpl,
-		"testfs":               TestFSPConfTmpl,
-		"network":              NetConfTmpl,
-		"fshc":                 FSHCConfTmpl,
-		"auth":                 AuthConfTmpl,
-		"keepalive":            KeepaliveConfTmpl,
-		"downloader":           DownloaderConfTmpl,
-		cmn.DSortNameLowercase: DSortConfTmpl,
-		"compression":          CompressionTmpl,
-		"ec":                   ECTmpl,
-		"replication":          ReplicationConfTmpl,
-	}
-)
+var ConfigSectionTmpl = map[string]string{
+	"global":               GlobalConfTmpl,
+	"mirror":               MirrorConfTmpl,
+	"log":                  LogConfTmpl,
+	"client":               ClientConfTmpl,
+	"periodic":             PeriodConfTmpl,
+	"timeout":              TimeoutConfTmpl,
+	"proxy":                ProxyConfTmpl,
+	"lru":                  LRUConfTmpl,
+	"disk":                 DiskConfTmpl,
+	"rebalance":            RebalanceConfTmpl,
+	"checksum":             CksumConfTmpl,
+	"versioning":           VerConfTmpl,
+	"fspath":               FSpathsConfTmpl,
+	"testfs":               TestFSPConfTmpl,
+	"network":              NetConfTmpl,
+	"fshc":                 FSHCConfTmpl,
+	"auth":                 AuthConfTmpl,
+	"keepalive":            KeepaliveConfTmpl,
+	"downloader":           DownloaderConfTmpl,
+	cmn.DSortNameLowercase: DSortConfTmpl,
+	"compression":          CompressionTmpl,
+	"ec":                   ECTmpl,
+	"replication":          ReplicationConfTmpl,
+}
 
 func fmtObjIsCached(obj *cmn.BucketEntry) string {
 	return fmtBool(obj.CheckExists())
@@ -529,16 +546,14 @@ func fmtEC(data, parity int, isCopy bool) string {
 	return info
 }
 
-func fmtDuration(d int64) string {
-	dNano := time.Duration(d * int64(time.Microsecond))
-	return duration.HumanDuration(dNano)
-}
+func fmtDuration(ns int64) string { return duration.HumanDuration(time.Duration(ns)) }
 
 func fmtDaemonID(id string, smap cluster.Smap) string {
+	si := smap.GetNode(id)
 	if id == smap.Primary.ID() {
 		return id + primarySuffix
 	}
-	if _, ok := smap.NonElects[id]; ok {
+	if si.Flags.IsSet(cluster.SnodeNonElectable) {
 		return id + nonElectableSuffix
 	}
 	return id
@@ -593,4 +608,21 @@ func fmtStringListGeneric(lst []string, sep string) string {
 		fmt.Fprint(&s, url)
 	}
 	return s.String()
+}
+
+func fmtFeatureFlags(flags cmn.FeatureFlags) string {
+	if flags == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%s(%s)", flags, flags.Describe())
+}
+
+func countNonElectable(nodeMap cluster.NodeMap) int {
+	cnt := 0
+	for _, si := range nodeMap {
+		if si.NonElectable() {
+			cnt++
+		}
+	}
+	return cnt
 }

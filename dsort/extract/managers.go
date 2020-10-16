@@ -16,7 +16,6 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/dsort/filetype"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/pkg/errors"
@@ -29,9 +28,7 @@ const (
 	ExtractToWriter
 )
 
-var (
-	_ RecordExtractor = &RecordManager{}
-)
+var _ RecordExtractor = &RecordManager{}
 
 type (
 	extractRecordArgs struct {
@@ -139,7 +136,7 @@ func (rm *RecordManager) ExtractRecordWithBuffer(args extractRecordArgs) (size i
 		storeType = SGLStoreType
 		contentPath, fullContentPath = rm.encodeRecordName(storeType, args.shardName, args.recordName)
 
-		sgl := rm.t.GetMMSA().NewSGL(r.Size() + int64(len(args.metadata)))
+		sgl := rm.t.MMSA().NewSGL(r.Size() + int64(len(args.metadata)))
 		if _, err = io.CopyBuffer(sgl, bytes.NewReader(args.metadata), args.buf); err != nil {
 			return 0, errors.WithStack(err)
 		}
@@ -180,13 +177,13 @@ func (rm *RecordManager) ExtractRecordWithBuffer(args extractRecordArgs) (size i
 			return size, errors.WithStack(err)
 		}
 		if size, err = copyMetadataAndData(f, r, args.metadata, args.buf); err != nil {
-			debug.AssertNoErr(f.Close())
+			cmn.Close(f)
 			return size, errors.WithStack(err)
 		}
-		debug.AssertNoErr(f.Close())
+		cmn.Close(f)
 		rm.extractionPaths.Store(fullContentPath, struct{}{})
 	} else {
-		cmn.AssertMsg(false, fmt.Sprintf("%d %d", args.extractMethod, args.extractMethod&ExtractToDisk))
+		cmn.Assertf(false, "%d %d", args.extractMethod, args.extractMethod&ExtractToDisk)
 	}
 
 	var key interface{}
@@ -194,7 +191,7 @@ func (rm *RecordManager) ExtractRecordWithBuffer(args extractRecordArgs) (size i
 		return size, errors.WithStack(err)
 	}
 
-	cmn.AssertMsg(contentPath != "", fmt.Sprintf("shardName: %s; recordName: %s", args.shardName, args.recordName))
+	cmn.Assertf(contentPath != "", "shardName: %s; recordName: %s", args.shardName, args.recordName)
 	cmn.Assert(storeType != "")
 
 	rm.Records.Insert(&Record{
@@ -386,7 +383,7 @@ func (rm *RecordManager) Cleanup() {
 
 	// NOTE: forcefully free all MMSA memory to the OS
 	// TODO: another reason to use a separate MMSA for extractions
-	rm.t.GetMMSA().FreeSpec(memsys.FreeSpec{
+	rm.t.MMSA().FreeSpec(memsys.FreeSpec{
 		Totally: true,
 		ToOS:    true,
 		MinSize: 1, // force toGC to free all (even small) memory to system

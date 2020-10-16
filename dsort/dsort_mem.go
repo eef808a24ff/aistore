@@ -16,13 +16,13 @@ import (
 
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/dsort/extract"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/transport/bundle"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -65,8 +65,8 @@ type (
 		m *Manager
 
 		streams struct {
-			builder *transport.StreamBundle // streams for sending information about building shards
-			records *transport.StreamBundle // streams for sending the record
+			builder *bundle.Streams // streams for sending information about building shards
+			records *bundle.Streams // streams for sending the record
 		}
 
 		creationPhase struct {
@@ -81,9 +81,7 @@ type (
 	}
 )
 
-var (
-	_ dsorter = &dsorterMem{}
-)
+var _ dsorter = &dsorterMem{}
 
 func newRWConnection(r io.Reader, w io.Writer) *rwConnection {
 	cmn.Assert(r != nil || w != nil)
@@ -216,13 +214,13 @@ func (ds *dsorterMem) start() error {
 
 	client := transport.NewIntraDataClient()
 
-	streamMultiplier := transport.IntraBundleMultiplier
+	streamMultiplier := bundle.Multiplier
 	if ds.m.rs.StreamMultiplier != 0 {
 		streamMultiplier = ds.m.rs.StreamMultiplier
 	}
 
 	trname := fmt.Sprintf(recvReqStreamNameFmt, ds.m.ManagerUUID)
-	reqSbArgs := transport.SBArgs{
+	reqSbArgs := bundle.Args{
 		Multiplier: 20,
 		Network:    reqNetwork,
 		Trname:     trname,
@@ -233,7 +231,7 @@ func (ds *dsorterMem) start() error {
 	}
 
 	trname = fmt.Sprintf(recvRespStreamNameFmt, ds.m.ManagerUUID)
-	respSbArgs := transport.SBArgs{
+	respSbArgs := bundle.Args{
 		Multiplier: streamMultiplier,
 		Network:    respNetwork,
 		Trname:     trname,
@@ -248,8 +246,8 @@ func (ds *dsorterMem) start() error {
 		return errors.WithStack(err)
 	}
 
-	ds.streams.builder = transport.NewStreamBundle(ds.m.ctx.smapOwner, ds.m.ctx.node, client, reqSbArgs)
-	ds.streams.records = transport.NewStreamBundle(ds.m.ctx.smapOwner, ds.m.ctx.node, client, respSbArgs)
+	ds.streams.builder = bundle.NewStreams(ds.m.ctx.smapOwner, ds.m.ctx.node, client, reqSbArgs)
+	ds.streams.records = bundle.NewStreams(ds.m.ctx.smapOwner, ds.m.ctx.node, client, respSbArgs)
 	return nil
 }
 
@@ -280,7 +278,7 @@ func (ds *dsorterMem) cleanupStreams() error {
 		}
 	}
 
-	for _, streamBundle := range []*transport.StreamBundle{ds.streams.builder, ds.streams.records} {
+	for _, streamBundle := range []*bundle.Streams{ds.streams.builder, ds.streams.records} {
 		if streamBundle != nil {
 			streamBundle.Close(!ds.m.aborted())
 		}
@@ -306,8 +304,8 @@ func (ds *dsorterMem) preShardCreation(shardName string, mpathInfo *fs.Mountpath
 	bsi := &buildingShardInfo{
 		shardName: shardName,
 	}
-	opaque := bsi.NewPack(ds.m.ctx.t.GetSmallMMSA())
-	if err := ds.streams.builder.Send(transport.Obj{Hdr: transport.Header{Opaque: opaque}}, nil); err != nil {
+	opaque := bsi.NewPack(ds.m.ctx.t.SmallMMSA())
+	if err := ds.streams.builder.Send(&transport.Obj{Hdr: transport.ObjHdr{Opaque: opaque}}, nil); err != nil {
 		return err
 	}
 	ds.creationPhase.requestedShards <- shardName // we also need to inform ourselves
@@ -332,9 +330,7 @@ func (ds *dsorterMem) loadContent() extract.LoadContentFunc {
 // createShardsLocally waits until it's given the signal to start creating
 // shards, then creates shards in parallel.
 func (ds *dsorterMem) createShardsLocally() (err error) {
-	var (
-		phaseInfo = &ds.m.creationPhase
-	)
+	phaseInfo := &ds.m.creationPhase
 
 	ds.creationPhase.adjuster.read.start()
 	ds.creationPhase.adjuster.write.start()
@@ -482,7 +478,7 @@ func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj,
 			RecordObj: obj,
 		}
 		opaque = cmn.MustMarshal(req)
-		hdr    = transport.Header{
+		hdr    = transport.ObjHdr{
 			Opaque: opaque,
 		}
 
@@ -522,7 +518,7 @@ func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj,
 				ds.m.Metrics.Creation.Unlock()
 			}
 		} else {
-			o := transport.Obj{Hdr: hdr, Callback: ds.m.sentCallback, CmplPtr: unsafe.Pointer(&beforeSend)}
+			o := &transport.Obj{Hdr: hdr, Callback: ds.m.sentCallback, CmplPtr: unsafe.Pointer(&beforeSend)}
 			err = ds.streams.records.Send(o, r, toNode)
 		}
 		return
@@ -544,11 +540,11 @@ func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj,
 		hdr.ObjAttrs.Size = obj.MetadataSize + obj.Size
 		r, err := cmn.NewFileSectionHandle(f, obj.Offset-obj.MetadataSize, hdr.ObjAttrs.Size, 0)
 		if err != nil {
-			debug.AssertNoErr(f.Close())
+			cmn.Close(f)
 			return err
 		}
 		if err := send(r); err != nil {
-			debug.AssertNoErr(f.Close())
+			cmn.Close(f)
 			return err
 		}
 	case extract.DiskStoreType:
@@ -558,12 +554,12 @@ func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj,
 		}
 		fi, err := f.Stat()
 		if err != nil {
-			debug.AssertNoErr(f.Close())
+			cmn.Close(f)
 			return err
 		}
 		hdr.ObjAttrs.Size = fi.Size()
 		if err := send(f); err != nil {
-			debug.AssertNoErr(f.Close())
+			cmn.Close(f)
 			return err
 		}
 	default:
@@ -576,7 +572,7 @@ func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj,
 func (ds *dsorterMem) postExtraction() {}
 
 func (ds *dsorterMem) makeRecvRequestFunc() transport.Receive {
-	return func(w http.ResponseWriter, hdr transport.Header, object io.Reader, err error) {
+	return func(w http.ResponseWriter, hdr transport.ObjHdr, object io.Reader, err error) {
 		if err != nil {
 			ds.m.abort(err)
 			return
@@ -601,7 +597,7 @@ func (ds *dsorterMem) makeRecvRequestFunc() transport.Receive {
 
 func (ds *dsorterMem) makeRecvResponseFunc() transport.Receive {
 	metrics := ds.m.Metrics.Creation
-	return func(w http.ResponseWriter, hdr transport.Header, object io.Reader, err error) {
+	return func(w http.ResponseWriter, hdr transport.ObjHdr, object io.Reader, err error) {
 		if err != nil {
 			ds.m.abort(err)
 			return

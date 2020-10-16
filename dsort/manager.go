@@ -18,7 +18,6 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/dsort/extract"
 	"github.com/NVIDIA/aistore/dsort/filetype"
@@ -27,6 +26,7 @@ import (
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/pkg/errors"
 )
 
@@ -120,7 +120,7 @@ type (
 			adjuster *concAdjuster
 		}
 		streams struct {
-			shards *transport.StreamBundle // streams for pushing streams to other targets if the fqn is non-local
+			shards *bundle.Streams // streams for pushing streams to other targets if the fqn is non-local
 		}
 		creationPhase struct {
 			metadata CreationPhaseMetadata
@@ -248,8 +248,8 @@ func (m *Manager) initStreams() error {
 	}
 
 	trname := fmt.Sprintf(shardStreamNameFmt, m.ManagerUUID)
-	shardsSbArgs := transport.SBArgs{
-		Multiplier: transport.IntraBundleMultiplier,
+	shardsSbArgs := bundle.Args{
+		Multiplier: bundle.Multiplier,
 		Network:    respNetwork,
 		Trname:     trname,
 		Ntype:      cluster.Targets,
@@ -264,7 +264,7 @@ func (m *Manager) initStreams() error {
 	}
 
 	client := transport.NewIntraDataClient()
-	m.streams.shards = transport.NewStreamBundle(m.ctx.smapOwner, m.ctx.node, client, shardsSbArgs)
+	m.streams.shards = bundle.NewStreams(m.ctx.smapOwner, m.ctx.node, client, shardsSbArgs)
 	return nil
 }
 
@@ -284,7 +284,7 @@ func (m *Manager) cleanupStreams() error {
 		}
 	}
 
-	for _, streamBundle := range []*transport.StreamBundle{m.streams.shards} {
+	for _, streamBundle := range []*bundle.Streams{m.streams.shards} {
 		if streamBundle != nil {
 			streamBundle.Close(false)
 		}
@@ -316,7 +316,7 @@ func (m *Manager) cleanup() {
 		glog.Infof("%s %s cleanup has been finished in %v", cmn.DSortName, m.ManagerUUID, time.Since(now))
 	}()
 
-	cmn.AssertMsg(!m.inProgress(), fmt.Sprintf("%s: was still in progress", m.ManagerUUID))
+	cmn.Assertf(!m.inProgress(), "%s: was still in progress", m.ManagerUUID)
 
 	m.extractCreator = nil
 	m.client = nil
@@ -421,16 +421,14 @@ func (m *Manager) setDSorter() (err error) {
 	case DSorterMemType:
 		m.dsorter = newDSorterMem(m)
 	default:
-		cmn.AssertMsg(false, fmt.Sprintf("dsorter type is invalid: %q", m.rs.DSorterType))
+		cmn.Assertf(false, "dsorter type is invalid: %q", m.rs.DSorterType)
 	}
 	return
 }
 
 // setExtractCreator sets what type of file extraction and creation is used based on the RequestSpec.
 func (m *Manager) setExtractCreator() (err error) {
-	var (
-		keyExtractor extract.KeyExtractor
-	)
+	var keyExtractor extract.KeyExtractor
 
 	switch m.rs.Algorithm.Kind {
 	case SortKindContent:
@@ -458,7 +456,7 @@ func (m *Manager) setExtractCreator() (err error) {
 	case cmn.ExtZip:
 		extractCreator = extract.NewZipExtractCreator(m.ctx.t)
 	default:
-		cmn.AssertMsg(false, fmt.Sprintf("unknown extension %s", m.rs.Extension))
+		cmn.Assertf(false, "unknown extension %s", m.rs.Extension)
 	}
 
 	if !m.rs.DryRun {
@@ -603,7 +601,7 @@ func (m *Manager) unlock() {
 	m.mu.Unlock()
 }
 
-func (m *Manager) sentCallback(hdr transport.Header, rc io.ReadCloser, x unsafe.Pointer, err error) {
+func (m *Manager) sentCallback(hdr transport.ObjHdr, rc io.ReadCloser, x unsafe.Pointer, err error) {
 	if m.Metrics.extended {
 		dur := mono.Since(*(*int64)(x))
 		m.Metrics.Creation.Lock()
@@ -622,7 +620,7 @@ func (m *Manager) sentCallback(hdr transport.Header, rc io.ReadCloser, x unsafe.
 }
 
 func (m *Manager) makeRecvShardFunc() transport.Receive {
-	return func(w http.ResponseWriter, hdr transport.Header, object io.Reader, err error) {
+	return func(w http.ResponseWriter, hdr transport.ObjHdr, object io.Reader, err error) {
 		if err != nil {
 			m.abort(err)
 			return
@@ -652,15 +650,15 @@ func (m *Manager) makeRecvShardFunc() transport.Receive {
 		lom.SetAtimeUnix(started.UnixNano())
 		rc := ioutil.NopCloser(object)
 
-		err = m.ctx.t.PutObject(cluster.PutObjectParams{
-			LOM:          lom,
+		params := cluster.PutObjectParams{
 			Reader:       rc,
 			WorkFQN:      workFQN,
 			RecvType:     cluster.WarmGet,
 			Cksum:        nil,
 			Started:      started,
 			WithFinalize: true,
-		})
+		}
+		err = m.ctx.t.PutObject(lom, params)
 		if err != nil {
 			m.abort(err)
 			return
@@ -683,14 +681,12 @@ func (m *Manager) doWithAbort(reqArgs *cmn.ReqArgs) error {
 		defer func() {
 			doneCh <- struct{}{}
 		}()
-		resp, err := m.client.Do(req)
+		resp, err := m.client.Do(req) // nolint:bodyclose // closed inside cmn.Close
 		if err != nil {
 			errCh <- err
 			return
 		}
-		defer func() {
-			debug.AssertNoErr(resp.Body.Close())
-		}()
+		defer cmn.Close(resp.Body)
 
 		if resp.StatusCode >= http.StatusBadRequest {
 			b, err := ioutil.ReadAll(resp.Body)
@@ -790,7 +786,7 @@ func calcMaxMemoryUsage(maxUsage cmn.ParsedQuantity, mem sys.MemStat) uint64 {
 	case cmn.QuantityBytes:
 		return cmn.MinU64(maxUsage.Value, mem.Total)
 	default:
-		cmn.AssertMsg(false, fmt.Sprintf("mem usage type (%s) is not recognized.. something went wrong", maxUsage.Type))
+		cmn.Assertf(false, "mem usage type (%s) is not recognized.. something went wrong", maxUsage.Type)
 		return 0
 	}
 }

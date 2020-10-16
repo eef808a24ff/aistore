@@ -24,6 +24,7 @@ import (
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/xaction/registry"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -183,12 +184,6 @@ type (
 		isSlice  bool               // is it slice or replica
 		reqType  intraReqType       // request's type, slice/meta request/response
 	}
-
-	XactRegistry interface {
-		RenewGetEC(bck *cluster.Bck) *XactGet
-		RenewPutEC(bck *cluster.Bck) *XactPut
-		RenewRespondEC(bck *cluster.Bck) *XactRespond
-	}
 )
 
 // frees all allocated memory and removes slice's temporary file
@@ -196,20 +191,21 @@ func (s *slice) free() {
 	freeObject(s.obj)
 	s.obj = nil
 	if s.reader != nil {
-		debug.AssertNoErr(s.reader.Close())
+		cmn.Close(s.reader)
 	}
 	if s.writer != nil {
 		switch w := s.writer.(type) {
 		case *os.File:
-			debug.AssertNoErr(w.Close())
+			cmn.Close(w)
 		case *memsys.SGL:
 			w.Free()
 		default:
-			cmn.AssertFmt(false, "%T", w)
+			cmn.Assertf(false, "%T", w)
 		}
 	}
 	if s.workFQN != "" {
-		debug.AssertNoErr(os.RemoveAll(s.workFQN))
+		errRm := os.RemoveAll(s.workFQN)
+		debug.AssertNoErr(errRm)
 	}
 }
 
@@ -235,11 +231,18 @@ var (
 	ErrorInsufficientTargets = errors.New("insufficient targets")
 )
 
-func Init(t cluster.Target, reg XactRegistry) {
-	mm = t.GetMMSA()
+func Init(t cluster.Target) {
+	mm = t.MMSA()
+
 	fs.CSM.RegisterContentType(SliceType, &SliceSpec{})
 	fs.CSM.RegisterContentType(MetaType, &MetaSpec{})
-	if err := initManager(t, reg); err != nil {
+
+	registry.Registry.RegisterBucketXact(&xactGetProvider{})
+	registry.Registry.RegisterBucketXact(&xactPutProvider{})
+	registry.Registry.RegisterBucketXact(&xactRespondProvider{})
+	registry.Registry.RegisterBucketXact(&xactBckEncodeProvider{})
+
+	if err := initManager(t); err != nil {
 		glog.Fatal(err)
 	}
 }
@@ -287,11 +290,11 @@ func freeObject(r interface{}) {
 	}
 	if f, ok := r.(*cmn.FileHandle); ok {
 		if f != nil {
-			debug.AssertNoErr(f.Close())
+			cmn.Close(f)
 		}
 		return
 	}
-	cmn.AssertFmt(false, "Invalid object type", r)
+	cmn.Assertf(false, "invalid object type: %v", r)
 }
 
 // removes all temporary slices in case of erasure coding fails in the middle
@@ -305,7 +308,7 @@ func freeSlices(slices []*slice) {
 
 // requestECMeta returns an EC metadata found on a remote target.
 func requestECMeta(bck cmn.Bck, objName string, si *cluster.Snode, client *http.Client) (md *Metadata, err error) {
-	path := cmn.URLPath(cmn.Version, cmn.EC, URLMeta, bck.Name, objName)
+	path := cmn.JoinWords(cmn.Version, cmn.EC, URLMeta, bck.Name, objName)
 	query := url.Values{}
 	query = cmn.AddBckToQuery(query, bck)
 	url := si.URL(cmn.NetworkIntraData) + path
@@ -314,11 +317,11 @@ func requestECMeta(bck cmn.Bck, objName string, si *cluster.Snode, client *http.
 		return nil, err
 	}
 	rq.URL.RawQuery = query.Encode()
-	resp, err := client.Do(rq)
+	resp, err := client.Do(rq) // nolint:bodyclose // closed inside cmn.Close
 	if err != nil {
 		return nil, err
 	}
-	defer func() { debug.AssertNoErr(resp.Body.Close()) }()
+	defer cmn.Close(resp.Body)
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("%s/%s not found on %s", bck, objName, si.ID())
 	} else if resp.StatusCode != http.StatusOK {
@@ -339,19 +342,19 @@ func WriteObject(t cluster.Target, lom *cluster.LOM, reader io.Reader, size int6
 	if err := fs.Access(bdir); err != nil {
 		return err
 	}
-	return t.PutObject(cluster.PutObjectParams{
-		LOM:          lom,
+	params := cluster.PutObjectParams{
 		Reader:       readCloser,
 		WorkFQN:      fs.CSM.GenContentFQN(lom.FQN, fs.WorkfileType, "ec"),
 		SkipEncode:   true,
 		WithFinalize: true,
 		RecvType:     cluster.Migrated, // to avoid changing version
-	})
+	}
+	return t.PutObject(lom, params)
 }
 
 // Saves slice and its metafile
-func WriteSliceAndMeta(t cluster.Target, hdr transport.Header, data io.Reader, md []byte) error {
-	ct, err := cluster.NewCTFromBO(hdr.Bck.Name, hdr.Bck.Provider, hdr.ObjName, t.GetBowner(), SliceType)
+func WriteSliceAndMeta(t cluster.Target, hdr transport.ObjHdr, data io.Reader, md []byte) error {
+	ct, err := cluster.NewCTFromBO(hdr.Bck.Name, hdr.Bck.Provider, hdr.ObjName, t.Bowner(), SliceType)
 	if err != nil {
 		return err
 	}
@@ -369,7 +372,7 @@ func WriteSliceAndMeta(t cluster.Target, hdr transport.Header, data io.Reader, m
 	return err
 }
 
-func LomFromHeader(t cluster.Target, hdr transport.Header) (*cluster.LOM, error) {
+func LomFromHeader(t cluster.Target, hdr transport.ObjHdr) (*cluster.LOM, error) {
 	lom := &cluster.LOM{T: t, ObjName: hdr.ObjName}
 	if err := lom.Init(hdr.Bck); err != nil {
 		return nil, err

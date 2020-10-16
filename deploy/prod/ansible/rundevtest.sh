@@ -16,7 +16,6 @@ function post_deploy() {
     exit 1
   fi
   echo "working with build: $(git rev-parse --short HEAD)"
-  export BUCKET=nvais
   echo "run tests with cloud bucket: ${BUCKET}"
 }
 
@@ -29,7 +28,7 @@ function deploy() {
 
   targets=$1
   proxies=$2
-  { echo $targets; echo $proxies; echo $3; echo $4; } | MODE="debug" make deploy
+  { echo $targets; echo $proxies; echo $3; echo $4; echo $5; echo $6; } | MODE="debug" make deploy
   export NUM_PROXY=$proxies
   export NUM_TARGET=$targets
   post_deploy $((targets + proxies))
@@ -38,6 +37,7 @@ function deploy() {
 set -o xtrace
 source /etc/profile.d/aispaths.sh
 source aws.env
+source gcs.env
 
 cd $AISSRC && cd ..
 
@@ -58,32 +58,35 @@ pushd deploy/dev/k8s
 { echo n; } | ./utils/deploy_minikube.sh
 popd
 
-
 # Running kubernetes based tests
 export K8S_HOST_NAME="minikube"
 # TODO: This requirement can be removed once we do not need single transformer per target.
 # We use this because minikube is a 1-node kubernetes cluster
 # and with pod anti-affinities (for enabling single transformer per target at a time) it would
 # cause failures with pods getting stuck in `Pending` state.
-deploy 1 1 3 0
-RE="TestKube" make test-run
+deploy 1 1 3 n n n
+echo "----- RUNNING K8S TESTS -----"
+BUCKET=test RE="TestETL" make test-run
 exit_code=$?
 result=$((result + exit_code))
-echo "'RE=TestKube make test-run' exit status: $exit_code"
+echo "----- K8S TESTS FINISHED WITH: ${exit_code} -----"
 
 # Deleting minikube cluster
-pushd deploy/dev/k8s
-./stop.sh
-popd
+./deploy/dev/k8s/stop.sh
 
 # Running long tests
-deploy 6 6 4 1
-make test-long && make test-aisloader
-exit_code=$?
-result=$((result + exit_code))
-echo "'make test-long && make test-aisloader' exit status: $exit_code"
+deploy 6 6 4 y y n
+for bucket in "aws://ais-jenkins" "gcp://ais-jenkins"; do
+  echo "----- RUNNING LONG TESTS WITH: ${bucket} -----"
+  BUCKET=${bucket} make test-long && make test-aisloader
+  exit_code=$?
+  result=$((result + exit_code))
+  echo "----- LONG TESTS FINISHED WITH: ${exit_code} -----"
+done
 
-cleanup
+# Note: only the logs from the last make test-long run survive - see function deploy above
+make kill
+
 if [[ $result -ne 0 ]]; then
   echo "tests failed"
 fi

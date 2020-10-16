@@ -31,7 +31,7 @@ import (
 // API types
 //
 type (
-	Receive func(w http.ResponseWriter, hdr Header, object io.Reader, err error)
+	Receive func(w http.ResponseWriter, hdr ObjHdr, object io.Reader, err error)
 )
 
 // internal types
@@ -46,7 +46,7 @@ type (
 		body io.Reader
 		off  int64
 		fbuf *fixedBuffer // ditto
-		hdr  Header
+		hdr  ObjHdr
 	}
 	handler struct {
 		trname      string
@@ -128,7 +128,7 @@ func Register(network, trname string, callback Receive, mems ...*memsys.MMSA) (u
 		mem = mems[0]
 	}
 	h := &handler{trname: trname, callback: callback, hkName: path.Join(network, trname, "oldSessions"), mem: mem}
-	upath = cmn.URLPath(cmn.Version, cmn.Transport, trname)
+	upath = cmn.JoinWords(cmn.Version, cmn.Transport, trname)
 	mux.HandleFunc(upath, h.receive)
 	if _, ok = handlers[network][trname]; ok {
 		glog.Errorf("Warning: re-registering transport handler %q", trname)
@@ -156,7 +156,7 @@ func Unregister(network, trname string) (err error) {
 	}
 	delete(handlers[network], trname)
 
-	upath := cmn.URLPath(cmn.Version, cmn.Transport, trname)
+	upath := cmn.JoinWords(cmn.Version, cmn.Transport, trname)
 	mux.Unhandle(upath)
 	mu.Unlock()
 
@@ -210,7 +210,7 @@ func (h *handler) receive(w http.ResponseWriter, r *http.Request) {
 		reader    io.Reader = r.Body
 		lz4Reader *lz4.Reader
 		fbuf      *fixedBuffer
-		debug     = bool(glog.FastV(4, glog.SmoduleTransport))
+		verbose   = bool(glog.FastV(4, glog.SmoduleTransport))
 	)
 	// compression
 	if compressionType := r.Header.Get(cmn.HeaderCompress); compressionType != "" {
@@ -229,10 +229,10 @@ func (h *handler) receive(w http.ResponseWriter, r *http.Request) {
 	}
 	uid := uniqueID(r, sessID)
 	statsif, loaded := h.sessions.LoadOrStore(uid, &Stats{})
-	if !loaded && debug {
+	if !loaded && debug.Enabled {
 		xxh, id := UID2SessID(uid)
-		cmn.Assert(id == uint64(sessID))
-		glog.Infof("%s[%d:%d]: start-of-stream from %s", trname, xxh, sessID, r.RemoteAddr) // r.RemoteAddr => xxh
+		debug.Assert(id == uint64(sessID))
+		debug.Infof("%s[%d:%d]: start-of-stream from %s", trname, xxh, sessID, r.RemoteAddr) // r.RemoteAddr => xxh
 	}
 	stats := statsif.(*Stats)
 
@@ -256,7 +256,7 @@ func (h *handler) receive(w http.ResponseWriter, r *http.Request) {
 					siz = stats.Size.Add(hdr.ObjAttrs.Size)
 					off = stats.Offset.Add(hdr.ObjAttrs.Size)
 				)
-				if debug {
+				if verbose {
 					xxh, _ := UID2SessID(uid)
 					glog.Infof("%s[%d:%d]: off=%d, size=%d(%d), num=%d - %s/%s",
 						trname, xxh, sessID, off, siz, hdr.ObjAttrs.Size, num, hdr.Bck, hdr.ObjName)
@@ -270,7 +270,7 @@ func (h *handler) receive(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			h.oldSessions.Store(uid, time.Now())
 			if err != io.EOF {
-				h.callback(w, Header{}, nil, err)
+				h.callback(w, ObjHdr{}, nil, err)
 				cmn.InvalidHandlerDetailed(w, r, err.Error())
 			}
 			if lz4Reader != nil {
@@ -327,7 +327,7 @@ read:
 func (it *iterator) next() (obj *objReader, hl64 int64, err error) {
 	var (
 		n   int
-		hdr Header
+		hdr ObjHdr
 	)
 	n, err = it.Read(it.headerBuf[:cmn.SizeofI64*2])
 	if n < cmn.SizeofI64*2 {
@@ -433,7 +433,7 @@ func (bb *fixedBuffer) Free()         { bb.slab.Free(bb.buf) }
 //
 // helpers
 //
-func ExtHeader(body []byte, hlen int) (hdr Header) {
+func ExtHeader(body []byte, hlen int) (hdr ObjHdr) {
 	var off int
 	off, hdr.Bck.Name = extString(0, body)
 	off, hdr.ObjName = extString(off, body)

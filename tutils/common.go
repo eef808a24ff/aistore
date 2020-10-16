@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/tutils/readers"
 	"github.com/NVIDIA/aistore/tutils/tassert"
 )
@@ -123,14 +125,16 @@ func CheckSkip(tb testing.TB, args SkipTestArgs) {
 		}
 	}
 	if args.K8s {
-		if cmn.DetectK8s() == "" {
+		if err := k8s.Detect(); err != nil {
 			tb.Skipf("%s requires Kubernetes", tb.Name())
 		}
 	}
 }
 
 func IsCloudBucket(tb testing.TB, proxyURL string, bck cmn.Bck) bool {
-	bck.Provider = cmn.AnyCloud
+	if !bck.IsCloud() {
+		return false
+	}
 	baseParams := BaseAPIParams(proxyURL)
 	bcks, err := api.ListBuckets(baseParams, cmn.QueryBcks(bck))
 	tassert.CheckFatal(tb, err)
@@ -154,9 +158,7 @@ func PutObjRR(baseParams api.BaseParams, bck cmn.Bck, objName string, objSize in
 
 func PutRR(tb testing.TB, baseParams api.BaseParams, objSize int64, cksumType string,
 	bck cmn.Bck, dir string, objCount, fnlen int) []string {
-	var (
-		objNames = make([]string, objCount)
-	)
+	objNames := make([]string, objCount)
 	for i := 0; i < objCount; i++ {
 		fname := GenRandomString(fnlen)
 		objName := filepath.Join(dir, fname)
@@ -168,4 +170,14 @@ func PutRR(tb testing.TB, baseParams api.BaseParams, objSize int64, cksumType st
 	}
 
 	return objNames
+}
+
+func NewClientWithProxy(proxyURL string) *http.Client {
+	transport := cmn.NewTransport(transportArgs)
+	prxURL, _ := url.Parse(proxyURL)
+	transport.Proxy = http.ProxyURL(prxURL)
+	return &http.Client{
+		Transport: transport,
+		Timeout:   transportArgs.Timeout,
+	}
 }

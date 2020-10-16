@@ -7,7 +7,6 @@ package ais
 import (
 	"errors"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
@@ -21,7 +20,7 @@ func (p *proxyrunner) httpTokenDelete(w http.ResponseWriter, r *http.Request) {
 	if _, err := p.checkRESTItems(w, r, 0, false, cmn.Version, cmn.Tokens); err != nil {
 		return
 	}
-	if p.forwardCP(w, r, &cmn.ActionMsg{Action: cmn.ActRevokeToken}, "revoke token", nil) {
+	if p.forwardCP(w, r, &cmn.ActionMsg{Action: cmn.ActRevokeToken}, "revoke token") {
 		return
 	}
 	if err := cmn.ReadJSON(w, r, tokenList); err != nil {
@@ -34,24 +33,11 @@ func (p *proxyrunner) httpTokenDelete(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// TODO: better check for internal request - nid & pid are too insecure
-func (p *proxyrunner) isInternalReq(query url.Values, hdr http.Header) bool {
-	pid := query.Get(cmn.URLParamProxyID)
-	if pid != "" {
-		return true
-	}
-	nid := hdr.Get(cmn.HeaderNodeID)
-	return nid != ""
-}
-
 // Read a token from request header and validates it
 // Header format:
 //		'Authorization: Bearer <token>'
 // Returns: is auth enabled, decoded token, error
-func (p *proxyrunner) validateToken(query url.Values, hdr http.Header) (*cmn.AuthToken, error) {
-	if p.isInternalReq(query, hdr) {
-		return nil, nil
-	}
+func (p *proxyrunner) validateToken(hdr http.Header) (*cmn.AuthToken, error) {
 	authToken := hdr.Get(cmn.HeaderAuthorization)
 	idx := strings.Index(authToken, " ")
 	if idx == -1 || authToken[:idx] != cmn.HeaderBearer {
@@ -67,12 +53,15 @@ func (p *proxyrunner) validateToken(query url.Values, hdr http.Header) (*cmn.Aut
 	return auth, nil
 }
 
-func (p *proxyrunner) checkPermissions(query url.Values, hdr http.Header, bck *cmn.Bck, perms cmn.AccessAttrs) error {
+func (p *proxyrunner) checkPermissions(hdr http.Header, bck *cmn.Bck, perms cmn.AccessAttrs) error {
+	if isIntraCall(hdr) {
+		return nil
+	}
 	cfg := cmn.GCO.Get()
 	if !cfg.Auth.Enabled {
 		return nil
 	}
-	token, err := p.validateToken(query, hdr)
+	token, err := p.validateToken(hdr)
 	if err != nil {
 		return err
 	}

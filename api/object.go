@@ -11,19 +11,20 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/downloader"
 	"github.com/NVIDIA/aistore/ec"
-	"github.com/NVIDIA/aistore/etl"
 )
 
 const (
-	httpMaxRetries = 3                      // maximum number of retries for an HTTP request
+	httpMaxRetries = 5                      // maximum number of retries for an HTTP request
 	httpRetrySleep = 100 * time.Millisecond // a sleep between HTTP request retries
+	// Sleep between HTTP retries for error[rate of change requests exceeds limit] - must be > 1s:
+	// From https://cloud.google.com/storage/quotas#objects
+	//   There is an update limit on each object of once per second ...
+	httpRetryRateSleep = 1500 * time.Millisecond
 )
 
 // GetObjectInput is used to hold optional parameters for GetObject and GetObjectWithValidation
@@ -59,6 +60,7 @@ type PromoteArgs struct {
 	FQN        string
 	Recurs     bool
 	Overwrite  bool
+	KeepOrig   bool
 	Verbose    bool
 }
 
@@ -79,9 +81,7 @@ type FlushArgs struct {
 	Cksum      *cmn.Cksum
 }
 
-// HeadObject API
-//
-// Returns the size and version of the object specified by bucket/object
+// HeadObject returns the size and version of the object specified by bucket/object.
 func HeadObject(baseParams BaseParams, bck cmn.Bck, object string, checkExists ...bool) (*cmn.ObjectProps, error) {
 	checkIsCached := false
 	if len(checkExists) > 0 {
@@ -94,7 +94,7 @@ func HeadObject(baseParams BaseParams, bck cmn.Bck, object string, checkExists .
 
 	resp, err := doHTTPRequestGetResp(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Objects, bck.Name, object),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Objects, bck.Name, object),
 		Query:      query,
 	}, nil)
 	if err != nil {
@@ -123,37 +123,32 @@ func HeadObject(baseParams BaseParams, bck cmn.Bck, object string, checkExists .
 	return objProps, nil
 }
 
-// DeleteObject API
-//
-// Deletes an object specified by bucket/object
+// DeleteObject deletes an object specified by bucket/object.
 func DeleteObject(baseParams BaseParams, bck cmn.Bck, object string) error {
 	baseParams.Method = http.MethodDelete
 	return DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Objects, bck.Name, object),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Objects, bck.Name, object),
 		Query:      cmn.AddBckToQuery(nil, bck),
 	})
 }
 
-// EvictObject API
-//
-// Evicts an object specified by bucket/object
+// EvictObject evicts an object specified by bucket/object.
 func EvictObject(baseParams BaseParams, bck cmn.Bck, object string) error {
 	baseParams.Method = http.MethodDelete
-	actMsg := cmn.ActionMsg{Action: cmn.ActEvictObjects, Name: cmn.URLPath(bck.Name, object)}
+	actMsg := cmn.ActionMsg{Action: cmn.ActEvictObjects, Name: cmn.JoinWords(bck.Name, object)}
 	return DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Objects, bck.Name, object),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Objects, bck.Name, object),
 		Body:       cmn.MustMarshal(actMsg),
 	})
 }
 
-// GetObject API
+// GetObject returns the length of the object. Does not validate checksum of the
+// object in the response.
 //
-// Returns the length of the object. Does not validate checksum of the object in the response.
-//
-// Writes the response body to a writer if one is specified in the optional GetObjectInput.Writer.
-// Otherwise, it discards the response body read.
+// Writes the response body to a writer if one is specified in the optional
+// `GetObjectInput.Writer`. Otherwise, it discards the response body read.
 //
 // `io.Copy` is used internally to copy response bytes from the request to the writer.
 func GetObject(baseParams BaseParams, bck cmn.Bck, object string, options ...GetObjectInput) (n int64, err error) {
@@ -169,7 +164,7 @@ func GetObject(baseParams BaseParams, bck cmn.Bck, object string, options ...Get
 	baseParams.Method = http.MethodGet
 	resp, err := doHTTPRequestGetResp(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Objects, bck.Name, object),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Objects, bck.Name, object),
 		Query:      q,
 		Header:     hdr,
 	}, w)
@@ -179,16 +174,39 @@ func GetObject(baseParams BaseParams, bck cmn.Bck, object string, options ...Get
 	return resp.n, nil
 }
 
-// GetObjectWithValidation API
+// GetObjectReader returns reader of the requested object. It does not read body
+// bytes, nor validates a checksum. Caller is responsible for closing the reader.
+func GetObjectReader(baseParams BaseParams, bck cmn.Bck, object string, options ...GetObjectInput) (r io.ReadCloser, err error) {
+	var (
+		q   url.Values
+		hdr http.Header
+	)
+	if len(options) != 0 {
+		var w io.Writer
+		w, q, hdr = getObjectOptParams(options[0])
+		cmn.Assert(w == nil)
+	}
+
+	q = cmn.AddBckToQuery(q, bck)
+	baseParams.Method = http.MethodGet
+	return doHTTPRequestGetRespReader(ReqParams{
+		BaseParams: baseParams,
+		Path:       cmn.JoinWords(cmn.Version, cmn.Objects, bck.Name, object),
+		Query:      q,
+		Header:     hdr,
+	})
+}
+
+// GetObjectWithValidation has same behavior as GetObject, but performs checksum
+// validation of the object by comparing the checksum in the response header
+// with the calculated checksum value derived from the returned object.
 //
-// Same behavior as GetObject, but performs checksum validation of the object
-// by comparing the checksum in the response header with the calculated checksum
-// value derived from the returned object.
+// Similar to GetObject, if a memory manager/slab allocator is not specified, a
+// temporary buffer is allocated when reading from the response body to compute
+// the object checksum.
 //
-// Similar to GetObject, if a memory manager/slab allocator is not specified, a temporary buffer
-// is allocated when reading from the response body to compute the object checksum.
-//
-// Returns InvalidCksumError when the expected and actual checksum values are different.
+// Returns `cmn.InvalidCksumError` when the expected and actual checksum values
+// are different.
 func GetObjectWithValidation(baseParams BaseParams, bck cmn.Bck, object string, options ...GetObjectInput) (n int64, err error) {
 	var (
 		w   = ioutil.Discard
@@ -202,7 +220,7 @@ func GetObjectWithValidation(baseParams BaseParams, bck cmn.Bck, object string, 
 
 	resp, err := doHTTPRequestGetResp(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Objects, bck.Name, object),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Objects, bck.Name, object),
 		Query:      q,
 		Header:     hdr,
 		Validate:   true,
@@ -218,13 +236,11 @@ func GetObjectWithValidation(baseParams BaseParams, bck cmn.Bck, object string, 
 	return resp.n, nil
 }
 
-// GetObjectWithResp API
-//
-// Returns the response of the request and length of the object. Does not
-// validate checksum of the object in the response.
+// GetObjectWithResp returns the response of the request and length of the object.
+// Does not validate checksum of the object in the response.
 //
 // Writes the response body to a writer if one is specified in the optional
-// GetObjectInput.Writer. Otherwise, it discards the response body read.
+// `GetObjectInput.Writer`. Otherwise, it discards the response body read.
 //
 // `io.Copy` is used internally to copy response bytes from the request to the writer.
 func GetObjectWithResp(baseParams BaseParams, bck cmn.Bck, object string, options ...GetObjectInput) (*http.Response, int64, error) {
@@ -240,7 +256,7 @@ func GetObjectWithResp(baseParams BaseParams, bck cmn.Bck, object string, option
 	baseParams.Method = http.MethodGet
 	resp, err := doHTTPRequestGetResp(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Objects, bck.Name, object),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Objects, bck.Name, object),
 		Query:      q,
 		Header:     hdr,
 	}, w)
@@ -250,20 +266,16 @@ func GetObjectWithResp(baseParams BaseParams, bck cmn.Bck, object string, option
 	return resp.Response, resp.n, nil
 }
 
-// PutObject API
+// PutObject creates an object from the body of the reader argument and puts
+// it in the specified bucket.
 //
-// Creates an object from the body of the io.Reader parameter and puts it in the 'bucket' bucket
-// If there is an ais bucket and cloud bucket with the same name, specify with provider ("ais", "cloud")
-// The object name is specified by the 'object' argument.
-// If the object hash passed in is not empty, the value is set
-// in the request header with the default checksum type "xxhash"
-// Assumes that args.Reader is already opened and ready for usage
+// Assumes that `args.Reader` is already opened and ready for usage.
 func PutObject(args PutObjectArgs) (err error) {
 	query := cmn.AddBckToQuery(nil, args.Bck)
 	reqArgs := cmn.ReqArgs{
 		Method: http.MethodPut,
 		Base:   args.BaseParams.URL,
-		Path:   cmn.URLPath(cmn.Version, cmn.Objects, args.Bck.Name, args.Object),
+		Path:   cmn.JoinWords(cmn.Version, cmn.Objects, args.Bck.Name, args.Object),
 		Query:  query,
 		BodyR:  args.Reader,
 	}
@@ -296,13 +308,11 @@ func PutObject(args PutObjectArgs) (err error) {
 		setAuthToken(req, args.BaseParams)
 		return req, nil
 	}
-	_, err = DoReqWithRetry(args.BaseParams.Client, newRequest, reqArgs) // nolint:bodyclose // it's closed inside
+	_, err = DoReqWithRetry(args.BaseParams.Client, newRequest, reqArgs) // nolint:bodyclose // is closed inside
 	return err
 }
 
-// AppendObject API
-//
-// Append builds the object which should be finished with `FlushObject` request.
+// AppendObject builds the object which should be finished with `FlushObject` request.
 // It returns handle which works as id for subsequent append requests so the
 // correct object can be identified.
 //
@@ -317,7 +327,7 @@ func AppendObject(args AppendArgs) (handle string, err error) {
 	reqArgs := cmn.ReqArgs{
 		Method: http.MethodPut,
 		Base:   args.BaseParams.URL,
-		Path:   cmn.URLPath(cmn.Version, cmn.Objects, args.Bck.Name, args.Object),
+		Path:   cmn.JoinWords(cmn.Version, cmn.Objects, args.Bck.Name, args.Object),
 		Query:  query,
 		BodyR:  args.Reader,
 	}
@@ -346,56 +356,7 @@ func AppendObject(args AppendArgs) (handle string, err error) {
 	return resp.Header.Get(cmn.HeaderAppendHandle), err
 }
 
-// Makes Client.Do request and retries it when got Broken Pipe or Connection Refused error
-// Should be used for PUT requests as it puts reader into a request
-func DoReqWithRetry(client *http.Client, newRequest func(_ cmn.ReqArgs) (*http.Request, error), reqArgs cmn.ReqArgs) (resp *http.Response, err error) {
-	var (
-		r     io.ReadCloser
-		req   *http.Request
-		sleep = httpRetrySleep
-	)
-	reader := reqArgs.BodyR.(cmn.ReadOpenCloser)
-	if req, err = newRequest(reqArgs); err != nil {
-		return
-	}
-	if resp, err = client.Do(req); !shouldRetryHTTP(err) {
-		goto exit
-	}
-	for i := 0; i < httpMaxRetries; i++ {
-		time.Sleep(sleep)
-		sleep += sleep / 2
-
-		if r, err = reader.Open(); err != nil {
-			return
-		}
-		reqArgs.BodyR = r
-
-		if req, err = newRequest(reqArgs); err != nil {
-			r.Close()
-			return
-		}
-		if resp, err = client.Do(req); !shouldRetryHTTP(err) {
-			goto exit
-		}
-	}
-exit:
-	if err != nil {
-		return nil, fmt.Errorf("failed to %s, err: %v", reqArgs.Method, err)
-	}
-	_, err = readResp(ReqParams{}, resp, nil)
-	if errC := resp.Body.Close(); err == nil {
-		return resp, errC
-	}
-	return
-}
-
-func shouldRetryHTTP(err error) bool {
-	return err != nil && (cmn.IsErrConnectionReset(err) || cmn.IsErrConnectionRefused(err))
-}
-
-// FlushObject API
-//
-// Flushing should occur once all appends have finished successfully.
+// FlushObject should occur once all appends have finished successfully.
 // This call will create a fully operational object and requires handle to be set.
 func FlushObject(args FlushArgs) (err error) {
 	query := make(url.Values)
@@ -413,30 +374,28 @@ func FlushObject(args FlushArgs) (err error) {
 	args.BaseParams.Method = http.MethodPut
 	return DoHTTPRequest(ReqParams{
 		BaseParams: args.BaseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Objects, args.Bck.Name, args.Object),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Objects, args.Bck.Name, args.Object),
 		Query:      query,
 		Header:     header,
 	})
 }
 
-// RenameObject API
-//
-// Creates a cmn.ActionMsg with the new name of the object
-// and sends a POST HTTP Request to /v1/objects/bucket-name/object-name
+// RenameObject renames object name from `oldName` to `newName`. Works only
+// across single, specified bucket.
 //
 // FIXME: handle cloud provider - here and elsewhere
 func RenameObject(baseParams BaseParams, bck cmn.Bck, oldName, newName string) error {
 	baseParams.Method = http.MethodPost
 	return DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Objects, bck.Name, oldName),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Objects, bck.Name, oldName),
 		Body:       cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActRenameObject, Name: newName}),
 	})
 }
 
-// PromoteFileOrDir API
+// PromoteFileOrDir promotes AIS-colocated files and directories to objects.
 //
-// promote AIS-colocated files and directories to objects (NOTE: advanced usage only)
+// NOTE: Advanced usage only.
 func PromoteFileOrDir(args *PromoteArgs) error {
 	actMsg := cmn.ActionMsg{Action: cmn.ActPromote, Name: args.FQN}
 	actMsg.Value = &cmn.ActValPromote{
@@ -444,161 +403,71 @@ func PromoteFileOrDir(args *PromoteArgs) error {
 		ObjName:   args.Object,
 		Recurs:    args.Recurs,
 		Overwrite: args.Overwrite,
+		KeepOrig:  args.KeepOrig,
 		Verbose:   args.Verbose,
 	}
 
 	args.BaseParams.Method = http.MethodPost
 	return DoHTTPRequest(ReqParams{
 		BaseParams: args.BaseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Objects, args.Bck.Name),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Objects, args.Bck.Name),
 		Body:       cmn.MustMarshal(actMsg),
 		Query:      cmn.AddBckToQuery(nil, args.Bck),
 	})
 }
 
-// Downloader API
-
-func DownloadSingle(baseParams BaseParams, description string, bck cmn.Bck, objName, link string) (string, error) {
-	dlBody := downloader.DlSingleBody{
-		DlSingleObj: downloader.DlSingleObj{
-			ObjName: objName,
-			Link:    link,
-		},
+// DoReqWithRetry makes `client.Do` request and retries it when got "Broken Pipe"
+// or "Connection Refused" error.
+//
+// Should be used for PUT requests as it puts reader into a request.
+func DoReqWithRetry(client *http.Client, newRequest func(_ cmn.ReqArgs) (*http.Request, error),
+	reqArgs cmn.ReqArgs) (resp *http.Response, err error) {
+	var (
+		r     io.ReadCloser
+		req   *http.Request
+		sleep = httpRetrySleep
+	)
+	reader := reqArgs.BodyR.(cmn.ReadOpenCloser)
+	if req, err = newRequest(reqArgs); err != nil {
+		return
 	}
-	dlBody.Bck = bck
-	dlBody.Description = description
-	return DownloadWithParam(baseParams, downloader.DlTypeSingle, &dlBody)
-}
-
-func DownloadRange(baseParams BaseParams, description string, bck cmn.Bck, template string) (string, error) {
-	dlBody := downloader.DlRangeBody{
-		Template: template,
+	if resp, err = client.Do(req); !shouldRetryHTTP(err, resp) {
+		goto exit
 	}
-	dlBody.Bck = bck
-	dlBody.Description = description
-	return DownloadWithParam(baseParams, downloader.DlTypeRange, dlBody)
-}
-
-func DownloadWithParam(baseParams BaseParams, dlt downloader.DlType, body interface{}) (string, error) {
-	baseParams.Method = http.MethodPost
-	return doDlDownloadRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Download),
-		Body:       cmn.MustMarshal(downloader.DlBody{Type: dlt, RawMessage: cmn.MustMarshal(body)}),
-	})
-}
-
-func DownloadMulti(baseParams BaseParams, description string, bck cmn.Bck, msg interface{}) (string, error) {
-	dlBody := downloader.DlMultiBody{}
-	dlBody.Bck = bck
-	dlBody.Description = description
-	dlBody.ObjectsPayload = msg
-	return DownloadWithParam(baseParams, downloader.DlTypeMulti, dlBody)
-}
-
-func DownloadCloud(baseParams BaseParams, description string, bck cmn.Bck, prefix, suffix string) (string, error) {
-	dlBody := downloader.DlCloudBody{
-		Prefix: prefix,
-		Suffix: suffix,
+	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+		sleep = httpRetryRateSleep
 	}
-	dlBody.Bck = bck
-	dlBody.Description = description
-	return DownloadWithParam(baseParams, downloader.DlTypeCloud, dlBody)
-}
+	for i := 0; i < httpMaxRetries; i++ {
+		time.Sleep(sleep)
+		sleep += sleep / 2
 
-func DownloadStatus(baseParams BaseParams, id string) (downloader.DlStatusResp, error) {
-	dlBody := downloader.DlAdminBody{
-		ID: id,
+		if r, err = reader.Open(); err != nil {
+			return
+		}
+		reqArgs.BodyR = r
+
+		if req, err = newRequest(reqArgs); err != nil {
+			r.Close()
+			return
+		}
+		if resp, err = client.Do(req); !shouldRetryHTTP(err, resp) {
+			goto exit
+		}
 	}
-	baseParams.Method = http.MethodGet
-	return doDlStatusRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Download),
-		Body:       cmn.MustMarshal(dlBody),
-	})
-}
-
-func DownloadGetList(baseParams BaseParams, regex string) (dlList downloader.DlJobInfos, err error) {
-	dlBody := downloader.DlAdminBody{
-		Regex: regex,
+exit:
+	if err != nil {
+		return nil, fmt.Errorf("failed to %s, err: %v", reqArgs.Method, err)
 	}
-	baseParams.Method = http.MethodGet
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Download),
-		Body:       cmn.MustMarshal(dlBody),
-	}, &dlList)
-	sort.Sort(dlList)
-	return dlList, err
-}
-
-func DownloadAbort(baseParams BaseParams, id string) error {
-	dlBody := downloader.DlAdminBody{
-		ID: id,
+	_, err = readResp(ReqParams{}, resp, nil)
+	if errC := resp.Body.Close(); err == nil {
+		return resp, errC
 	}
-	baseParams.Method = http.MethodDelete
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Download, cmn.Abort),
-		Body:       cmn.MustMarshal(dlBody),
-	})
-}
-
-func DownloadRemove(baseParams BaseParams, id string) error {
-	dlBody := downloader.DlAdminBody{
-		ID: id,
-	}
-	baseParams.Method = http.MethodDelete
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Download, cmn.Remove),
-		Body:       cmn.MustMarshal(dlBody),
-	})
-}
-
-func doDlDownloadRequest(reqParams ReqParams) (string, error) {
-	var resp downloader.DlPostResp
-	err := DoHTTPRequest(reqParams, &resp)
-	return resp.ID, err
-}
-
-func doDlStatusRequest(reqParams ReqParams) (resp downloader.DlStatusResp, err error) {
-	err = DoHTTPRequest(reqParams, &resp)
-	return resp, err
-}
-
-func TransformInit(baseParams BaseParams, spec []byte) (id string, err error) {
-	baseParams.Method = http.MethodPost
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.ETL, cmn.EtlInit),
-		Body:       spec,
-	}, &id)
-	return id, err
-}
-
-func TransformList(baseParams BaseParams) (list []etl.Info, err error) {
-	baseParams.Method = http.MethodGet
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.ETL, cmn.EtlList),
-	}, &list)
-	return list, err
-}
-
-func TransformStop(baseParams BaseParams, id string) (err error) {
-	baseParams.Method = http.MethodDelete
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.ETL, cmn.EtlStop, id),
-	})
-	return err
-}
-
-func TransformObject(baseParams BaseParams, id string, bck cmn.Bck, objName string, w io.Writer) (err error) {
-	_, err = GetObject(baseParams, bck, objName, GetObjectInput{
-		Writer: w,
-		Query:  url.Values{cmn.URLParamUUID: []string{id}},
-	})
 	return
+}
+
+func shouldRetryHTTP(err error, resp *http.Response) bool {
+	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	return err != nil && (cmn.IsErrConnectionReset(err) || cmn.IsErrConnectionRefused(err))
 }

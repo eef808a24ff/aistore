@@ -5,10 +5,8 @@
 package tutils
 
 import (
-	"errors"
 	"fmt"
 	"math/rand"
-	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -74,32 +72,40 @@ func ExtractTargetNodes(smap *cluster.Smap) cluster.Nodes {
 }
 
 func ExtractProxyNodes(smap *cluster.Smap) cluster.Nodes {
-	proxies := make(cluster.Nodes, 0, smap.CountTargets())
+	proxies := make(cluster.Nodes, 0, smap.CountProxies())
 	for _, proxy := range smap.Pmap {
 		proxies = append(proxies, proxy)
 	}
 	return proxies
 }
 
-func RandomProxyURL(ts ...*testing.T) string {
+func RandomProxyURL(ts ...*testing.T) (url string) {
 	var (
-		httpErr    = &cmn.HTTPError{}
 		baseParams = BaseAPIParams(proxyURLReadOnly)
+		smap, err  = waitForStartup(baseParams, ts...)
+		retries    = 3
 	)
-while503:
-	smap, err := api.GetClusterMap(baseParams)
-	if err != nil && errors.As(err, &httpErr) && httpErr.Status == http.StatusServiceUnavailable {
-		Logln("waiting for the cluster to start up...")
-		time.Sleep(waitClusterStartup)
-		goto while503
+	if err == nil {
+		return _getRandomProxyURL(smap)
 	}
-	if err != nil {
-		Logf("unable to get usable cluster map, err: %v\n", err)
-		if len(ts) > 0 {
-			tassert.CheckFatal(ts[0], err)
+	for _, node := range pmapReadOnly {
+		url := node.URL(cmn.NetworkPublic)
+		if url == proxyURLReadOnly {
+			continue
 		}
-		return ""
+		if retries == 0 {
+			return ""
+		}
+		baseParams = BaseAPIParams(url)
+		if smap, err = waitForStartup(baseParams, ts...); err == nil {
+			return _getRandomProxyURL(smap)
+		}
+		retries--
 	}
+	return ""
+}
+
+func _getRandomProxyURL(smap *cluster.Smap) string {
 	proxies := ExtractProxyNodes(smap)
 	return proxies[rand.Intn(len(proxies))].URL(cmn.NetworkPublic)
 }
@@ -217,6 +223,14 @@ func WaitForPrimaryProxy(proxyURL, reason string, origVersion int64, verbose boo
 	}
 
 	return nil, fmt.Errorf("timed out waiting for the cluster to stabilize")
+}
+
+func WaitNodeRestored(t *testing.T, proxyURL, reason, nodeID string, origVersion int64, verbose bool, nodeCnt ...int) *cluster.Smap {
+	smap, err := WaitForPrimaryProxy(proxyURL, reason, origVersion, verbose, nodeCnt...)
+	tassert.CheckFatal(t, err)
+	_, err = api.WaitNodeAdded(BaseAPIParams(proxyURL), nodeID)
+	tassert.CheckFatal(t, err)
+	return smap
 }
 
 func WaitMapVersionSync(timeout time.Time, smap *cluster.Smap, prevVersion int64, idsToIgnore []string) error {

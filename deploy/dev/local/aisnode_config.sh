@@ -1,9 +1,9 @@
 cat > $AIS_CONF_FILE <<EOL
 {
 	"confdir": "${AIS_CONF_DIR}",
-	"cloud": {
-		"${AIS_CLD_PROVIDER}": {}
-	},
+  "cloud": {
+    $(for i in ${AIS_CLD_PROVIDERS};do echo -n "\"${i}\":{}", ;done | sed 's/,$//')
+  },
 	"mirror": {
 		"copies":       2,
 		"burst_buffer": 512,
@@ -27,6 +27,7 @@ cat > $AIS_CONF_FILE <<EOL
 	},
 	"periodic": {
 		"stats_time":        "10s",
+		"notif_time":        "30s",
 		"retry_sync_time":   "2s"
 	},
 	"timeout": {
@@ -39,6 +40,7 @@ cat > $AIS_CONF_FILE <<EOL
 	"client": {
 		"client_timeout":      "10s",
 		"client_long_timeout": "30m",
+		"allow_direct_access": false,
 		"list_timeout":        "3m"
 	},
 	"proxy": {
@@ -66,7 +68,7 @@ cat > $AIS_CONF_FILE <<EOL
 		"enabled":         true,
 		"dont_run_time":   "0m",
 		"dest_retry_time": "2m",
-		"quiescent":       "20s",
+		"quiescent":       "10s",
 		"compression":     "${COMPRESSION:-never}",
 		"multiplier":      ${REBALANCE_MULTIPLIER:-4}
 	},
@@ -111,9 +113,7 @@ cat > $AIS_CONF_FILE <<EOL
 			"write_buffer_size": ${HTTP_WRITE_BUFFER_SIZE:-0},
 			"read_buffer_size":  ${HTTP_READ_BUFFER_SIZE:-0},
 			"chunked_transfer":  ${CHUNKED_TRANSFER:-true},
-			"skip_verify":       ${AIS_SKIP_VERIFY_CRT:-false},
-			"rproxy":            "",
-			"rproxy_cache":      true
+			"skip_verify":       ${AIS_SKIP_VERIFY_CRT:-false}
 		}
 	},
 	"fshc": {

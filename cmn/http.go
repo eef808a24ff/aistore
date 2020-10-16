@@ -14,7 +14,6 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -22,7 +21,6 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -45,6 +43,7 @@ const (
 	HeaderContentLength         = "Content-Length"
 	HeaderAccept                = "Accept"
 	HeaderLocation              = "Location"
+	HeaderETag                  = "ETag" // Ref: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag
 )
 
 // Ref: https://www.iana.org/assignments/media-types/media-types.xhtml
@@ -83,15 +82,26 @@ type (
 		Base   string      // base URL: http://xyz.abc
 		Path   string      // path URL: /x/y/z
 		Query  url.Values  // query: ?x=y&y=z
-		Body   []byte      // body for POST, PUT, ...
-		BodyR  io.Reader
+		Body   []byte      // body for [POST, PUT, ...]
+		// BodyR is an alternative to `Body` to avoid unnecessary allocations
+		// when body for [POST, PUT, ...] is in stored `io.Reader`.
+		BodyR io.Reader
+	}
+
+	ObjHeaderMetaProvider interface {
+		Size() int64
+		Cksum() *Cksum
+		Version() string
+		AtimeUnix() int64
+		CustomMD() SimpleKVs
 	}
 )
 
 // Eg: Bad Request: Bucket abc does not appear to be local or does not exist:
 //   DELETE /v1/buckets/abc from 127.0.0.1:54064| ([httpcommon.go, #840] <- [proxy.go, #484] <- [proxy.go, #264])
 func (e *HTTPError) String() string {
-	return http.StatusText(e.Status) + ": " + e.Message + ": " + e.Method + " " + e.URLPath + " from " + e.RemoteAddr + "| (" + e.Trace + ")"
+	return http.StatusText(e.Status) + ": " + e.Message + ": " +
+		e.Method + " " + e.URLPath + " from " + e.RemoteAddr + "| (" + e.Trace + ")"
 }
 
 // Implements error interface
@@ -118,12 +128,10 @@ func NewHTTPError(r *http.Request, msg string, status int) (*HTTPError, bool) {
 	if err := jsoniter.UnmarshalFromString(msg, &httpErr); err == nil {
 		return &httpErr, true
 	}
-	return &HTTPError{Status: status, Message: msg, Method: r.Method, URLPath: r.URL.Path, RemoteAddr: r.RemoteAddr}, false
-}
-
-// URLPath returns a HTTP URL path by joining all segments with "/"
-func URLPath(segments ...string) string {
-	return path.Join("/", path.Join(segments...))
+	return &HTTPError{
+		Status: status, Message: msg, Method: r.Method,
+		URLPath: r.URL.Path, RemoteAddr: r.RemoteAddr,
+	}, false
 }
 
 // PrependProtocol prepends protocol in URL in case it is missing.
@@ -152,10 +160,10 @@ func RESTItems(unescapedPath string) []string {
 	return apiItems
 }
 
-// MatchRESTItems splits url path into api items and match them with provided
-// items. If splitAfter is set to true all items will be split, otherwise the
-// rest of the path will be split only to itemsAfter items. Returns all items
-// which come after all of the provided items
+// MatchRESTItems splits url path and matches the parts against specified `items`.
+// If `splitAfter` is true all items will be split, otherwise the
+// rest of the path will be split only to `itemsAfter` items.
+// Returns all items that follow the specified `items`.
 func MatchRESTItems(unescapedPath string, itemsAfter int, splitAfter bool, items ...string) ([]string, error) {
 	var split []string
 	escaped := html.EscapeString(unescapedPath)
@@ -185,9 +193,11 @@ func MatchRESTItems(unescapedPath string, itemsAfter int, splitAfter bool, items
 
 	apiItems = apiItems[len(items):]
 	if len(apiItems) < itemsAfter {
-		return nil, fmt.Errorf("path is too short: got %d items, but expected %d", len(apiItems)+len(items), itemsAfter+len(items))
+		return nil, fmt.Errorf("path is too short: got %d items, but expected %d",
+			len(apiItems)+len(items), itemsAfter+len(items))
 	} else if len(apiItems) > itemsAfter && !splitAfter {
-		return nil, fmt.Errorf("path is too long: got %d items, but expected %d", len(apiItems)+len(items), itemsAfter+len(items))
+		return nil, fmt.Errorf("path is too long: got %d items, but expected %d",
+			len(apiItems)+len(items), itemsAfter+len(items))
 	}
 
 	return apiItems, nil
@@ -268,9 +278,7 @@ func InvalidHandlerDetailedNoLog(w http.ResponseWriter, r *http.Request, msg str
 }
 
 func ReadBytes(r *http.Request) (b []byte, err error) {
-	var (
-		e error
-	)
+	var e error
 
 	b, e = ioutil.ReadAll(r.Body)
 	if e != nil {
@@ -282,15 +290,13 @@ func ReadBytes(r *http.Request) (b []byte, err error) {
 			}
 		}
 	}
-	debug.AssertNoErr(r.Body.Close())
+	Close(r.Body)
 
 	return b, err
 }
 
 func ReadJSON(w http.ResponseWriter, r *http.Request, out interface{}, optional ...bool) error {
-	defer func() {
-		debug.AssertNoErr(r.Body.Close())
-	}()
+	defer Close(r.Body)
 	if err := jsoniter.NewDecoder(r.Body).Decode(out); err != nil {
 		if len(optional) > 0 && optional[0] && err == io.EOF {
 			return nil
@@ -401,10 +407,6 @@ func MakeHeaderAuthnToken(token string) string {
 	return HeaderBearer + " " + token
 }
 
-func IsHTTPS(urlPath string) bool {
-	return strings.HasPrefix(urlPath, "https://")
-}
-
 func (r HTTPRange) ContentRange(size int64) string {
 	return fmt.Sprintf("%s%d-%d/%d", HeaderContentRangeValPrefix, r.Start, r.Start+r.Length-1, size)
 }
@@ -492,4 +494,32 @@ func RangeHdr(start, length int64) (hdr http.Header) {
 	hdr = make(http.Header, 1)
 	hdr.Add(HeaderRange, fmt.Sprintf("%s%d-%d", HeaderRangeValPrefix, start, start+length-1))
 	return
+}
+
+func ToHTTPHdr(meta ObjHeaderMetaProvider, hdrs ...http.Header) (hdr http.Header) {
+	if len(hdrs) == 0 || hdrs[0] == nil {
+		hdr = make(http.Header, 4)
+	} else {
+		hdr = hdrs[0]
+	}
+
+	if meta.Size() > 0 {
+		hdr.Set(HeaderContentLength, strconv.FormatInt(meta.Size(), 10))
+	}
+	if meta.Cksum() != nil {
+		if ty, val := meta.Cksum().Get(); ty != ChecksumNone {
+			hdr.Set(HeaderObjCksumType, ty)
+			hdr.Set(HeaderObjCksumVal, val)
+		}
+	}
+	if meta.Version() != "" {
+		hdr.Set(HeaderObjVersion, meta.Version())
+	}
+	if meta.AtimeUnix() != 0 {
+		hdr.Set(HeaderObjAtime, UnixNano2S(meta.AtimeUnix()))
+	}
+	for k, v := range meta.CustomMD() {
+		hdr.Add(HeaderObjCustomMD, strings.Join([]string{k, v}, "="))
+	}
+	return hdr
 }

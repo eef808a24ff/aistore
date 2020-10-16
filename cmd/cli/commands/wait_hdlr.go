@@ -73,30 +73,13 @@ func waitXactionHandler(c *cli.Context) error {
 		return err
 	}
 
-	latest := !flagIsSet(c, allItemsFlag)
-	if xactID != "" {
-		latest = false
+	refreshRate := calcRefreshRate(c)
+	xactArgs := api.XactReqArgs{ID: xactID, Kind: xactKind, Bck: bck}
+	status, err := api.WaitForXaction(defaultAPIParams, xactArgs, refreshRate)
+	if err != nil {
+		return err
 	}
-
-	var (
-		aborted     bool
-		refreshRate = calcRefreshRate(c)
-	)
-	for {
-		xactArgs := api.XactReqArgs{ID: xactID, Kind: xactKind, Bck: bck, Latest: latest}
-		xactStats, err := api.QueryXactionStats(defaultAPIParams, xactArgs)
-
-		if err != nil {
-			return err
-		}
-
-		aborted = xactStats.Aborted()
-		if aborted || xactStats.Finished() {
-			break
-		}
-		time.Sleep(refreshRate)
-	}
-	if aborted {
+	if status.Aborted() {
 		if xactID != "" {
 			return fmt.Errorf("xaction %q was aborted", xactID)
 		}
@@ -130,7 +113,7 @@ func waitDownloadHandler(c *cli.Context) (err error) {
 	}
 
 	for {
-		resp, err := api.DownloadStatus(defaultAPIParams, id)
+		resp, err := api.DownloadStatus(defaultAPIParams, id, true)
 		if err != nil {
 			return err
 		}

@@ -201,7 +201,7 @@ func TestMetaSyncDeepCopy(t *testing.T) {
 	clone := &bucketMD{}
 	bmd.deepCopy(clone)
 
-	var jsonCompat = jsoniter.ConfigCompatibleWithStandardLibrary
+	jsonCompat := jsoniter.ConfigCompatibleWithStandardLibrary
 	b1, _ := jsonCompat.Marshal(bmd)
 	s1 := string(b1)
 	b2, _ := jsonCompat.Marshal(clone)
@@ -420,27 +420,29 @@ func multipleSync(t *testing.T, primary *proxyrunner, syncer *metasyncer) ([]tra
 	msg := primary.newAisMsgStr("", smap, nil)
 	syncer.sync(revsPair{smap, msg}).Wait()
 
-	primary.owner.smap.modify(
-		func(clone *smapX) error {
+	ctx := &smapModifier{
+		pre: func(_ *smapModifier, clone *smapX) error {
 			clone.Version++
 			return nil
 		},
-		func(clone *smapX) {
+		post: func(_ *smapModifier, clone *smapX) {
 			msg := primary.newAisMsgStr("", clone, nil)
 			syncer.sync(revsPair{clone, msg})
 		},
-	)
+	}
+	primary.owner.smap.modify(ctx)
 
-	primary.owner.smap.modify(
-		func(clone *smapX) error {
+	ctx = &smapModifier{
+		pre: func(_ *smapModifier, clone *smapX) error {
 			clone.Version++
 			return nil
 		},
-		func(clone *smapX) {
+		post: func(_ *smapModifier, clone *smapX) {
 			msg := primary.newAisMsgStr("", clone, nil)
 			syncer.sync(revsPair{clone, msg}).Wait()
 		},
-	)
+	}
+	primary.owner.smap.modify(ctx)
 
 	return []transportData{
 		{true, "p1", 1},
@@ -473,7 +475,7 @@ func refused(t *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transpor
 	)
 
 	// handler for /v1/metasync
-	http.HandleFunc(cmn.URLPath(cmn.Version, cmn.Metasync), func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(cmn.JoinWords(cmn.Version, cmn.Metasync), func(w http.ResponseWriter, r *http.Request) {
 		ch <- transportData{true, id, 1}
 	})
 
@@ -515,16 +517,17 @@ func refused(t *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transpor
 	f()
 
 	// testcase #2: long delay
-	primary.owner.smap.modify(
-		func(clone *smapX) error {
+	ctx := &smapModifier{
+		pre: func(_ *smapModifier, clone *smapX) error {
 			clone.Version++
 			return nil
 		},
-		func(clone *smapX) {
+		post: func(_ *smapModifier, clone *smapX) {
 			msg := primary.newAisMsgStr("", clone, nil)
 			syncer.sync(revsPair{clone, msg})
 		},
-	)
+	}
+	primary.owner.smap.modify(ctx)
 
 	time.Sleep(2 * time.Second)
 	f()

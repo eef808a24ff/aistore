@@ -7,22 +7,46 @@ package ais
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
-//===========================================================================
+//
+// request validation helpers - TODO: optionally, check node IDs vs Smap
+//
+func isIntraCall(hdr http.Header) bool { return hdr != nil && hdr.Get(cmn.HeaderCallerID) != "" }
+func isIntraPut(hdr http.Header) bool  { return hdr != nil && hdr.Get(cmn.HeaderPutterID) != "" }
+
+func isRedirect(q url.Values) (delta string) {
+	if len(q) == 0 || q.Get(cmn.URLParamProxyID) == "" {
+		return
+	}
+	return q.Get(cmn.URLParamUnixTime)
+}
+
+func redirectLatency(started time.Time, ptime string) (redelta int64) {
+	pts, err := cmn.S2UnixNano(ptime)
+	if err != nil {
+		glog.Errorf("unexpected: failed to convert %s to int, err: %v", ptime, err)
+		return
+	}
+	redelta = started.UnixNano() - pts
+	if redelta < 0 && -redelta < int64(clusterClockDrift) {
+		redelta = 0
+	}
+	return
+}
+
 //
 // IPV4
 //
-//===========================================================================
 
 // Local unicast IP info
 type localIPv4Info struct {
@@ -101,31 +125,27 @@ func selectConfiguredIPv4(addrlist []*localIPv4Info, configuredList []string) (i
 	return "", fmt.Errorf("configured IPv4 does not match any local one")
 }
 
-// detectLocalIPv4 takes a list of local IPv4s and returns the best fit for a deamon to listen on it
-func detectLocalIPv4(addrlist []*localIPv4Info) (ip net.IP, err error) {
-	if len(addrlist) == 0 {
+// detectLocalIPv4 takes a list of local IPv4s and returns the best fit for a daemon to listen on it
+func detectLocalIPv4(addrList []*localIPv4Info) (ip net.IP, err error) {
+	if len(addrList) == 0 {
 		return nil, fmt.Errorf("no addresses to choose from")
-	} else if len(addrlist) == 1 {
-		msg := fmt.Sprintf("Found only one IPv4: %s, MTU %d", addrlist[0].ipv4, addrlist[0].mtu)
-		glog.Info(msg)
-		if addrlist[0].mtu <= 1500 {
-			glog.Warningf("IPv4 %s MTU size is small: %d\n", addrlist[0].ipv4, addrlist[0].mtu)
+	} else if len(addrList) == 1 {
+		glog.Infof("Found only one IPv4: %s, MTU %d", addrList[0].ipv4, addrList[0].mtu)
+		if addrList[0].mtu <= 1500 {
+			glog.Warningf("IPv4 %s MTU size is small: %d\n", addrList[0].ipv4, addrList[0].mtu)
 		}
-		ip = net.ParseIP(addrlist[0].ipv4)
-		if ip == nil {
-			return nil, fmt.Errorf("failed to parse IP address: %s", addrlist[0].ipv4)
+		if ip = net.ParseIP(addrList[0].ipv4); ip == nil {
+			return nil, fmt.Errorf("failed to parse IP address: %s", addrList[0].ipv4)
 		}
 		return ip, nil
 	}
 
-	glog.Warningf("Warning: %d IPv4s available", len(addrlist))
-	for _, intf := range addrlist {
-		glog.Warningf("    %#v\n", *intf)
+	glog.Warningf("%d IPv4s available", len(addrList))
+	for _, addr := range addrList {
+		glog.Warningf("    %#v\n", *addr)
 	}
-	// FIXME: temp hack - make sure to keep working on laptops with dockers
-	ip = net.ParseIP(addrlist[0].ipv4)
-	if ip == nil {
-		return nil, fmt.Errorf("failed to parse IP address: %s", addrlist[0].ipv4)
+	if ip = net.ParseIP(addrList[0].ipv4); ip == nil {
+		return nil, fmt.Errorf("failed to parse IP address: %s", addrList[0].ipv4)
 	}
 	return ip, nil
 }
@@ -151,25 +171,9 @@ func getIPv4(addrList []*localIPv4Info, configuredIPv4s string) (ip net.IP, err 
 	return ip, nil
 }
 
-// FIXME: usage
-// mentioned in the https://github.com/golang/go/issues/11745#issuecomment-123555313 thread
-// there must be a better way to handle this..
-func isSyscallWriteError(err error) bool {
-	switch e := err.(type) {
-	case *url.Error:
-		return isSyscallWriteError(e.Err)
-	case *net.OpError:
-		return e.Op == "write" && isSyscallWriteError(e.Err)
-	case *os.SyscallError:
-		return e.Syscall == "write"
-	default:
-		return false
-	}
-}
-
-/////////////////
-// Helpers     //
-/////////////////
+/////////////
+// HELPERS //
+/////////////
 
 func reMirror(bprops, nprops *cmn.BucketProps) bool {
 	if !bprops.Mirror.Enabled && nprops.Mirror.Enabled {
@@ -187,7 +191,7 @@ func reEC(bprops, nprops *cmn.BucketProps, bck *cluster.Bck) bool {
 	if !nprops.EC.Enabled {
 		if bprops.EC.Enabled {
 			// kill running ec-encode xact if it is active
-			xaction.Registry.DoAbort(cmn.ActECEncode, bck)
+			registry.Registry.DoAbort(cmn.ActECEncode, bck)
 		}
 		return false
 	}
@@ -198,20 +202,14 @@ func reEC(bprops, nprops *cmn.BucketProps, bck *cluster.Bck) bool {
 		bprops.EC.ParitySlices != nprops.EC.ParitySlices
 }
 
-func withLocalRetry(pred func() bool, maxTries ...int) {
-	var (
-		sleep = cmn.GCO.Get().Timeout.CplaneOperation / 2
-		max   = 3
-	)
-
-	if len(maxTries) > 0 {
-		max = maxTries[0]
+func withRetry(cond func() bool) (ok bool) {
+	if ok = cond(); !ok {
+		time.Sleep(time.Second)
+		ok = cond()
 	}
+	return
+}
 
-	for i := 0; i < max; i++ {
-		time.Sleep(sleep)
-		if pred() {
-			return
-		}
-	}
+func isETLRequest(query url.Values) bool {
+	return query.Get(cmn.URLParamUUID) != ""
 }

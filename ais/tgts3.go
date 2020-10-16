@@ -81,13 +81,10 @@ func (t *targetrunner) copyObjS3(w http.ResponseWriter, r *http.Request, items [
 		return
 	}
 
-	ri := replicInfo{
-		t:     t,
-		smap:  t.owner.smap.get(),
-		bckTo: bckDst,
-	}
+	coi := copyObjInfo{t: t}
+	coi.BckTo = bckDst
 	objName := path.Join(items[1:]...)
-	if _, err := ri.copyObject(lom, objName); err != nil {
+	if _, err := coi.copyObject(lom, objName); err != nil {
 		t.invalmsghdlr(w, r, err.Error())
 		return
 	}
@@ -119,9 +116,7 @@ func (t *targetrunner) directPutObjS3(w http.ResponseWriter, r *http.Request, it
 		t.invalmsghdlr(w, r, "object name is undefined")
 		return
 	}
-	var (
-		err error
-	)
+	var err error
 	objName := path.Join(items[1:]...)
 	lom := &cluster.LOM{T: t, ObjName: objName}
 	if err = lom.Init(bck.Bck, config); err != nil {
@@ -134,7 +129,7 @@ func (t *targetrunner) directPutObjS3(w http.ResponseWriter, r *http.Request, it
 			return
 		}
 	}
-	if lom.Bck().IsAIS() && lom.VerConf().Enabled {
+	if lom.Bck().IsAIS() && lom.VersionConf().Enabled {
 		lom.Load() // need to know the current version if versioning enabled
 	}
 	lom.SetAtimeUnix(started.UnixNano())
@@ -259,7 +254,7 @@ func (t *targetrunner) headObjS3(w http.ResponseWriter, r *http.Request, items [
 		return
 	}
 
-	if cmn.IsETLRequest(r.URL.Query()) {
+	if isETLRequest(r.URL.Query()) {
 		s3compat.SetETLHeader(w.Header(), lom)
 		return
 	}
@@ -286,7 +281,7 @@ func (t *targetrunner) delObjS3(w http.ResponseWriter, r *http.Request, items []
 		t.invalmsghdlr(w, r, err.Error())
 		return
 	}
-	err, errCode := t.objDelete(context.Background(), lom, false)
+	err, errCode := t.DeleteObject(context.Background(), lom, false)
 	if err != nil {
 		if errCode == http.StatusNotFound {
 			t.invalmsghdlrsilent(w, r,

@@ -22,9 +22,39 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/containers"
 	"github.com/NVIDIA/aistore/tutils"
+	"github.com/NVIDIA/aistore/tutils/readers"
 	"github.com/NVIDIA/aistore/tutils/tassert"
 	"golang.org/x/sync/errgroup"
 )
+
+func TestHTTPProviderBucket(t *testing.T) {
+	var (
+		bck = cmn.Bck{
+			Name:     t.Name() + "Bucket",
+			Provider: cmn.ProviderHTTP,
+		}
+		proxyURL   = tutils.RandomProxyURL(t)
+		baseParams = tutils.BaseAPIParams(proxyURL)
+	)
+
+	err := api.CreateBucket(baseParams, bck)
+	tassert.Fatalf(t, err != nil, "expected error")
+
+	_, err = api.GetObject(baseParams, bck, "nonexisting")
+	tassert.Fatalf(t, err != nil, "expected error")
+
+	_, err = api.ListObjects(baseParams, bck, nil, 0)
+	tassert.Fatalf(t, err != nil, "expected error")
+
+	reader, _ := readers.NewRandReader(cmn.KiB, cmn.ChecksumNone)
+	err = api.PutObject(api.PutObjectArgs{
+		BaseParams: baseParams,
+		Bck:        bck,
+		Object:     "something",
+		Reader:     reader,
+	})
+	tassert.Fatalf(t, err != nil, "expected error")
+}
 
 func Test_BucketNames(t *testing.T) {
 	var (
@@ -152,13 +182,11 @@ func TestStressCreateDestroyBucket(t *testing.T) {
 
 	for i := 0; i < bckCount; i++ {
 		group.Go(func() error {
-			var (
-				m = &ioContext{
-					t:      t,
-					num:    100,
-					silent: true,
-				}
-			)
+			m := &ioContext{
+				t:      t,
+				num:    100,
+				silent: true,
+			}
 
 			m.init()
 
@@ -320,80 +348,40 @@ func TestSetInvalidBucketProps(t *testing.T) {
 	}
 }
 
-func TestCloudListObjectVersions(t *testing.T) {
+func TestListObjectCloudVersions(t *testing.T) {
 	var (
-		workerCount = 10
-		objectDir   = "cloud-version-test"
-		objectSize  = 256
-		objectCount = 1340 // must be greater than 1000(AWS page size)
-		bck         = cmn.Bck{
-			Name:     clibucket,
-			Provider: cmn.AnyCloud,
+		m = ioContext{
+			t:        t,
+			bck:      cliBck,
+			num:      50,
+			fileSize: 128,
+			prefix:   cmn.RandString(6) + "-",
 		}
-		proxyURL = tutils.RandomProxyURL(t)
-		wg       = cmn.NewLimitedWaitGroup(40)
+		baseParams = tutils.BaseAPIParams()
 	)
 
-	tutils.CheckSkip(t, tutils.SkipTestArgs{Long: true, Cloud: true, Bck: bck})
+	tutils.CheckSkip(t, tutils.SkipTestArgs{Long: true, Cloud: true, Bck: m.bck})
 
-	baseParams := tutils.BaseAPIParams(proxyURL)
-	p, err := api.HeadBucket(baseParams, bck)
+	m.init()
+
+	p, err := api.HeadBucket(baseParams, m.bck)
 	tassert.CheckFatal(t, err)
 
-	// Enable local versioning management
-	_, err = api.SetBucketProps(baseParams, bck, cmn.BucketPropsToUpdate{
-		Versioning: &cmn.VersionConfToUpdate{Enabled: api.Bool(true)},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer api.SetBucketProps(baseParams, bck, cmn.BucketPropsToUpdate{
-		Versioning: &cmn.VersionConfToUpdate{Enabled: api.Bool(false)},
-	})
-
-	// Enabling local versioning may not work if the cloud bucket has
-	// versioning disabled. So, request props and do double check
-	bprops, err := api.HeadBucket(baseParams, bck)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !bprops.Versioning.Enabled {
+	if !p.Versioning.Enabled {
 		t.Skip("test requires a cloud bucket with enabled versioning")
 	}
 
-	tutils.Logf("Filling bucket %s\n", bck)
-	for wid := 0; wid < workerCount; wid++ {
-		wg.Add(1)
-		go func(wid int) {
-			defer wg.Done()
-			objectsToPut := objectCount / workerCount
-			if wid == workerCount-1 { // last worker puts leftovers
-				objectsToPut += objectCount % workerCount
-			}
-			tutils.PutRR(t, baseParams, int64(objectSize), p.Cksum.Type, bck, objectDir, objectsToPut, fnlen)
-		}(wid)
+	m.puts()
+	defer m.del()
 
-		wg.Wait()
+	tutils.Logf("Reading %q objects\n", m.bck)
+	msg := &cmn.SelectMsg{Prefix: m.prefix, Props: cmn.GetPropsVersion}
+	bckObjs, err := api.ListObjects(baseParams, m.bck, msg, 0)
+	tassert.CheckFatal(t, err)
 
-		tutils.Logf("Reading %q objects\n", bck)
-		msg := &cmn.SelectMsg{Prefix: objectDir, Props: cmn.GetPropsVersion}
-		bckObjs, err := api.ListObjects(baseParams, bck, msg, 0)
-		tassert.CheckFatal(t, err)
-
-		tutils.Logf("Checking %q object versions[total: %d]\n", bck, len(bckObjs.Entries))
-		for _, entry := range bckObjs.Entries {
-			if entry.Version == "" {
-				t.Errorf("Object %s does not have version", entry.Name)
-			}
-			wg.Add(1)
-			go func(name string) {
-				defer wg.Done()
-				err := api.DeleteObject(baseParams, bck, name)
-				tassert.CheckError(t, err)
-			}(entry.Name)
-		}
-		wg.Wait()
+	tutils.Logf("Checking %q object versions [total: %d]\n", m.bck, len(bckObjs.Entries))
+	for _, entry := range bckObjs.Entries {
+		tassert.Errorf(t, entry.Version != "", "Object %s does not have version", entry.Name)
 	}
 }
 
@@ -690,9 +678,10 @@ func TestListObjectsProps(t *testing.T) {
 func TestListObjectsCloudCached(t *testing.T) {
 	var (
 		baseParams = tutils.BaseAPIParams()
-		m          = ioContext{
+
+		m = ioContext{
 			t:        t,
-			bck:      cmn.Bck{Name: clibucket, Provider: cmn.AnyCloud},
+			bck:      cliBck,
 			num:      rand.Intn(100) + 10,
 			fileSize: 128,
 		}
@@ -868,7 +857,7 @@ func TestListObjects(t *testing.T) {
 			tutils.CreateFreshBucket(t, proxyURL, bck)
 			defer tutils.DestroyBucket(t, proxyURL, bck)
 
-			p := cmn.DefaultBucketProps()
+			p := cmn.DefaultAISBckProps()
 
 			totalObjects := 0
 			for iter := 1; iter <= iterations; iter++ {
@@ -996,7 +985,12 @@ func TestListObjectsPrefix(t *testing.T) {
 		baseParams = tutils.BaseAPIParams(proxyURL)
 	)
 
-	for _, provider := range []string{cmn.ProviderAIS, cmn.AnyCloud} {
+	providers := []string{cmn.ProviderAIS}
+	if cliBck.IsCloud() {
+		providers = append(providers, cliBck.Provider)
+	}
+
+	for _, provider := range providers {
 		t.Run(provider, func(t *testing.T) {
 			var (
 				bck        cmn.Bck
@@ -1006,11 +1000,8 @@ func TestListObjectsPrefix(t *testing.T) {
 				customPage = true
 			)
 			bckTest := cmn.Bck{Provider: provider, Ns: cmn.NsGlobal}
-			if bckTest.IsCloud(cmn.AnyCloud) {
-				bck = cmn.Bck{
-					Name:     clibucket,
-					Provider: provider,
-				}
+			if bckTest.IsCloud() {
+				bck = cliBck
 
 				tutils.CheckSkip(t, tutils.SkipTestArgs{Cloud: true, Bck: bck})
 
@@ -1035,7 +1026,7 @@ func TestListObjectsPrefix(t *testing.T) {
 				tutils.CreateFreshBucket(t, proxyURL, bck)
 				defer tutils.DestroyBucket(t, proxyURL, bck)
 
-				p := cmn.DefaultBucketProps()
+				p := cmn.DefaultAISBckProps()
 				cksumType = p.Cksum.Type
 			}
 
@@ -1182,6 +1173,59 @@ func TestListObjectsCache(t *testing.T) {
 	}
 }
 
+func TestListObjectsWithRebalance(t *testing.T) {
+	// TODO: This test doesn't work as list objects doesn't correctly handle
+	//  objects which are yet to be migrated.
+	t.Skip("list objects does not work correctly with rebalance")
+
+	tutils.CheckSkip(t, tutils.SkipTestArgs{Long: true})
+
+	var (
+		baseParams = tutils.BaseAPIParams()
+		wg         = &sync.WaitGroup{}
+		m          = ioContext{
+			t:        t,
+			num:      10000,
+			fileSize: 128,
+		}
+	)
+
+	m.init()
+	m.saveClusterState()
+	if m.originalTargetCount < 2 {
+		t.Fatalf("must have at least 2 target in the cluster")
+	}
+
+	tutils.CreateFreshBucket(t, m.proxyURL, m.bck)
+	defer tutils.DestroyBucket(t, m.proxyURL, m.bck)
+
+	target := m.unregisterTarget()
+
+	m.puts()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		m.reregisterTarget(target)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 15; i++ {
+			tutils.Logf("listing all objects, iter: %d\n", i)
+			bckList, err := api.ListObjects(baseParams, m.bck, nil, 0)
+			tassert.CheckFatal(t, err)
+			tassert.Errorf(t, len(bckList.Entries) == m.num, "entries mismatch (%d vs %d)", len(bckList.Entries), m.num)
+
+			time.Sleep(time.Second)
+		}
+	}()
+
+	wg.Wait()
+	m.assertClusterState()
+}
+
 func TestBucketSingleProp(t *testing.T) {
 	const (
 		dataSlices      = 1
@@ -1284,7 +1328,8 @@ func TestBucketSingleProp(t *testing.T) {
 
 	// Change mirroring threshold
 	_, err = api.SetBucketProps(baseParams, m.bck, cmn.BucketPropsToUpdate{
-		Mirror: &cmn.MirrorConfToUpdate{UtilThresh: api.Int64(mirrorThreshold)}},
+		Mirror: &cmn.MirrorConfToUpdate{UtilThresh: api.Int64(mirrorThreshold)},
+	},
 	)
 	tassert.CheckError(t, err)
 	p, err = api.HeadBucket(baseParams, m.bck)
@@ -1301,15 +1346,13 @@ func TestBucketSingleProp(t *testing.T) {
 }
 
 func TestSetBucketPropsOfNonexistentBucket(t *testing.T) {
-	var (
-		baseParams = tutils.BaseAPIParams()
-	)
+	baseParams := tutils.BaseAPIParams()
 	bucket, err := tutils.GenerateNonexistentBucketName(t.Name()+"Bucket", baseParams)
 	tassert.CheckFatal(t, err)
 
 	bck := cmn.Bck{
 		Name:     bucket,
-		Provider: cmn.AnyCloud,
+		Provider: cliBck.Provider,
 	}
 
 	_, err = api.SetBucketProps(baseParams, bck, cmn.BucketPropsToUpdate{
@@ -1336,7 +1379,7 @@ func TestSetAllBucketPropsOfNonexistentBucket(t *testing.T) {
 
 	bck := cmn.Bck{
 		Name:     bucket,
-		Provider: cmn.AnyCloud,
+		Provider: cliBck.Provider,
 	}
 
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
@@ -1389,18 +1432,17 @@ func TestLocalMirror(t *testing.T) {
 		})
 	}
 }
+
 func testLocalMirror(t *testing.T, numCopies []int) {
-	var (
-		m = ioContext{
-			t:               t,
-			num:             10000,
-			numGetsEachFile: 5,
-			bck: cmn.Bck{
-				Name:     cmn.RandString(10),
-				Provider: cmn.ProviderAIS,
-			},
-		}
-	)
+	m := ioContext{
+		t:               t,
+		num:             10000,
+		numGetsEachFile: 5,
+		bck: cmn.Bck{
+			Name:     cmn.RandString(10),
+			Provider: cmn.ProviderAIS,
+		},
+	}
 
 	if testing.Short() {
 		m.num = 250
@@ -1468,19 +1510,17 @@ func makeNCopies(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, ncopies i
 	xactID, err := api.MakeNCopies(baseParams, bck, ncopies)
 	tassert.CheckFatal(t, err)
 
-	err = api.WaitForXactionJtx(baseParams, xactID)
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActMakeNCopies}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 }
 
 func TestCloudMirror(t *testing.T) {
 	var (
 		m = &ioContext{
-			t:   t,
-			num: 64,
-			bck: cmn.Bck{
-				Name:     clibucket,
-				Provider: cmn.AnyCloud,
-			},
+			t:      t,
+			num:    64,
+			bck:    cliBck,
 			prefix: t.Name(),
 		}
 		baseParams = tutils.BaseAPIParams()
@@ -1530,13 +1570,11 @@ func TestCloudMirror(t *testing.T) {
 }
 
 func TestBucketReadOnly(t *testing.T) {
-	var (
-		m = ioContext{
-			t:               t,
-			num:             10,
-			numGetsEachFile: 2,
-		}
-	)
+	m := ioContext{
+		t:               t,
+		num:             10,
+		numGetsEachFile: 2,
+	}
 	m.init()
 	tutils.CreateFreshBucket(t, m.proxyURL, m.bck)
 	defer tutils.DestroyBucket(t, m.proxyURL, m.bck)
@@ -1608,7 +1646,8 @@ func TestRenameEmptyBucket(t *testing.T) {
 	uuid, err := api.RenameBucket(baseParams, srcBck, dstBck)
 	tassert.CheckFatal(t, err)
 
-	err = api.WaitForXactionJtx(baseParams, uuid, rebalanceTimeout)
+	args := api.XactReqArgs{ID: uuid, Kind: cmn.ActRenameLB, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// Check if the new bucket appears in the list
@@ -1673,7 +1712,8 @@ func TestRenameNonEmptyBucket(t *testing.T) {
 	xactID, err := api.RenameBucket(baseParams, srcBck, dstBck)
 	tassert.CheckFatal(t, err)
 
-	err = api.WaitForXactionJtx(baseParams, xactID, rebalanceTimeout)
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActRenameLB, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// Gets on renamed ais bucket
@@ -1800,7 +1840,8 @@ func TestRenameBucketTwice(t *testing.T) {
 	}
 
 	// Wait for rename to complete
-	err = api.WaitForXactionJtx(baseParams, xactID, rebalanceTimeout)
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActRenameLB, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// Check if the new bucket appears in the list
@@ -1820,31 +1861,39 @@ func TestRenameBucketTwice(t *testing.T) {
 
 func TestCopyBucket(t *testing.T) {
 	tests := []struct {
-		provider         string
+		srcCloud         bool
+		dstCloud         bool
 		dstBckExist      bool // determines if destination bucket exists before copy or not
 		dstBckHasObjects bool // determines if destination bucket contains any objects before copy or not
 		multipleDests    bool // determines if there are multiple destinations to which objects are copied
 	}{
-		// ais
-		{provider: cmn.ProviderAIS, dstBckExist: false, dstBckHasObjects: false, multipleDests: false},
-		{provider: cmn.ProviderAIS, dstBckExist: true, dstBckHasObjects: false, multipleDests: false},
-		{provider: cmn.ProviderAIS, dstBckExist: true, dstBckHasObjects: true, multipleDests: false},
-		{provider: cmn.ProviderAIS, dstBckExist: false, dstBckHasObjects: false, multipleDests: true},
-		{provider: cmn.ProviderAIS, dstBckExist: true, dstBckHasObjects: true, multipleDests: true},
+		// ais -> ais
+		{srcCloud: false, dstCloud: false, dstBckExist: false, dstBckHasObjects: false, multipleDests: false},
+		{srcCloud: false, dstCloud: false, dstBckExist: true, dstBckHasObjects: false, multipleDests: false},
+		{srcCloud: false, dstCloud: false, dstBckExist: true, dstBckHasObjects: true, multipleDests: false},
+		{srcCloud: false, dstCloud: false, dstBckExist: false, dstBckHasObjects: false, multipleDests: true},
+		{srcCloud: false, dstCloud: false, dstBckExist: true, dstBckHasObjects: true, multipleDests: true},
 
-		// cloud
-		{provider: cmn.AnyCloud, dstBckExist: false, dstBckHasObjects: false},
-		{provider: cmn.AnyCloud, dstBckExist: true, dstBckHasObjects: false},
-		{provider: cmn.AnyCloud, dstBckExist: true, dstBckHasObjects: true},
-		{provider: cmn.AnyCloud, dstBckExist: false, dstBckHasObjects: false, multipleDests: true},
-		{provider: cmn.AnyCloud, dstBckExist: true, dstBckHasObjects: true, multipleDests: true},
+		// cloud -> ais
+		{srcCloud: true, dstCloud: false, dstBckExist: false, dstBckHasObjects: false},
+		{srcCloud: true, dstCloud: false, dstBckExist: true, dstBckHasObjects: false},
+		{srcCloud: true, dstCloud: false, dstBckExist: true, dstBckHasObjects: true},
+		{srcCloud: true, dstCloud: false, dstBckExist: false, dstBckHasObjects: false, multipleDests: true},
+		{srcCloud: true, dstCloud: false, dstBckExist: true, dstBckHasObjects: true, multipleDests: true},
+
+		// ais -> cloud
+		{srcCloud: false, dstCloud: true, dstBckExist: true, dstBckHasObjects: false},
 	}
 
 	for _, test := range tests {
 		// Bucket must exist when we require it to have objects.
 		cmn.Assert(test.dstBckExist || !test.dstBckHasObjects)
 
-		testName := test.provider + "/"
+		// We only have 1 cloud bucket available (cliBck), coping from the same bucket to the same bucket would fail.
+		// TODO: remove this limitation and add cloud -> cloud test cases.
+		cmn.Assert(!test.srcCloud || !test.dstCloud)
+
+		testName := fmt.Sprintf("src-cloud=%t/dst-cloud=%t/", test.srcCloud, test.dstCloud)
 		if test.dstBckExist {
 			testName += "present/"
 			if test.dstBckHasObjects {
@@ -1895,21 +1944,35 @@ func TestCopyBucket(t *testing.T) {
 					},
 				})
 			}
-			bckTest := cmn.Bck{Provider: test.provider, Ns: cmn.NsGlobal}
-			if bckTest.IsCloud(cmn.AnyCloud) {
-				srcm.bck = cmn.Bck{
-					Name:     clibucket,
-					Provider: cmn.AnyCloud,
-				}
-
+			bckTest := cmn.Bck{Provider: cmn.ProviderAIS, Ns: cmn.NsGlobal}
+			if test.srcCloud {
+				srcm.bck = cliBck
+				bckTest.Provider = cliBck.Provider
 				tutils.CheckSkip(t, tutils.SkipTestArgs{Cloud: true, Bck: srcm.bck})
+			}
+			if test.dstCloud {
+				dstms = []*ioContext{
+					{
+						t:   t,
+						num: 0, // Make sure to not put anything new to destination cloud bucket
+						bck: cliBck,
+					},
+				}
+				tutils.CheckSkip(t, tutils.SkipTestArgs{Cloud: true, Bck: dstms[0].bck})
 			}
 
 			// Initialize ioContext
 			srcm.saveClusterState()
+
 			for _, dstm := range dstms {
 				dstm.init()
+
+				if dstm.bck.IsCloud() {
+					// Remove unnecessary local objects.
+					tassert.CheckFatal(t, api.EvictCloudBucket(baseParams, dstm.bck))
+				}
 			}
+
 			if srcm.originalTargetCount < 1 {
 				t.Fatalf("Must have 1 or more targets in the cluster, have only %d", srcm.originalTargetCount)
 			}
@@ -1921,24 +1984,45 @@ func TestCopyBucket(t *testing.T) {
 
 			if test.dstBckExist {
 				for _, dstm := range dstms {
-					tutils.CreateFreshBucket(t, dstm.proxyURL, dstm.bck)
-					dstm.setRandBucketProps()
+					if !dstm.bck.IsCloud() {
+						tutils.CreateFreshBucket(t, dstm.proxyURL, dstm.bck)
+						dstm.setRandBucketProps()
+					}
 				}
 			} else { // cleanup
 				for _, dstm := range dstms {
-					tutils.DestroyBucket(t, dstm.proxyURL, dstm.bck)
+					if !dstm.bck.IsCloud() {
+						tutils.DestroyBucket(t, dstm.proxyURL, dstm.bck)
+					}
 				}
 			}
-			for _, dstm := range dstms {
-				defer tutils.DestroyBucket(t, dstm.proxyURL, dstm.bck)
-			}
+
+			defer func() {
+				for _, dstm := range dstms {
+					if !dstm.bck.IsCloud() {
+						tutils.DestroyBucket(t, dstm.proxyURL, dstm.bck)
+					} else {
+						msg := &cmn.SelectMsg{Flags: cmn.SelectCached}
+						entries, err := api.ListObjects(baseParams, dstm.bck, msg, 0)
+						tassert.CheckFatal(t, err)
+						for _, e := range entries.Entries {
+							if err := api.DeleteObject(baseParams, dstm.bck, e.Name); err != nil {
+								tutils.Logf("failed to delete object %s/%s", dstm.bck, e.Name)
+							}
+						}
+					}
+				}
+			}()
 
 			srcProps, err := api.HeadBucket(baseParams, srcm.bck)
 			tassert.CheckFatal(t, err)
 
 			if test.dstBckHasObjects {
 				for _, dstm := range dstms {
-					dstm.puts()
+					// Don't make PUTs to cloud bucket
+					if !dstm.bck.IsCloud() {
+						dstm.puts()
+					}
 				}
 			}
 
@@ -1947,14 +2031,14 @@ func TestCopyBucket(t *testing.T) {
 
 				srcBckList, err = api.ListObjects(baseParams, srcm.bck, nil, 0)
 				tassert.CheckFatal(t, err)
-			} else if bckTest.IsCloud(cmn.AnyCloud) {
+			} else if bckTest.IsCloud() {
 				srcm.cloudPuts(false /*evict*/)
 				defer srcm.del()
 
 				srcBckList, err = api.ListObjects(baseParams, srcm.bck, nil, 0)
 				tassert.CheckFatal(t, err)
 			} else {
-				panic(test.provider)
+				panic(bckTest)
 			}
 
 			xactIDs := make([]string, len(dstms))
@@ -1966,12 +2050,17 @@ func TestCopyBucket(t *testing.T) {
 			}
 
 			for _, uuid := range xactIDs {
-				err = api.WaitForXactionJtx(baseParams, uuid, copyBucketTimeout)
+				args := api.XactReqArgs{ID: uuid, Kind: cmn.ActCopyBucket, Timeout: copyBucketTimeout}
+				_, err = api.WaitForXaction(baseParams, args)
 				tassert.CheckFatal(t, err)
 			}
 
-			tutils.Logln("checking and comparing bucket props")
 			for _, dstm := range dstms {
+				if dstm.bck.IsCloud() {
+					continue
+				}
+
+				tutils.Logf("checking and comparing bucket %s props\n", dstm.bck)
 				dstProps, err := api.HeadBucket(baseParams, dstm.bck)
 				tassert.CheckFatal(t, err)
 
@@ -1996,15 +2085,21 @@ func TestCopyBucket(t *testing.T) {
 				}
 			}
 
-			tutils.Logln("checking and comparing objects")
-
 			for _, dstm := range dstms {
+				tutils.Logf("checking and comparing objects of bucket %s\n", dstm.bck)
 				expectedObjCount := srcm.num
 				if test.dstBckHasObjects {
 					expectedObjCount += dstm.num
 				}
 
-				dstBckList, err := api.ListObjects(baseParams, dstm.bck, nil, 0)
+				_, err := api.HeadBucket(baseParams, srcm.bck)
+				tassert.CheckFatal(t, err)
+
+				msg := &cmn.SelectMsg{}
+				if test.dstCloud {
+					msg.Flags = cmn.SelectCached
+				}
+				dstBckList, err := api.ListObjects(baseParams, dstm.bck, msg, 0)
 				tassert.CheckFatal(t, err)
 				if len(dstBckList.Entries) != expectedObjCount {
 					t.Fatalf("list_objects: dst %d != %d src", len(dstBckList.Entries), expectedObjCount)
@@ -2026,32 +2121,47 @@ func TestCopyBucket(t *testing.T) {
 	}
 }
 
-func TestCopyBucketAbort(t *testing.T) {
+// TODO: make some of those long-only, after they are considered stable.
+func TestCopyBucketSimple(t *testing.T) {
 	var (
-		m = ioContext{
-			t:   t,
-			num: 1000,
-		}
-		baseParams = tutils.BaseAPIParams()
-		dstBck     = cmn.Bck{
-			Name:     TestBucketName + "_new1",
-			Provider: cmn.ProviderAIS,
+		srcBck = cmn.Bck{Name: "cpybck_src", Provider: cmn.ProviderAIS}
+
+		m = &ioContext{
+			t:         t,
+			num:       1000,
+			fileSize:  512,
+			fixedSize: true,
+			bck:       srcBck,
 		}
 	)
 
-	// Initialize ioContext
+	if testing.Short() {
+		m.num = 10
+	}
+
+	tutils.Logln("Preparing a source bucket")
+	tutils.CreateFreshBucket(t, proxyURL, srcBck)
+	defer tutils.DestroyBucket(t, proxyURL, srcBck)
 	m.init()
 
-	srcBck := m.bck
-	tutils.CreateFreshBucket(t, m.proxyURL, srcBck)
-	defer func() {
-		tutils.DestroyBucket(t, m.proxyURL, srcBck)
-		tutils.DestroyBucket(t, m.proxyURL, dstBck)
-	}()
-
+	tutils.Logln("Putting objects to the source bucket")
 	m.puts()
+
+	t.Run("Stats", func(t *testing.T) { testCopyBucketStats(t, srcBck, m) })
+	t.Run("Prefix", func(t *testing.T) { testCopyBucketPrefix(t, srcBck, m) })
+	t.Run("Abort", func(t *testing.T) { testCopyBucketAbort(t, srcBck, m) })
+	t.Run("DryRun", func(t *testing.T) { testCopyBucketDryRun(t, srcBck, m) })
+}
+
+func testCopyBucketAbort(t *testing.T, srcBck cmn.Bck, m *ioContext) {
+	dstBck := cmn.Bck{
+		Name:     TestBucketName + "_new1",
+		Provider: cmn.ProviderAIS,
+	}
+
 	xactID, err := api.CopyBucket(baseParams, srcBck, dstBck)
 	tassert.CheckError(t, err)
+	defer tutils.DestroyBucket(t, m.proxyURL, dstBck)
 
 	err = api.AbortXaction(baseParams, api.XactReqArgs{ID: xactID})
 	tassert.CheckError(t, err)
@@ -2068,6 +2178,69 @@ func TestCopyBucketAbort(t *testing.T) {
 	// tassert.CheckError(t, err)
 	// tassert.Errorf(t, !bck.Contains(cmn.QueryBcks(dstBck)), "should not contains bucket %s", dstBck)
 	*/
+}
+
+func testCopyBucketStats(t *testing.T, srcBck cmn.Bck, m *ioContext) {
+	dstBck := cmn.Bck{Name: "cpybck_dst", Provider: cmn.ProviderAIS}
+
+	xactID, err := api.CopyBucket(baseParams, srcBck, dstBck)
+	tassert.CheckFatal(t, err)
+	defer tutils.DestroyBucket(t, proxyURL, dstBck)
+
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActCopyBucket, Timeout: time.Minute}
+	_, err = api.WaitForXaction(baseParams, args)
+	tassert.CheckFatal(t, err)
+
+	stats, err := api.GetXactionStatsByID(baseParams, xactID)
+	tassert.CheckFatal(t, err)
+	tassert.Errorf(t, stats.ObjCount() == int64(m.num), "Stats expected to return %d objects in total", m.num)
+	expectedBytesCnt := int64(m.fileSize * uint64(m.num))
+	tassert.Errorf(t, stats.BytesCount() == expectedBytesCnt, "Stats expected to return %d bytes, got %d",
+		expectedBytesCnt, stats.BytesCount())
+}
+
+func testCopyBucketPrefix(t *testing.T, srcBck cmn.Bck, m *ioContext) {
+	var (
+		cpyPrefix = "cpyprefix" + cmn.RandString(5)
+		dstBck    = cmn.Bck{Name: "cpybck_dst", Provider: cmn.ProviderAIS}
+	)
+
+	xactID, err := api.CopyBucket(baseParams, srcBck, dstBck, &cmn.CopyBckMsg{Prefix: cpyPrefix})
+	tassert.CheckFatal(t, err)
+	defer tutils.DestroyBucket(t, proxyURL, dstBck)
+
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActCopyBucket, Timeout: time.Minute}
+	_, err = api.WaitForXaction(baseParams, args)
+	tassert.CheckFatal(t, err)
+
+	list, err := api.ListObjects(baseParams, dstBck, nil, 0)
+	tassert.CheckFatal(t, err)
+	tassert.Errorf(t, len(list.Entries) == m.num, "expected %d to be copied, got %d", m.num, len(list.Entries))
+	for _, e := range list.Entries {
+		tassert.Fatalf(t, strings.HasPrefix(e.Name, cpyPrefix), "expected %q to have prefix %q", e.Name, cpyPrefix)
+	}
+}
+
+func testCopyBucketDryRun(t *testing.T, srcBck cmn.Bck, m *ioContext) {
+	dstBck := cmn.Bck{Name: "cpybck_dst" + cmn.RandString(5), Provider: cmn.ProviderAIS}
+
+	xactID, err := api.CopyBucket(baseParams, srcBck, dstBck, &cmn.CopyBckMsg{DryRun: true})
+	tassert.CheckFatal(t, err)
+	defer tutils.DestroyBucket(t, proxyURL, dstBck)
+
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActCopyBucket, Timeout: time.Minute}
+	_, err = api.WaitForXaction(baseParams, args)
+	tassert.CheckFatal(t, err)
+
+	stats, err := api.GetXactionStatsByID(baseParams, xactID)
+	tassert.CheckFatal(t, err)
+	tassert.Errorf(t, stats.ObjCount() == int64(m.num), "dry run stats expected to return %d objects", m.num)
+	expectedBytesCnt := int64(m.fileSize * uint64(m.num))
+	tassert.Errorf(t, stats.BytesCount() == expectedBytesCnt, "dry run stats expected to return %d bytes, got %d", expectedBytesCnt, stats.BytesCount())
+
+	exists, err := api.DoesBucketExist(baseParams, cmn.QueryBcks(dstBck))
+	tassert.CheckFatal(t, err)
+	tassert.Errorf(t, exists == false, "expected destination bucket to not be created")
 }
 
 // Tries to rename and then copy bucket at the same time.
@@ -2134,7 +2307,8 @@ func TestRenameAndCopyBucket(t *testing.T) {
 	}
 
 	// Wait for rename to complete
-	err = api.WaitForXactionJtx(baseParams, xactID, rebalanceTimeout)
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActCopyBucket, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// Check if the new bucket appears in the list
@@ -2217,7 +2391,8 @@ func TestCopyAndRenameBucket(t *testing.T) {
 	}
 
 	// Wait for copy to complete
-	err = api.WaitForXactionJtx(baseParams, xactID, rebalanceTimeout)
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActRenameLB, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// Check if the new bucket appears in the list
@@ -2237,11 +2412,8 @@ func TestCopyAndRenameBucket(t *testing.T) {
 
 func TestBackendBucket(t *testing.T) {
 	var (
-		cloudBck = cmn.Bck{
-			Name:     clibucket,
-			Provider: cmn.AnyCloud,
-		}
-		aisBck = cmn.Bck{
+		cloudBck = cliBck
+		aisBck   = cmn.Bck{
 			Name:     cmn.RandString(10),
 			Provider: cmn.ProviderAIS,
 		}
@@ -2387,6 +2559,7 @@ func TestAllChecksums(t *testing.T) {
 		})
 	}
 }
+
 func testWarmValidation(t *testing.T, cksumType string, mirrored, eced bool) {
 	const (
 		copyCnt   = 2
@@ -2569,8 +2742,13 @@ func TestBucketListAndSummary(t *testing.T) {
 		fast     bool // TODO: it makes sense only for summary
 	}
 
+	providers := []string{cmn.ProviderAIS}
+	if cliBck.IsCloud() {
+		providers = append(providers, cliBck.Provider)
+	}
+
 	var tests []test
-	for _, provider := range []string{cmn.ProviderAIS, cmn.AnyCloud} {
+	for _, provider := range providers {
 		for _, summary := range []bool{false, true} {
 			for _, cached := range []bool{false, true} {
 				for _, fast := range []bool{false, true} {
@@ -2630,8 +2808,8 @@ func TestBucketListAndSummary(t *testing.T) {
 				defer tutils.DestroyBucket(t, m.proxyURL, m.bck)
 
 				m.puts()
-			} else if bckTest.IsCloud(cmn.AnyCloud) {
-				m.bck.Name = clibucket
+			} else if bckTest.IsCloud() {
+				m.bck.Name = cliBck.Name
 
 				tutils.CheckSkip(t, tutils.SkipTestArgs{Cloud: true, Bck: m.bck})
 

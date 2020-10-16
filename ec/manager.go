@@ -18,6 +18,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/transport/bundle"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 // nolint:maligned // no performance critical code
@@ -25,7 +27,6 @@ type Manager struct {
 	sync.RWMutex
 
 	t         cluster.Target
-	reg       XactRegistry
 	smap      *cluster.Smap
 	targetCnt atomic.Int32 // atomic, to avoid races between read/write on smap
 	bmd       *cluster.BMD // bmd owner
@@ -35,15 +36,13 @@ type Manager struct {
 	bundleEnabled atomic.Bool // to disable and enable on the fly
 	netReq        string      // network used to send object request
 	netResp       string      // network used to send/receive slices
-	reqBundle     *transport.StreamBundle
-	respBundle    *transport.StreamBundle
+	reqBundle     *bundle.Streams
+	respBundle    *bundle.Streams
 }
 
-var (
-	ECM *Manager
-)
+var ECM *Manager
 
-func initManager(t cluster.Target, reg XactRegistry) error {
+func initManager(t cluster.Target) error {
 	config := cmn.GCO.Get()
 	netReq, netResp := cmn.NetworkIntraControl, cmn.NetworkIntraData
 	if !config.Net.UseIntraControl {
@@ -53,17 +52,16 @@ func initManager(t cluster.Target, reg XactRegistry) error {
 		netResp = cmn.NetworkPublic
 	}
 
-	sowner := t.GetSowner()
+	sowner := t.Sowner()
 	smap := sowner.Get()
 
 	ECM = &Manager{
 		netReq:    netReq,
 		netResp:   netResp,
 		t:         t,
-		reg:       reg,
 		smap:      smap,
 		targetCnt: *atomic.NewInt32(int32(smap.CountTargets())),
-		bmd:       t.GetBowner().Get(),
+		bmd:       t.Bowner().Get(),
 		xacts:     make(map[string]*BckXacts),
 	}
 
@@ -87,7 +85,7 @@ func (mgr *Manager) initECBundles() {
 	}
 	cmn.AssertMsg(mgr.reqBundle == nil && mgr.respBundle == nil, "EC Bundles have been already initialized")
 
-	cbReq := func(hdr transport.Header, reader io.ReadCloser, _ unsafe.Pointer, err error) {
+	cbReq := func(hdr transport.ObjHdr, reader io.ReadCloser, _ unsafe.Pointer, err error) {
 		if err != nil {
 			glog.Errorf("failed to request %s/%s: %v", hdr.Bck, hdr.ObjName, err)
 		}
@@ -100,23 +98,23 @@ func (mgr *Manager) initECBundles() {
 		Compression: compression,
 	}
 
-	reqSbArgs := transport.SBArgs{
-		Multiplier: transport.IntraBundleMultiplier,
+	reqSbArgs := bundle.Args{
+		Multiplier: bundle.Multiplier,
 		Extra:      &extraReq,
 		Network:    mgr.netReq,
 		Trname:     ReqStreamName,
 	}
 
-	respSbArgs := transport.SBArgs{
-		Multiplier: transport.IntraBundleMultiplier,
+	respSbArgs := bundle.Args{
+		Multiplier: bundle.Multiplier,
 		Trname:     RespStreamName,
 		Network:    mgr.netResp,
 		Extra:      &transport.Extra{Compression: compression},
 	}
 
-	sowner := mgr.t.GetSowner()
-	mgr.reqBundle = transport.NewStreamBundle(sowner, mgr.t.Snode(), client, reqSbArgs)
-	mgr.respBundle = transport.NewStreamBundle(sowner, mgr.t.Snode(), client, respSbArgs)
+	sowner := mgr.t.Sowner()
+	mgr.reqBundle = bundle.NewStreams(sowner, mgr.t.Snode(), client, reqSbArgs)
+	mgr.respBundle = bundle.NewStreams(sowner, mgr.t.Snode(), client, respSbArgs)
 
 	mgr.smap = sowner.Get()
 	mgr.targetCnt.Store(int32(mgr.smap.CountTargets()))
@@ -134,7 +132,7 @@ func (mgr *Manager) closeECBundles() {
 	if !mgr.bundleEnabled.CAS(true, false) {
 		return
 	}
-	mgr.t.GetSowner().Listeners().Unreg(mgr)
+	mgr.t.Sowner().Listeners().Unreg(mgr)
 	mgr.reqBundle.Close(false)
 	mgr.reqBundle = nil
 	mgr.respBundle.Close(false)
@@ -144,9 +142,11 @@ func (mgr *Manager) closeECBundles() {
 func (mgr *Manager) NewGetXact(bck cmn.Bck) *XactGet {
 	return NewGetXact(mgr.t, bck, mgr.reqBundle, mgr.respBundle)
 }
+
 func (mgr *Manager) NewPutXact(bck cmn.Bck) *XactPut {
 	return NewPutXact(mgr.t, bck, mgr.reqBundle, mgr.respBundle)
 }
+
 func (mgr *Manager) NewRespondXact(bck cmn.Bck) *XactRespond {
 	return NewRespondXact(mgr.t, bck, mgr.reqBundle, mgr.respBundle)
 }
@@ -154,30 +154,36 @@ func (mgr *Manager) NewRespondXact(bck cmn.Bck) *XactRespond {
 func (mgr *Manager) RestoreBckGetXact(bck *cluster.Bck) *XactGet {
 	xact := mgr.getBckXacts(bck.Name).Get()
 	if xact == nil || xact.Finished() {
-		xact = mgr.reg.RenewGetEC(bck)
+		x, err := registry.Registry.RenewBucketXact(cmn.ActECGet, bck)
+		cmn.AssertNoErr(err)
+
+		xact = x.(*XactGet)
 		mgr.getBckXacts(bck.Name).SetGet(xact)
 	}
-
 	return xact
 }
 
 func (mgr *Manager) RestoreBckPutXact(bck *cluster.Bck) *XactPut {
 	xact := mgr.getBckXacts(bck.Name).Put()
 	if xact == nil || xact.Finished() {
-		xact = mgr.reg.RenewPutEC(bck)
+		x, err := registry.Registry.RenewBucketXact(cmn.ActECPut, bck)
+		cmn.AssertNoErr(err)
+
+		xact = x.(*XactPut)
 		mgr.getBckXacts(bck.Name).SetPut(xact)
 	}
-
 	return xact
 }
 
 func (mgr *Manager) RestoreBckRespXact(bck *cluster.Bck) *XactRespond {
 	xact := mgr.getBckXacts(bck.Name).Req()
 	if xact == nil || xact.Finished() {
-		xact = mgr.reg.RenewRespondEC(bck)
+		x, err := registry.Registry.RenewBucketXact(cmn.ActECRespond, bck)
+		cmn.AssertNoErr(err)
+
+		xact = x.(*XactRespond)
 		mgr.getBckXacts(bck.Name).SetReq(xact)
 	}
-
 	return xact
 }
 
@@ -197,7 +203,7 @@ func (mgr *Manager) getBckXactsUnlocked(bckName string) *BckXacts {
 }
 
 // A function to process command requests from other targets
-func (mgr *Manager) recvRequest(w http.ResponseWriter, hdr transport.Header, object io.Reader, err error) {
+func (mgr *Manager) recvRequest(w http.ResponseWriter, hdr transport.ObjHdr, object io.Reader, err error) {
 	if err != nil {
 		glog.Errorf("request failed: %v", err)
 		return
@@ -224,7 +230,7 @@ func (mgr *Manager) recvRequest(w http.ResponseWriter, hdr transport.Header, obj
 		}
 	}
 	bck := cluster.NewBckEmbed(hdr.Bck)
-	if err = bck.Init(mgr.t.GetBowner(), mgr.t.Snode()); err != nil {
+	if err = bck.Init(mgr.t.Bowner(), mgr.t.Snode()); err != nil {
 		if _, ok := err.(*cmn.ErrorRemoteBucketDoesNotExist); !ok { // is ais
 			glog.Errorf("failed to init bucket %s: %v", bck, err)
 			return
@@ -234,7 +240,7 @@ func (mgr *Manager) recvRequest(w http.ResponseWriter, hdr transport.Header, obj
 }
 
 // A function to process big chunks of data (replica/slice/meta) sent from other targets
-func (mgr *Manager) recvResponse(w http.ResponseWriter, hdr transport.Header, object io.Reader, err error) {
+func (mgr *Manager) recvResponse(w http.ResponseWriter, hdr transport.ObjHdr, object io.Reader, err error) {
 	if err != nil {
 		glog.Errorf("receive failed: %v", err)
 		return
@@ -254,7 +260,7 @@ func (mgr *Manager) recvResponse(w http.ResponseWriter, hdr transport.Header, ob
 		return
 	}
 	bck := cluster.NewBckEmbed(hdr.Bck)
-	if err = bck.Init(mgr.t.GetBowner(), mgr.t.Snode()); err != nil {
+	if err = bck.Init(mgr.t.Bowner(), mgr.t.Snode()); err != nil {
 		if _, ok := err.(*cmn.ErrorRemoteBucketDoesNotExist); !ok { // is ais
 			glog.Error(err)
 			cmn.DrainReader(object)
@@ -265,8 +271,8 @@ func (mgr *Manager) recvResponse(w http.ResponseWriter, hdr transport.Header, ob
 	case reqPut:
 		mgr.RestoreBckRespXact(bck).DispatchResp(iReq, hdr, object)
 	case respPut:
-		// Process this request even if there might not be enough targets. It might have been started when there was,
-		// so there is a chance to complete restore successfully
+		// Process the request even if the number of targets is insufficient
+		// (might've started when we had enough)
 		mgr.RestoreBckGetXact(bck).DispatchResp(iReq, bck, hdr.ObjName, hdr.ObjAttrs, object)
 	default:
 		glog.Errorf("unknown EC response action %d", iReq.act)
@@ -377,7 +383,7 @@ func (mgr *Manager) enableBck(bck *cluster.Bck) {
 
 func (mgr *Manager) BucketsMDChanged() {
 	mgr.Lock()
-	newBckMD := mgr.t.GetBowner().Get()
+	newBckMD := mgr.t.Bowner().Get()
 	oldBckMD := mgr.bmd
 	if newBckMD.Version <= mgr.bmd.Version {
 		mgr.Unlock()
@@ -387,11 +393,11 @@ func (mgr *Manager) BucketsMDChanged() {
 	mgr.Unlock()
 
 	if newBckMD.IsECUsed() && !oldBckMD.IsECUsed() {
-		// init EC streams if there were not initialized on the start
-		// no need to close them when last EC bucket is disabled
-		// as they close itself on idle
+		// init EC streams if they were not initialized at startup;
+		// no need to close when the last EC bucket is disabled -
+		// streams timeout (when idle) and auto-close.
 		mgr.initECBundles()
-	} else if !newBckMD.IsECUsed() {
+	} else if !newBckMD.IsECUsed() && oldBckMD.IsECUsed() {
 		mgr.closeECBundles()
 	}
 	provider := cmn.ProviderAIS
@@ -409,12 +415,12 @@ func (mgr *Manager) BucketsMDChanged() {
 }
 
 func (mgr *Manager) ListenSmapChanged() {
-	smap := mgr.t.GetSowner().Get()
+	smap := mgr.t.Sowner().Get()
 	if smap.Version <= mgr.smap.Version {
 		return
 	}
 
-	mgr.smap = mgr.t.GetSowner().Get()
+	mgr.smap = mgr.t.Sowner().Get()
 	targetCnt := mgr.smap.CountTargets()
 	mgr.targetCnt.Store(int32(targetCnt))
 

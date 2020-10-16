@@ -11,6 +11,7 @@ import (
 	"unsafe"
 
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/OneOfOne/xxhash"
 )
 
@@ -21,7 +22,6 @@ const (
 type (
 	Bck struct {
 		cmn.Bck
-		Props *cmn.BucketProps
 	}
 	noCopy       struct{}
 	NameLockPair struct {
@@ -37,9 +37,7 @@ var (
 	_ cmn.NLP = &NameLockPair{}
 )
 
-var (
-	bckLocker nameLocker
-)
+var bckLocker nameLocker
 
 func Init() {
 	bckLocker = make(nameLocker, cmn.MultiSyncMapCount)
@@ -56,18 +54,18 @@ func NewBck(name, provider string, ns cmn.Ns, optProps ...*cmn.BucketProps) *Bck
 		props = optProps[0]
 	}
 	if !cmn.IsValidProvider(provider) {
-		cmn.Assert(provider == "" || provider == cmn.AnyCloud)
+		cmn.Assert(provider == "")
 	}
-	b := &Bck{Bck: bck, Props: props}
+	bck.Props = props
+	b := &Bck{Bck: bck}
 	return b
 }
 
 func NewBckEmbed(bck cmn.Bck) *Bck { return &Bck{Bck: bck} }
+func BackendBck(bck *Bck) *Bck     { return &Bck{Bck: bck.Props.BackendBck} }
 
 func parseUname(uname string) (b Bck, objName string) {
-	var (
-		prev, itemIdx int
-	)
+	var prev, itemIdx int
 	for i := 0; i < len(uname); i++ {
 		if uname[i] != filepath.Separator {
 			continue
@@ -126,89 +124,110 @@ func (b *Bck) unmaskBID() uint64 {
 
 func (b *Bck) String() string {
 	var (
+		s   string
 		bid = b.unmaskBID()
 	)
 	if bid == 0 {
 		return b.Bck.String()
 	}
-	return fmt.Sprintf("%s(%#x)", b.Bck.String(), bid)
+	if b.HasBackendBck() {
+		s = ", backend=" + b.Props.BackendBck.String()
+	}
+	return fmt.Sprintf("%s(%#x%s)", b.Bck.String(), bid, s)
 }
 
-func (b *Bck) Equal(other *Bck, sameID bool) bool {
-	if b.Name != other.Name {
+func (b *Bck) Equal(other *Bck, sameID, sameBackend bool) bool {
+	left, right := b.Bck, other.Bck
+	left.Props, right.Props = nil, nil
+	if left != right {
 		return false
 	}
-	if b.Ns != other.Ns {
+	if sameID && b.Props != nil && other.Props != nil && b.Props.BID != other.Props.BID {
 		return false
 	}
-	if sameID {
-		if b.Props != nil && other.Props != nil {
-			if b.Props.BID != other.Props.BID {
-				return false
-			}
-		}
-	}
-	if b.IsAIS() && other.IsAIS() {
+	if !sameBackend {
 		return true
 	}
-	if (b.HasBackendBck() && !other.HasBackendBck()) || (!b.HasBackendBck() && other.HasBackendBck()) {
-		// Case when either bck has backend bucket - we say it's a match since
-		// backend bucket was either connected or disconnected.
-		return true
+	if b.HasBackendBck() && other.HasBackendBck() {
+		left, right = *b.BackendBck(), *other.BackendBck()
+		left.Props, right.Props = nil, nil
+		return left == right
 	}
-	if b.IsCloud() && other.IsCloud() {
-		return true
-	}
-	return b.IsRemoteAIS() && other.IsRemoteAIS()
-}
-
-func (b *Bck) IsAIS() bool { return b.Bck.IsAIS() && !b.HasBackendBck() }
-func (b *Bck) IsCloud(anyCloud ...string) bool {
-	return b.Bck.IsCloud(anyCloud...) || b.HasBackendBck()
-}
-func (b *Bck) IsRemote() bool      { return b.Bck.IsRemote() || b.HasBackendBck() }
-func (b *Bck) HasBackendBck() bool { return !b.Props.BackendBck.IsEmpty() }
-func (b *Bck) CloudBck() cmn.Bck {
-	// NOTE: It's required that props are initialized for AIS bucket. It
-	//  might not be the case for cloud buckets (see: `HeadBucket`).
-	if b.Provider == cmn.ProviderAIS && b.HasBackendBck() {
-		return b.Props.BackendBck
-	}
-	cmn.Assert(b.Bck.IsCloud())
-	return b.Bck
+	return true
 }
 
 // NOTE: when the specified bucket is not present in the BMD:
 // - always returns the corresponding *DoesNotExist error
-// - for Cloud bucket - fills in the props with defaults from config
-// - for AIS bucket - sets the props to nil
-// - for Remote (Cloud or Remote AIS) bucket, the caller can type-cast err.(*cmn.ErrorRemoteBucketDoesNotExist) and proceed
+// - Cloud bucket: fills in the props with defaults from config
+// - AIS bucket: sets the props to nil
+// - Remote (Cloud or Remote AIS) bucket: caller can type-cast err.(*cmn.ErrorRemoteBucketDoesNotExist) and proceed
+//
+// NOTE: most of the above applies to a backend bucket, if specified
+//
 func (b *Bck) Init(bowner Bowner, si *Snode) (err error) {
-	bmd := bowner.Get()
-	if b.Provider == "" {
-		bmd.initBckAnyProvider(b)
-	} else if b.Bck.IsCloud(cmn.AnyCloud) {
-		cloudConf := cmn.GCO.Get().Cloud
-		b.Provider = cloudConf.Provider
-		b.Ns = cloudConf.Ns // TODO -- FIXME: remove
-		bmd.initBckCloudProvider(b)
-	} else {
-		b.Props, _ = bmd.Get(b)
+	err = b.InitNoBackend(bowner, si)
+	if err != nil {
+		return
 	}
-	if b.Props == nil {
-		var name string
-		if si != nil {
-			name = si.Name()
-		}
-		if b.Bck.IsAIS() {
-			return cmn.NewErrorBucketDoesNotExist(b.Bck, name)
-		}
-		return cmn.NewErrorRemoteBucketDoesNotExist(b.Bck, name)
+	if !b.HasBackendBck() {
+		return
 	}
+	backend := NewBckEmbed(b.Props.BackendBck)
+	if !backend.IsCloud() {
+		err = fmt.Errorf("bucket %s: invalid backend %s (not a Cloud bucket)", b, backend)
+		return
+	}
+	err = backend.Init(bowner, si)
+	if err == nil {
+		cmn.Assert(!backend.HasBackendBck())
+	}
+	b.Props.BackendBck = backend.Bck
 	return
 }
 
+func (b *Bck) InitNoBackend(bowner Bowner, si *Snode) (err error) {
+	bmd := bowner.Get()
+	if b.Provider == "" {
+		bmd.initBckAnyProvider(b)
+	} else if b.Bck.IsCloud() {
+		debug.Assert(b.Ns == cmn.NsGlobal)
+		bmd.initBckCloudProvider(b)
+	} else if b.IsHTTP() {
+		debug.Assert(b.Ns == cmn.NsGlobal)
+		present := bmd.initBckCloudProvider(b)
+		if debug.Enabled && present {
+			var (
+				origURL = b.Props.Extra.OrigURLBck
+				bckName = cmn.OrigURLBck2Name(origURL)
+			)
+			debug.Assertf(b.Name == bckName, "%s != %s; original_url: %s", b.Name, bckName, origURL)
+		}
+	} else {
+		b.Props, _ = bmd.Get(b)
+	}
+	if b.Props != nil {
+		return
+	}
+	var name string
+	if si != nil {
+		name = si.Name()
+	}
+	if b.Bck.IsAIS() {
+		return cmn.NewErrorBucketDoesNotExist(b.Bck, name)
+	}
+	return cmn.NewErrorRemoteBucketDoesNotExist(b.Bck, name)
+}
+
 func (b *Bck) CksumConf() (conf *cmn.CksumConf) { return &b.Props.Cksum }
+
+func (b *Bck) VersionConf() cmn.VersionConf {
+	if b.HasBackendBck() && b.Props.BackendBck.Props != nil {
+		conf := b.Props.BackendBck.Props.Versioning
+		conf.ValidateWarmGet = b.Props.Versioning.ValidateWarmGet
+		return conf
+	}
+	return b.Props.Versioning
+}
 
 //
 // access perms
@@ -242,6 +261,7 @@ func (nlp *NameLockPair) Lock() {
 	nlp.nlc.Lock(nlp.uname, true)
 	nlp.exclusive = true
 }
+
 func (nlp *NameLockPair) TryLock() (ok bool) {
 	ok = nlp.withRetry(nlpTryDuration, true)
 	nlp.exclusive = ok

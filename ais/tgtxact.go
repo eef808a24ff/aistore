@@ -6,14 +6,15 @@ package ais
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 // TODO: uplift via higher-level query and similar (#668)
@@ -21,7 +22,7 @@ import (
 // verb /v1/xactions
 func (t *targetrunner) xactHandler(w http.ResponseWriter, r *http.Request) {
 	var (
-		xactMsg cmn.XactReqMsg
+		xactMsg xaction.XactReqMsg
 		bck     *cluster.Bck
 	)
 	if _, err := t.checkRESTItems(w, r, 0, true, cmn.Version, cmn.Xactions); err != nil {
@@ -49,14 +50,12 @@ func (t *targetrunner) xactHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		xactQuery := xaction.RegistryXactFilter{
+		xactQuery := registry.XactFilter{
 			ID: xactMsg.ID, Kind: xactMsg.Kind, Bck: bck, OnlyRunning: xactMsg.OnlyRunning,
 		}
 		t.queryMatchingXact(w, r, what, xactQuery)
 	case http.MethodPut:
-		var (
-			msg cmn.ActionMsg
-		)
+		var msg cmn.ActionMsg
 		if cmn.ReadJSON(w, r, &msg) != nil {
 			return
 		}
@@ -73,16 +72,16 @@ func (t *targetrunner) xactHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		switch msg.Action {
 		case cmn.ActXactStart:
-			if err := t.cmdXactStart(xactMsg, bck); err != nil {
+			if err := t.cmdXactStart(&xactMsg, bck); err != nil {
 				t.invalmsghdlr(w, r, err.Error())
 				return
 			}
 		case cmn.ActXactStop:
 			if xactMsg.ID != "" {
-				xaction.Registry.DoAbortByID(xactMsg.ID)
+				registry.Registry.DoAbortByID(xactMsg.ID)
 				return
 			}
-			xaction.Registry.DoAbort(xactMsg.Kind, bck)
+			registry.Registry.DoAbort(xactMsg.Kind, bck)
 			return
 		default:
 			t.invalmsghdlrf(w, r, fmtUnknownAct, msg)
@@ -97,7 +96,7 @@ func (t *targetrunner) getXactByID(w http.ResponseWriter, r *http.Request, what,
 		t.invalmsghdlrf(w, r, fmtUnknownQue, what)
 		return
 	}
-	xact := xaction.Registry.GetXact(uuid)
+	xact := registry.Registry.GetXact(uuid)
 	if xact != nil {
 		t.writeJSON(w, r, xact.Stats(), what)
 		return
@@ -106,12 +105,13 @@ func (t *targetrunner) getXactByID(w http.ResponseWriter, r *http.Request, what,
 	t.invalmsghdlrsilent(w, r, err.Error(), http.StatusNotFound)
 }
 
-func (t *targetrunner) queryMatchingXact(w http.ResponseWriter, r *http.Request, what string, xactQuery xaction.RegistryXactFilter) {
+func (t *targetrunner) queryMatchingXact(w http.ResponseWriter, r *http.Request, what string,
+	xactQuery registry.XactFilter) {
 	if what != cmn.QueryXactStats {
 		t.invalmsghdlrf(w, r, fmtUnknownQue, what)
 		return
 	}
-	stats, err := xaction.Registry.GetStats(xactQuery)
+	stats, err := registry.Registry.GetStats(xactQuery)
 	if err == nil {
 		t.writeJSON(w, r, stats, what)
 		return
@@ -123,7 +123,7 @@ func (t *targetrunner) queryMatchingXact(w http.ResponseWriter, r *http.Request,
 	}
 }
 
-func (t *targetrunner) cmdXactStart(xactMsg cmn.XactReqMsg, bck *cluster.Bck) error {
+func (t *targetrunner) cmdXactStart(xactMsg *xaction.XactReqMsg, bck *cluster.Bck) error {
 	const erfmb = "global xaction %q does not require bucket (%s) - ignoring it and proceeding to start"
 	const erfmn = "xaction %q requires a bucket to start"
 	switch xactMsg.Kind {
@@ -137,31 +137,42 @@ func (t *targetrunner) cmdXactStart(xactMsg cmn.XactReqMsg, bck *cluster.Bck) er
 		if bck != nil {
 			glog.Errorf(erfmb, xactMsg.Kind, bck)
 		}
-		go t.rebManager.RunResilver(xactMsg.ID, false /*skipGlobMisplaced*/)
+		notif := &xaction.NotifXact{
+			NotifBase: nl.NotifBase{
+				When: cluster.UponTerm,
+				Dsts: []string{equalIC},
+				F:    t.callerNotifyFin,
+			},
+		}
+		go t.runResilver(xactMsg.ID, false /*skipGlobMisplaced*/, notif)
 	// 2. with bucket
 	case cmn.ActPrefetch:
 		if bck == nil {
 			return fmt.Errorf(erfmn, xactMsg.Kind)
 		}
-		args := &xaction.DeletePrefetchArgs{
+		args := &registry.DeletePrefetchArgs{
 			Ctx:      context.Background(),
 			RangeMsg: &cmn.RangeMsg{},
 		}
-		xact, err := xaction.Registry.RenewPrefetch(t, bck, args)
-		if err != nil {
-			return err
-		}
+		xact := registry.Registry.RenewPrefetch(t, bck, args)
+		xact.AddNotif(&xaction.NotifXact{
+			NotifBase: nl.NotifBase{
+				When: cluster.UponTerm,
+				Dsts: []string{equalIC},
+				F:    t.callerNotifyFin,
+			},
+		})
 		go xact.Run()
 	// 3. cannot start
 	case cmn.ActPutCopies:
-		return fmt.Errorf("cannot start xaction %q - it is invoked automatically by PUTs into mirrored bucket", xactMsg.Kind)
+		return fmt.Errorf("cannot start %q (is driven by PUTs into a mirrored bucket)", xactMsg)
 	case cmn.ActDownload, cmn.ActEvictObjects, cmn.ActDelete, cmn.ActMakeNCopies, cmn.ActECEncode:
-		return fmt.Errorf("initiating xaction %q must be done via a separate documented API", xactMsg.Kind)
+		return fmt.Errorf("initiating %q must be done via a separate documented API", xactMsg)
 	// 4. unknown
 	case "":
-		return errors.New("unspecified (empty) xaction kind")
+		return fmt.Errorf("%q: unspecified (empty) xaction kind", xactMsg)
 	default:
-		return fmt.Errorf("starting %q xaction is unsupported", xactMsg.Kind)
+		return fmt.Errorf("%q: kind is not supported", xactMsg)
 	}
 	return nil
 }

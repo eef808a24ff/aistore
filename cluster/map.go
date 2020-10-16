@@ -22,12 +22,28 @@ const (
 	AllNodes
 )
 
+// enum: Snode flags
+const (
+	SnodeNonElectable = 1 << iota
+	SnodeIC
+	SnodeMaintenance
+	SnodeDecomission
+)
+
+const (
+	SnodeMaintenanceMask SnodeFlags = SnodeMaintenance | SnodeDecomission
+
+	icGroupSize = 3 // desirable gateway count in the Information Center
+)
+
 type (
 	// interface to Get current cluster-map instance
 	Sowner interface {
 		Get() (smap *Smap)
 		Listeners() SmapListeners
 	}
+
+	SnodeFlags uint64
 
 	// Snode's networking info
 	NetInfo struct {
@@ -38,11 +54,12 @@ type (
 
 	// Snode - a node (gateway or target) in a cluster
 	Snode struct {
-		DaemonID        string  `json:"daemon_id"`
-		DaemonType      string  `json:"daemon_type"`       // enum: "target" or "proxy"
-		PublicNet       NetInfo `json:"public_net"`        // cmn.NetworkPublic
-		IntraControlNet NetInfo `json:"intra_control_net"` // cmn.NetworkIntraControl
-		IntraDataNet    NetInfo `json:"intra_data_net"`    // cmn.NetworkIntraData
+		DaemonID        string     `json:"daemon_id"`
+		DaemonType      string     `json:"daemon_type"`       // enum: "target" or "proxy"
+		PublicNet       NetInfo    `json:"public_net"`        // cmn.NetworkPublic
+		IntraControlNet NetInfo    `json:"intra_control_net"` // cmn.NetworkIntraControl
+		IntraDataNet    NetInfo    `json:"intra_data_net"`    // cmn.NetworkIntraData
+		Flags           SnodeFlags `json:"flags"`             // enum cmn.Snode*
 		idDigest        uint64
 		name            string
 		LocalNet        *net.IPNet `json:"-"`
@@ -51,14 +68,12 @@ type (
 	NodeMap map[string]*Snode // map of Snodes: DaemonID => Snodes
 
 	Smap struct {
-		Tmap         NodeMap          `json:"tmap"`                    // targetID -> targetInfo
-		Pmap         NodeMap          `json:"pmap"`                    // proxyID -> proxyInfo
-		NonElects    cmn.SimpleKVs    `json:"non_electable,omitempty"` // non-electable proxies: DaemonID => [info]
-		IC           cmn.SimpleKVsInt `json:"ic"`                      // cluster information center: DaemonID => smap version (when added as member)
-		Primary      *Snode           `json:"proxy_si"`                // (json tag preserved for back. compat.)
-		Version      int64            `json:"version,string"`          // version
-		UUID         string           `json:"uuid"`                    // UUID - assigned at creation time
-		CreationTime string           `json:"creation_time"`           // creation time
+		Tmap         NodeMap `json:"tmap"`           // targetID -> targetInfo
+		Pmap         NodeMap `json:"pmap"`           // proxyID -> proxyInfo
+		Primary      *Snode  `json:"proxy_si"`       // (json tag preserved for back. compat.)
+		Version      int64   `json:"version,string"` // version
+		UUID         string  `json:"uuid"`           // UUID (assigned once at creation time)
+		CreationTime string  `json:"creation_time"`  // creation time
 	}
 
 	// Smap on-change listeners
@@ -71,6 +86,26 @@ type (
 		Unreg(sl Slistener)
 	}
 )
+
+////////////////
+// SnodeFlags //
+////////////////
+
+func (f SnodeFlags) Set(flags SnodeFlags) SnodeFlags {
+	return f | flags
+}
+
+func (f SnodeFlags) Clear(flags SnodeFlags) SnodeFlags {
+	return f &^ flags
+}
+
+func (f SnodeFlags) IsSet(flags SnodeFlags) bool {
+	return f&flags == flags
+}
+
+func (f SnodeFlags) IsAnySet(flags SnodeFlags) bool {
+	return f&flags != 0
+}
 
 ///////////
 // Snode //
@@ -94,6 +129,7 @@ func (d *Snode) SetName() {
 		d.name = "t[" + d.DaemonID + "]"
 	}
 }
+
 func (d *Snode) String() string {
 	if d.Name() == "" {
 		d.SetName()
@@ -119,7 +155,7 @@ func (d *Snode) URL(network string) string {
 	case cmn.NetworkIntraData:
 		return d.IntraDataNet.DirectURL
 	default:
-		cmn.AssertMsg(false, "unknown network '"+network+"'")
+		cmn.Assertf(false, "unknown network %q", network)
 		return ""
 	}
 }
@@ -139,7 +175,7 @@ func (d *Snode) Validate() error {
 		return errors.New("invalid Snode: missing node " + d.NameEx())
 	}
 	if d.DaemonType != cmn.Proxy && d.DaemonType != cmn.Target {
-		cmn.AssertMsg(false, "invalid Snode type '+"+d.DaemonType+"'")
+		cmn.Assertf(false, "invalid Snode type %q", d.DaemonType)
 	}
 	return nil
 }
@@ -159,8 +195,11 @@ func (d *Snode) isDuplicateURL(n *Snode) bool {
 	return false
 }
 
-func (d *Snode) IsProxy() bool  { return d.DaemonType == cmn.Proxy }
-func (d *Snode) IsTarget() bool { return d.DaemonType == cmn.Target }
+func (d *Snode) IsProxy() bool       { return d.DaemonType == cmn.Proxy }
+func (d *Snode) IsTarget() bool      { return d.DaemonType == cmn.Target }
+func (d *Snode) InMaintenance() bool { return d.Flags.IsAnySet(SnodeMaintenanceMask) }
+func (d *Snode) NonElectable() bool  { return d.Flags.IsSet(SnodeNonElectable) }
+func (d *Snode) IsIC() bool          { return d.Flags.IsSet(SnodeIC) }
 
 //===============================================================
 //
@@ -185,6 +224,7 @@ func (m *Smap) String() string {
 	}
 	return "Smap v" + strconv.FormatInt(m.Version, 10)
 }
+
 func (m *Smap) StringEx() string {
 	if m == nil {
 		return "Smap <nil>"
@@ -211,15 +251,15 @@ func (m *Smap) GetTarget(sid string) *Snode {
 	return tsi
 }
 
-func (m *Smap) GetTargetMap(sids []string) (np NodeMap, err error) {
-	np = make(NodeMap, len(sids))
-	for _, id := range sids {
-		node := m.GetTarget(id)
-		if node == nil {
-			err = cmn.NewNotFoundError("Daemon: %s", id)
-			continue
+func (m *Smap) NewTmap(tids []string) (tmap NodeMap, err error) {
+	for _, tid := range tids {
+		if m.GetTarget(tid) == nil {
+			return nil, cmn.NewNotFoundError("t[%s]", tid)
 		}
-		np.Add(node)
+	}
+	tmap = make(NodeMap, len(tids))
+	for _, tid := range tids {
+		tmap[tid] = m.GetTarget(tid)
 	}
 	return
 }
@@ -294,10 +334,6 @@ func (m *Smap) Compare(other *Smap) (uuid string, sameOrigin, sameVersion, eq bo
 		eq = false
 		return
 	}
-	if !m.NonElects.Compare(other.NonElects) {
-		eq = false
-		return
-	}
 	eq = mapsEq(m.Tmap, other.Tmap) && mapsEq(m.Pmap, other.Pmap)
 	return
 }
@@ -306,26 +342,20 @@ func (m *Smap) CompareTargets(other *Smap) (equal bool) {
 	return mapsEq(m.Tmap, other.Tmap)
 }
 
+// Method is used when comparing one SMap to another ones, so
+// it cannot be replaced with single `psi.IsIC()` call
 func (m *Smap) IsIC(psi *Snode) (ok bool) {
-	_, ok = m.IC[psi.ID()]
-	return
+	node := m.GetProxy(psi.ID())
+	return node != nil && node.IsIC()
 }
 
-func (m *Smap) OldestIC() (psi *Snode, version int64) {
-	version = m.Version
-	for sid, v := range m.IC {
-		if v <= version {
-			version = v
-			psi = m.GetProxy(sid)
+func (m *Smap) StrIC(node *Snode) string {
+	all := make([]string, 0, m.DefaultICSize())
+	for pid, psi := range m.Pmap {
+		if !psi.IsIC() {
+			continue
 		}
-	}
-	return
-}
-
-func (m *Smap) StrIC(psi *Snode) string {
-	all := make([]string, 0, len(m.IC))
-	for pid := range m.IC {
-		if pid == psi.ID() {
+		if node != nil && pid == node.ID() {
 			all = append(all, pid+"(*)")
 		} else {
 			all = append(all, pid)
@@ -333,6 +363,18 @@ func (m *Smap) StrIC(psi *Snode) string {
 	}
 	return strings.Join(all, ",")
 }
+
+func (m *Smap) ICCount() int {
+	count := 0
+	for _, psi := range m.Pmap {
+		if psi.IsIC() {
+			count++
+		}
+	}
+	return count
+}
+
+func (m *Smap) DefaultICSize() int { return icGroupSize }
 
 /////////////
 // NodeMap //

@@ -7,6 +7,7 @@ package ais
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ const (
 	revsTokenTag  = "token"
 	revsActionTag = "-action" // to make a pair (revs, action)
 )
+
 const (
 	revsReqSync = iota
 	revsReqNotify
@@ -123,9 +125,12 @@ type (
 		stopCh       chan struct{}       // stop channel
 		workCh       chan revsReq        // work channel
 		retryTimer   *time.Timer         // timer to sync pending
+		stopping     atomic.Bool         // true: primary is shutting down
 		timerStopped bool                // true if retryTimer has been stopped, false otherwise
 	}
 )
+
+var jspMetasyncOpts = jsp.Options{Signature: true, Checksum: true}
 
 //
 // inner helpers
@@ -229,9 +234,7 @@ func (y *metasyncer) notify(wait bool, pair revsPair) (failedCnt int) {
 func (y *metasyncer) sync(pairs ...revsPair) *sync.WaitGroup {
 	cmn.Assert(y.isPrimary()) // caller must ensure
 	cmn.Assert(len(pairs) > 0)
-	var (
-		req = revsReq{pairs: pairs}
-	)
+	req := revsReq{pairs: pairs}
 	req.wg = &sync.WaitGroup{}
 	req.wg.Add(1)
 	req.reqType = revsReqSync
@@ -261,6 +264,9 @@ func (y *metasyncer) doSync(pairs []revsPair, revsReqType int) (failedCnt int) {
 
 		newTargetIDs []string
 	)
+	if y.stopping.Load() {
+		return
+	}
 	newCnt := y.countNewMembers(smap)
 	// step 1: validation & enforcement (CoW, non-decremental versioning, duplication)
 	if debug.Enabled {
@@ -271,7 +277,7 @@ func (y *metasyncer) doSync(pairs []revsPair, revsReqType int) (failedCnt int) {
 	} else if revsReqType == revsReqSync {
 		method = http.MethodPut
 	} else {
-		cmn.AssertMsg(false, fmt.Sprintf("unknown request type: %d", revsReqType))
+		cmn.Assertf(false, "unknown request type: %d", revsReqType)
 	}
 
 	pairsToSend = pairs[:0] // share original slice
@@ -310,7 +316,7 @@ outer:
 	// step 2: build payload and update last sync-ed
 	payload := make(msPayload, 2*len(pairsToSend))
 	for _, pair := range pairsToSend {
-		var revs, msg, tag, s = pair.revs, pair.msg, pair.revs.tag(), ""
+		revs, msg, tag, s := pair.revs, pair.msg, pair.revs.tag(), ""
 		if msg.Action != "" {
 			s = ", action " + msg.Action
 		}
@@ -334,18 +340,21 @@ outer:
 
 	// step 3: b-cast
 	var (
-		urlPath = cmn.URLPath(cmn.Version, cmn.Metasync)
-		body    = jsp.EncodeBuf(payload, jsp.CCSign())
+		urlPath = cmn.JoinWords(cmn.Version, cmn.Metasync)
+		body    = jsp.EncodeSGL(payload, jspMetasyncOpts)
 		to      = cluster.AllNodes
 	)
+	defer body.Free()
+
 	if revsReqType == revsReqNotify {
 		to = cluster.Targets
 	}
 	res := y.p.bcastToGroup(bcastArgs{
-		req:     cmn.ReqArgs{Method: method, Path: urlPath, Body: body},
-		smap:    smap,
-		timeout: config.Timeout.MaxKeepalive, // making exception for this critical op
-		to:      to,
+		req:               cmn.ReqArgs{Method: method, Path: urlPath, BodyR: body},
+		smap:              smap,
+		timeout:           config.Timeout.MaxKeepalive, // making exception for this critical op
+		to:                to,
+		ignoreMaintenance: true,
 	})
 
 	// step 4: count failures and fill-in refused
@@ -402,14 +411,18 @@ func (y *metasyncer) syncDone(sid string, pairs []revsPair) {
 	}
 }
 
-func (y *metasyncer) handleRefused(method, urlPath string, body []byte, refused cluster.NodeMap, pairs []revsPair,
-	config *cmn.Config) {
-	res := y.p.bcastToNodes(bcastArgs{
-		req:     cmn.ReqArgs{Method: method, Path: urlPath, Body: body},
-		network: cmn.NetworkIntraControl,
-		timeout: config.Timeout.MaxKeepalive,
-		nodes:   []cluster.NodeMap{refused},
-	})
+func (y *metasyncer) handleRefused(method, urlPath string, body io.Reader, refused cluster.NodeMap,
+	pairs []revsPair, config *cmn.Config) {
+	var (
+		bargs = bcastArgs{
+			req:       cmn.ReqArgs{Method: method, Path: urlPath, BodyR: body},
+			network:   cmn.NetworkIntraControl,
+			timeout:   config.Timeout.MaxKeepalive,
+			nodes:     []cluster.NodeMap{refused},
+			nodeCount: len(refused),
+		}
+		res = y.p.bcastToNodes(&bargs)
+	)
 	for r := range res {
 		if r.err == nil {
 			delete(refused, r.si.ID())
@@ -482,22 +495,26 @@ func (y *metasyncer) handlePending() (failedCnt int) {
 		pairs = append(pairs, revsPair{revs, msg})
 	}
 	var (
-		urlPath = cmn.URLPath(cmn.Version, cmn.Metasync)
-		body    = jsp.EncodeBuf(payload, jsp.CCSign())
+		urlPath = cmn.JoinWords(cmn.Version, cmn.Metasync)
+		body    = jsp.EncodeSGL(payload, jspMetasyncOpts)
+		bargs   = bcastArgs{
+			req:       cmn.ReqArgs{Method: http.MethodPut, Path: urlPath, BodyR: body},
+			network:   cmn.NetworkIntraControl,
+			timeout:   cmn.GCO.Get().Timeout.MaxKeepalive,
+			nodes:     []cluster.NodeMap{pending},
+			nodeCount: len(pending),
+		}
 	)
-	res := y.p.bcastToNodes(bcastArgs{
-		req:     cmn.ReqArgs{Method: http.MethodPut, Path: urlPath, Body: body},
-		network: cmn.NetworkIntraControl,
-		timeout: cmn.GCO.Get().Timeout.MaxKeepalive,
-		nodes:   []cluster.NodeMap{pending},
-	})
+	defer body.Free()
+	res := y.p.bcastToNodes(&bargs)
 	for r := range res {
 		if r.err == nil {
 			y.syncDone(r.si.ID(), pairs)
 			glog.Infof("%s: handle-pending: sync-ed %s", y.p.si, r.si)
 		} else {
 			failedCnt++
-			glog.Warningf("%s: handle-pending: failing to sync %s, err: %v (%d)", y.p.si, r.si, r.err, r.status)
+			glog.Warningf("%s: handle-pending: failing to sync %s, err: %v (%d)",
+				y.p.si, r.si, r.err, r.status)
 		}
 	}
 	return

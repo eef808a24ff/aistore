@@ -16,9 +16,9 @@ ifdef GOBIN
 	BUILD_DEST = $(GOBIN)
 endif
 ifdef TAGS
-	BUILD_TAGS = "$(AIS_CLD_PROVIDER) $(TAGS)"
+	BUILD_TAGS = "$(AIS_CLD_PROVIDERS) $(TAGS)"
 else
-	BUILD_TAGS = $(AIS_CLD_PROVIDER)
+	BUILD_TAGS = $(AIS_CLD_PROVIDERS)
 endif
 
 # Profiling
@@ -67,12 +67,12 @@ term-reset = $(shell { tput sgr0 || tput me; } 2>/dev/null)
 $(call make-lazy,cyan)
 $(call make-lazy,term-reset)
 
-.PHONY: all node cli cli-autocompletions aisfs authn aisloader xmeta
+.PHONY: all node cli cli-autocompletions aisfs authn aisloader xmeta client-bindings
 
 all: node cli aisfs authn aisloader ## Build all main binaries
 
 node: ## Build 'aisnode' binary
-	@echo "Building aisnode: version=$(VERSION) provider=$(AIS_CLD_PROVIDER)"
+	@echo "Building aisnode: version=$(VERSION) providers=$(AIS_CLD_PROVIDERS)"
 ifneq ($(strip $(GORACE)),)
 ifneq ($(findstring log_path,$(GORACE)),log_path)
 	@echo
@@ -110,7 +110,19 @@ build-%:
 	@echo "done."
 
 docker-image-aisnode-%: ## Build 'aisnode' docker image using alpine/ubuntu as the base.
+	@echo "Building docker-image-aisnode $*... "
 	@sudo docker build . --force-rm -t aistore/aisnode:latest-$* -f deploy/dev/k8s/Dockerfile-aisnode-$*
+	@echo "*** Run the following to push the image to docker hub"
+	@echo "*** docker push aistore/aisnode:latest-"$*
+
+docker-image-ais-demo-%: ## Build 'aisnode' docker demo image with (1-proxy, 1-target, no cloud setup) using alpine/ubuntu as the base.
+	@echo "Building docker-image-ais-demo $*... "
+	@sudo docker build . --force-rm -t aistore/aistore:latest-minimal-devel-$* -f deploy/dev/docker/Dockerfile-ais-demo-$*
+	@echo "*** Run the following to push the image to docker hub"
+	@echo "*** docker push aistore/latest-minimal-devel-"$*
+
+client-bindings:
+	$(SCRIPTS_DIR)/generate-python-api-client.sh
 
 #
 # local deployment (intended for developers)
@@ -123,7 +135,7 @@ deploy: ## Build 'aisnode' and deploy the specified numbers of local AIS proxies
 #
 # cleanup local deployment (cached objects, logs, and executables)
 #
-.PHONY: kill clean
+.PHONY: kill clean clean-client-bindings
 
 # when profiling, make sure to let it flush accumulated stats
 # e.g., insert sleep prior to SIGKILL or remove it altogether
@@ -144,6 +156,8 @@ clean: ## Remove all AIS related files and binaries
 		rm -f $(GOPATH)/pkg/linux_amd64/github.com/NVIDIA/aistore/aisnode.a
 	@echo "done."
 
+clean-client-bindings: ## Remove all generated client binding files
+	$(SCRIPTS_DIR)/clean-python-api-client.sh
 #
 # go modules
 #
@@ -194,7 +208,7 @@ test-envcheck:
 	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-env
 
 test-short: test-envcheck ## Run short tests (requires BUCKET variable to be set)
-	@BUCKET=$(BUCKET) AIS_ENDPOINT=$(AIS_ENDPOINT) $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-short
+	@RE=$(RE) BUCKET=$(BUCKET) AIS_ENDPOINT=$(AIS_ENDPOINT) $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-short
 
 test-long: test-envcheck ## Run all (long) tests (requires BUCKET variable to be set)
 	@BUCKET=$(BUCKET) AIS_ENDPOINT=$(AIS_ENDPOINT) $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-long
@@ -278,4 +292,6 @@ help:
 		"BUCKET=tmp make ci" "Run style, lint, and spell checks, as well as all short tests" \
 		"MEM_PROFILE=/tmp/mem make deploy" "Deploy cluster with memory profiling enabled, write reports to /tmp/mem.<PID> (and make sure to stop gracefully)" \
 		"CPU_PROFILE=/tmp/cpu make deploy" "Build and deploy cluster instrumented for CPU profiling, write reports to /tmp/cpu.<PID>" \
-		"TAGS=nethttp make deploy" "Build 'transport' package with net/http (see transport/README.md) and deploy cluster locally"
+		"TAGS=nethttp make deploy" "Build 'transport' package with net/http (see transport/README.md) and deploy cluster locally" \
+		"make client-bindings" "Generate client bindings (ie. the python ais-client)"\
+		"make clean-client-bindings" "Clean up all generated client bindings"

@@ -14,6 +14,7 @@ RUN apt-get clean && apt-get update &&\
       attr \
       net-tools \
       iproute2 \
+      make \
       gnupg \
       iputils-ping &&\
   apt-get -y clean all
@@ -49,12 +50,13 @@ ENV STATSD_CONF_FILE ${AIS_CONF_DIR}/statsd.conf
 
 ENV MOUNTPATH /tmp/ais
 
-ARG QUICK
-ENV QUICK=${QUICK}
-
 COPY aisnode_config.sh aisnode_config.sh
 COPY entrypoint/entrypoint.sh entrypoint.sh
 
-EXPOSE 8080 9080 10080
+RUN go get -v github.com/NVIDIA/aistore
+WORKDIR "${GOPATH}/src/github.com/NVIDIA/aistore"
+
+
+EXPOSE 51080 9080 10080
 
 ENTRYPOINT ["sh", "-c", "/entrypoint.sh"]

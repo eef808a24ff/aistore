@@ -32,7 +32,7 @@ import (
 
 var cpbuf = make([]byte, 32*cmn.KiB)
 
-func receive10G(w http.ResponseWriter, hdr transport.Header, objReader io.Reader, err error) {
+func receive10G(w http.ResponseWriter, hdr transport.ObjHdr, objReader io.Reader, err error) {
 	cmn.AssertNoErr(err)
 	written, _ := io.CopyBuffer(ioutil.Discard, objReader, cpbuf)
 	cmn.Assert(written == hdr.ObjAttrs.Size)
@@ -78,18 +78,18 @@ func Test_CompressedOne(t *testing.T) {
 	for size < cmn.GiB*numGs {
 		if num%7 == 0 { // header-only
 			hdr.ObjAttrs.Size = 0
-			stream.Send(transport.Obj{Hdr: hdr})
+			stream.Send(&transport.Obj{Hdr: hdr})
 			numhdr++
 		} else {
 			var reader io.ReadCloser
 			if num%3 == 0 {
-				hdr.ObjAttrs.Size = int64(random.Intn(100))
+				hdr.ObjAttrs.Size = int64(random.Intn(100) + 1)
 				reader = ioutil.NopCloser(&io.LimitedReader{R: random, N: hdr.ObjAttrs.Size}) // fully random to hinder compression
 			} else {
-				hdr.ObjAttrs.Size = int64(random.Intn(cmn.GiB))
+				hdr.ObjAttrs.Size = int64(random.Intn(cmn.GiB) + 1)
 				reader = &randReader{buf: buf, hdr: hdr, clone: true}
 			}
-			stream.Send(transport.Obj{Hdr: hdr, Reader: reader})
+			stream.Send(&transport.Obj{Hdr: hdr, Reader: reader})
 		}
 		num++
 		size += hdr.ObjAttrs.Size
@@ -125,7 +125,7 @@ func Test_DryRun(t *testing.T) {
 
 	for size < cmn.TiB/4 {
 		reader := newRandReader(random, hdr, slab)
-		stream.Send(transport.Obj{Hdr: hdr, Reader: reader})
+		stream.Send(&transport.Obj{Hdr: hdr, Reader: reader})
 		num++
 		size += hdr.ObjAttrs.Size
 		if size-prevsize >= cmn.GiB*100 {
@@ -147,13 +147,13 @@ func Test_CompletionCount(t *testing.T) {
 		mux                       = mux.NewServeMux()
 	)
 
-	receive := func(w http.ResponseWriter, hdr transport.Header, objReader io.Reader, err error) {
+	receive := func(w http.ResponseWriter, hdr transport.ObjHdr, objReader io.Reader, err error) {
 		cmn.Assert(err == nil)
 		written, _ := io.CopyBuffer(ioutil.Discard, objReader, cpbuf)
 		cmn.Assert(written == hdr.ObjAttrs.Size)
 		numReceived.Inc()
 	}
-	callback := func(_ transport.Header, _ io.ReadCloser, _ unsafe.Pointer, _ error) {
+	callback := func(_ transport.ObjHdr, _ io.ReadCloser, _ unsafe.Pointer, _ error) {
 		numCompleted.Inc()
 	}
 
@@ -179,11 +179,11 @@ func Test_CompletionCount(t *testing.T) {
 			hdr := genStaticHeader()
 			hdr.ObjAttrs.Size = 0
 			hdr.Opaque = []byte(strconv.FormatInt(104729*int64(idx), 10))
-			stream.Send(transport.Obj{Hdr: hdr, Callback: callback})
+			stream.Send(&transport.Obj{Hdr: hdr, Callback: callback})
 			rem = random.Int63() % 13
 		} else {
 			hdr, rr := makeRandReader()
-			stream.Send(transport.Obj{Hdr: hdr, Reader: rr, Callback: callback})
+			stream.Send(&transport.Obj{Hdr: hdr, Reader: rr, Callback: callback})
 		}
 		numSent++
 		if numSent > 5000 && rem == 3 {

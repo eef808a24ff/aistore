@@ -17,8 +17,8 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/stats"
 )
 
@@ -29,20 +29,18 @@ const (
 	internalErrorMsg = "internal server error"
 )
 
-var (
-	// List of HTTP status codes on which we should
-	// not retry and just mark job as failed.
-	terminalStatuses = map[int]struct{}{
-		http.StatusNotFound:          {},
-		http.StatusPaymentRequired:   {},
-		http.StatusUnauthorized:      {},
-		http.StatusForbidden:         {},
-		http.StatusMethodNotAllowed:  {},
-		http.StatusNotAcceptable:     {},
-		http.StatusProxyAuthRequired: {},
-		http.StatusGone:              {},
-	}
-)
+// List of HTTP status codes on which we should
+// not retry and just mark job as failed.
+var terminalStatuses = map[int]struct{}{
+	http.StatusNotFound:          {},
+	http.StatusPaymentRequired:   {},
+	http.StatusUnauthorized:      {},
+	http.StatusForbidden:         {},
+	http.StatusMethodNotAllowed:  {},
+	http.StatusNotAcceptable:     {},
+	http.StatusProxyAuthRequired: {},
+	http.StatusGone:              {},
+}
 
 type (
 	singleObjectTask struct {
@@ -101,10 +99,7 @@ func (t *singleObjectTask) download() {
 }
 
 func (t *singleObjectTask) tryDownloadLocal(lom *cluster.LOM, timeout time.Duration) error {
-	var (
-		workFQN = fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfilePut)
-	)
-
+	workFQN := fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfilePut)
 	ctx, cancel := context.WithTimeout(t.downloadCtx, timeout)
 	defer cancel()
 
@@ -123,9 +118,7 @@ func (t *singleObjectTask) tryDownloadLocal(lom *cluster.LOM, timeout time.Durat
 	if err != nil {
 		return err
 	}
-	defer func() {
-		debug.AssertNoErr(resp.Body.Close())
-	}()
+	defer cmn.Close(resp.Body)
 
 	if resp.StatusCode >= http.StatusBadRequest {
 		return fmt.Errorf("request failed with %d status code (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
@@ -139,14 +132,14 @@ func (t *singleObjectTask) tryDownloadLocal(lom *cluster.LOM, timeout time.Durat
 	t.setTotalSize(roi.size)
 
 	lom.SetCustomMD(roi.md)
-	err = t.parent.t.PutObject(cluster.PutObjectParams{
-		LOM:          lom,
+	params := cluster.PutObjectParams{
 		Reader:       r,
 		WorkFQN:      workFQN,
 		RecvType:     cluster.ColdGet,
 		Started:      t.started.Load(),
 		WithFinalize: true,
-	})
+	}
+	err = t.parent.t.PutObject(lom, params)
 	if err != nil {
 		return err
 	}
@@ -195,6 +188,7 @@ func (t *singleObjectTask) wrapReader(ctx context.Context, r io.ReadCloser) io.R
 		r: r,
 		reporter: func(n int64) {
 			t.currentSize.Add(n)
+			nl.OnProgress(t.job.Notif())
 		},
 	}
 	// Wrap around throttler reader (noop if throttling is disabled).

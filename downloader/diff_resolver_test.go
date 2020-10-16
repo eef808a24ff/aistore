@@ -36,6 +36,7 @@ type (
 func (*mockDiffResolverCtx) CompareObjects(*cluster.LOM, *downloader.DstElement) (bool, error) {
 	return true, nil
 }
+
 func (*mockDiffResolverCtx) IsObjFromCloud(lom *cluster.LOM) (bool, error) {
 	return lom.FQN == fromCloudFQN, nil
 }
@@ -185,7 +186,7 @@ func TestDiffResolver(t *testing.T) {
 				case downloader.DiffResolverEOF:
 					break
 				default:
-					cmn.AssertFmt(false, result.Action)
+					cmn.Assertf(false, "%d", result.Action)
 				}
 			}
 

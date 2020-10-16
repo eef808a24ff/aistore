@@ -175,7 +175,7 @@ func (c Client) Send(bucket string, aggCnt int64, metrics ...Metric) {
 			prefix = "+"
 			t = "g"
 		default:
-			cmn.AssertMsg(false, fmt.Sprintf("Unknown type %+v", m.Type))
+			cmn.Assertf(false, "unknown type %+v", m.Type)
 		}
 
 		if packet.Len() > 0 {
@@ -193,8 +193,8 @@ func (c Client) Send(bucket string, aggCnt int64, metrics ...Metric) {
 
 	if packet.Len() > 0 {
 		_, err := c.conn.Write(packet.Bytes())
-		if err != nil && glog.V(5) {
-			glog.Infof("Sending to StatsD failed: %s\n", err.Error())
+		if err != nil && glog.V(4) {
+			glog.Errorf("Sending to StatsD failed: %v", err)
 		}
 	}
 }

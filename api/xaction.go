@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/nl"
+	"github.com/NVIDIA/aistore/xaction"
 )
 
 const (
@@ -19,8 +21,8 @@ const (
 )
 
 type (
-	NodesXactStat       map[string]*cmn.BaseXactStatsExt
-	NodesXactMultiStats map[string][]*cmn.BaseXactStatsExt
+	NodesXactStat       map[string]*xaction.BaseXactStatsExt
+	NodesXactMultiStats map[string][]*xaction.BaseXactStatsExt
 
 	XactStatsHelper interface {
 		Running() bool
@@ -63,6 +65,13 @@ func (xs NodesXactStat) Aborted() bool {
 func (xs NodesXactStat) ObjCount() (count int64) {
 	for _, stat := range xs {
 		count += stat.ObjCount()
+	}
+	return
+}
+
+func (xs NodesXactStat) BytesCount() (count int64) {
+	for _, stat := range xs {
+		count += stat.BytesCount()
 	}
 	return
 }
@@ -113,15 +122,13 @@ func (xs NodesXactMultiStats) GetNodesXactStat(id string) (xactStat NodesXactSta
 	return
 }
 
-// StartXaction API
-//
 // StartXaction starts a given xaction.
 func StartXaction(baseParams BaseParams, args XactReqArgs) (id string, err error) {
-	if !cmn.XactsDtor[args.Kind].Startable {
+	if !xaction.XactsDtor[args.Kind].Startable {
 		return id, fmt.Errorf("cannot start \"kind=%s\" xaction", args.Kind)
 	}
 
-	xactMsg := cmn.XactReqMsg{
+	xactMsg := xaction.XactReqMsg{
 		Kind: args.Kind,
 		Bck:  args.Bck,
 	}
@@ -139,20 +146,18 @@ func StartXaction(baseParams BaseParams, args XactReqArgs) (id string, err error
 	baseParams.Method = http.MethodPut
 	err = DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Cluster),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Cluster),
 		Body:       cmn.MustMarshal(msg),
 		Query:      cmn.AddBckToQuery(nil, args.Bck),
 	}, &id)
 	return id, err
 }
 
-// AbortXaction API
-//
 // AbortXaction aborts a given xaction.
 func AbortXaction(baseParams BaseParams, args XactReqArgs) error {
 	msg := cmn.ActionMsg{
 		Action: cmn.ActXactStop,
-		Value: cmn.XactReqMsg{
+		Value: xaction.XactReqMsg{
 			ID:   args.ID,
 			Kind: args.Kind,
 			Bck:  args.Bck,
@@ -161,14 +166,12 @@ func AbortXaction(baseParams BaseParams, args XactReqArgs) error {
 	baseParams.Method = http.MethodPut
 	return DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Cluster),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Cluster),
 		Body:       cmn.MustMarshal(msg),
 		Query:      cmn.AddBckToQuery(nil, args.Bck),
 	})
 }
 
-// GetXactionStatsByID API
-//
 // GetXactionStatsByID gets all xaction stats for given id.
 func GetXactionStatsByID(baseParams BaseParams, id string) (xactStat NodesXactStat, err error) {
 	xactStats, err := QueryXactionStats(baseParams, XactReqArgs{ID: id})
@@ -179,11 +182,9 @@ func GetXactionStatsByID(baseParams BaseParams, id string) (xactStat NodesXactSt
 	return
 }
 
-// QueryXactionStats API
-//
 // QueryXactionStats gets all xaction stats for given kind and bucket (optional).
 func QueryXactionStats(baseParams BaseParams, args XactReqArgs) (xactStats NodesXactMultiStats, err error) {
-	msg := cmn.XactReqMsg{
+	msg := xaction.XactReqMsg{
 		ID:   args.ID,
 		Kind: args.Kind,
 		Bck:  args.Bck,
@@ -194,18 +195,49 @@ func QueryXactionStats(baseParams BaseParams, args XactReqArgs) (xactStats Nodes
 	baseParams.Method = http.MethodGet
 	err = DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Cluster),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Cluster),
 		Body:       cmn.MustMarshal(msg),
 		Query:      url.Values{cmn.URLParamWhat: []string{cmn.QueryXactStats}},
 	}, &xactStats)
 	return xactStats, err
 }
 
-// WaitForXaction API
-//
+// GetXactionStatus retrieves the status of the xaction.
+func GetXactionStatus(baseParams BaseParams, args XactReqArgs) (status *nl.NotifStatus, err error) {
+	baseParams.Method = http.MethodGet
+	msg := xaction.XactReqMsg{
+		ID:   args.ID,
+		Kind: args.Kind,
+		Bck:  args.Bck,
+	}
+	if args.Latest {
+		msg.OnlyRunning = Bool(true)
+	}
+
+	status = &nl.NotifStatus{}
+	err = DoHTTPRequest(ReqParams{
+		BaseParams: baseParams,
+		Path:       cmn.JoinWords(cmn.Version, cmn.Cluster),
+		Body:       cmn.MustMarshal(msg),
+		Query: url.Values{
+			cmn.URLParamWhat: []string{cmn.GetWhatStatus},
+		},
+	}, status)
+	return
+}
+
 // WaitForXaction waits for a given xaction to complete.
-func WaitForXaction(baseParams BaseParams, args XactReqArgs) error {
-	ctx := context.Background()
+func WaitForXaction(baseParams BaseParams, args XactReqArgs,
+	refreshIntervals ...time.Duration) (status *nl.NotifStatus, err error) {
+	var (
+		ctx           = context.Background()
+		retryInterval = xactRetryInterval
+	)
+
+	if len(refreshIntervals) > 0 {
+		retryInterval = refreshIntervals[0]
+	}
+
 	if args.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, args.Timeout)
@@ -213,66 +245,21 @@ func WaitForXaction(baseParams BaseParams, args XactReqArgs) error {
 	}
 
 	for {
-		xactStats, err := QueryXactionStats(baseParams, args)
-		if err != nil {
-			return err
+		status, err = GetXactionStatus(baseParams, args)
+		if err != nil || status.Finished() {
+			return
 		}
-		if xactStats.Finished() {
-			break
-		}
-		time.Sleep(xactRetryInterval)
+
+		time.Sleep(retryInterval)
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			break
-		}
-	}
-
-	return nil
-}
-
-// TODO: Rename this function after IC is stable
-func GetStatusJtx(baseParams BaseParams, uuid string) (finished bool, err error) {
-	baseParams.Method = http.MethodGet
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Cluster),
-		Query: url.Values{
-			cmn.URLParamWhat: []string{cmn.GetWhatStatus},
-			cmn.URLParamUUID: []string{uuid},
-		},
-	}, &finished)
-	return
-}
-
-// TODO: Rename this function after IC is stable
-func WaitForXactionJtx(baseParams BaseParams, uuid string, timeout ...time.Duration) (err error) {
-	ctx := context.Background()
-	if len(timeout) > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout[0])
-		defer cancel()
-	}
-
-	for {
-		finished, err := GetStatusJtx(baseParams, uuid)
-		if err != nil || finished {
-			return err
-		}
-
-		time.Sleep(xactRetryInterval)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		default:
 			break
 		}
 	}
 }
 
-// WaitForXaction API
-//
 // WaitForXactionToStart waits for a given xaction to start.
 func WaitForXactionToStart(baseParams BaseParams, args XactReqArgs) error {
 	ctx := context.Background()
@@ -305,14 +292,13 @@ func WaitForXactionToStart(baseParams BaseParams, args XactReqArgs) error {
 	return nil
 }
 
-// MakeNCopies API
-//
-// MakeNCopies starts an extended action (xaction) to bring a given bucket to a certain redundancy level (num copies)
+// MakeNCopies starts an extended action (xaction) to bring a given bucket to a
+// certain redundancy level (num copies).
 func MakeNCopies(baseParams BaseParams, bck cmn.Bck, copies int) (xactID string, err error) {
 	baseParams.Method = http.MethodPost
 	err = DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name),
 		Body:       cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActMakeNCopies, Value: copies}),
 	}, &xactID)
 	return

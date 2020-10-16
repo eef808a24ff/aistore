@@ -12,11 +12,13 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/downloader"
 	"github.com/NVIDIA/aistore/dsort"
+	"github.com/NVIDIA/aistore/xaction"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 	"gopkg.in/yaml.v2"
@@ -30,6 +32,7 @@ var (
 			descriptionFlag,
 			limitConnectionsFlag,
 			objectsListFlag,
+			progressIntervalFlag,
 		},
 		subcmdStartDsort: {
 			specFileFlag,
@@ -61,7 +64,7 @@ var (
 					ArgsUsage:    bucketArgument,
 					Flags:        startCmdsFlags[commandPrefetch],
 					Action:       prefetchHandler,
-					BashComplete: bucketCompletions(bckCompletionsOpts{multiple: true, provider: cmn.AnyCloud}),
+					BashComplete: bucketCompletions(bckCompletionsOpts{multiple: true}),
 				},
 				{
 					Name:      subcmdStartDownload,
@@ -131,16 +134,16 @@ func xactionCmds() cli.Commands {
 	splCmdKinds.Add(cmn.ActPrefetch, cmn.ActECEncode, cmn.ActMakeNCopies, cmn.ActLRU)
 
 	startable := listXactions(true)
-	for _, xaction := range startable {
-		if splCmdKinds.Contains(xaction) {
+	for _, xact := range startable {
+		if splCmdKinds.Contains(xact) {
 			continue
 		}
 		cmd := cli.Command{
-			Name:   xaction,
-			Usage:  fmt.Sprintf("start %s", xaction),
+			Name:   xact,
+			Usage:  fmt.Sprintf("start %s", xact),
 			Action: startXactionHandler,
 		}
-		if cmn.IsXactTypeBck(xaction) {
+		if xaction.IsXactTypeBck(xact) {
 			cmd.ArgsUsage = bucketArgument
 			cmd.BashComplete = bucketCompletions()
 		}
@@ -151,12 +154,11 @@ func xactionCmds() cli.Commands {
 
 func startXactionHandler(c *cli.Context) (err error) {
 	xactKind := c.Command.Name
-	if cmn.IsXactTypeBck(xactKind) && c.NArg() == 0 {
+	if xaction.IsXactTypeBck(xactKind) && c.NArg() == 0 {
 		return missingArgumentsError(c, bucketArgument)
 	}
 
-	bck, _, err := parseBckObjectURI(c.Args().First())
-
+	bck, err := parseBckURI(c, c.Args().First())
 	if err != nil {
 		return err
 	}
@@ -209,10 +211,11 @@ func stopXactionHandler(c *cli.Context) (err error) {
 
 func startDownloadHandler(c *cli.Context) error {
 	var (
-		description     = parseStrFlag(c, descriptionFlag)
-		timeout         = parseStrFlag(c, timeoutFlag)
-		objectsListPath = parseStrFlag(c, objectsListFlag)
-		id              string
+		description      = parseStrFlag(c, descriptionFlag)
+		timeout          = parseStrFlag(c, timeoutFlag)
+		objectsListPath  = parseStrFlag(c, objectsListFlag)
+		progressInterval = parseStrFlag(c, progressIntervalFlag)
+		id               string
 	)
 
 	if c.NArg() == 0 {
@@ -246,14 +249,20 @@ func startDownloadHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+
+	if _, err := time.ParseDuration(progressInterval); err != nil {
+		return err
+	}
+
 	basePayload := downloader.DlBase{
 		Bck: cmn.Bck{
 			Name:     bucket,
-			Provider: cmn.ProviderAIS, // NOTE: currently downloading only to ais buckets is supported
+			Provider: cmn.ProviderAIS,
 			Ns:       cmn.NsGlobal,
 		},
-		Timeout:     timeout,
-		Description: description,
+		Timeout:          timeout,
+		Description:      description,
+		ProgressInterval: progressInterval,
 		Limits: downloader.DlLimits{
 			Connections:  parseIntFlag(c, limitConnectionsFlag),
 			BytesPerHour: int(limitBPH),
@@ -267,13 +276,13 @@ func startDownloadHandler(c *cli.Context) error {
 	} else if strings.Contains(source.link, "{") && strings.Contains(source.link, "}") {
 		dlType = downloader.DlTypeRange
 	} else if source.cloud.bck.IsEmpty() {
-		dlType = downloader.DlTypeCloud
+		dlType = downloader.DlTypeSingle
 	} else {
 		cfg, err := getClusterConfig()
 		if err != nil {
 			return err
 		}
-		if cfg.Cloud.Provider == source.cloud.bck.Provider {
+		if _, ok := cfg.Cloud.Providers[source.cloud.bck.Provider]; ok {
 			// Cloud is configured to requested bucket provider.
 			dlType = downloader.DlTypeCloud
 
@@ -282,10 +291,11 @@ func startDownloadHandler(c *cli.Context) error {
 				return err
 			}
 			if !p.BackendBck.Equal(source.cloud.bck) {
-				return fmt.Errorf(
-					"%q AIS bucket must be connected to backend cloud bucket %q",
+				fmt.Fprintf(c.App.Writer,
+					"Warning: bucket %q does not have Cloud bucket %q as its *backend* - proceeding to download anyway\n",
 					basePayload.Bck, source.cloud.bck,
 				)
+				dlType = downloader.DlTypeSingle
 			}
 		} else if source.cloud.prefix == "" {
 			return fmt.Errorf(
@@ -357,7 +367,7 @@ func startDownloadHandler(c *cli.Context) error {
 	}
 
 	fmt.Fprintln(c.App.Writer, id)
-	fmt.Fprintf(c.App.Writer, "Run `ais show download %s` to monitor the progress of downloading.\n", id)
+	fmt.Fprintf(c.App.Writer, "Run `ais show download %s --progress` to monitor the progress of downloading.\n", id)
 	return nil
 }
 
@@ -368,7 +378,7 @@ func stopDownloadHandler(c *cli.Context) (err error) {
 		return missingArgumentsError(c, "download job ID")
 	}
 
-	if err = api.DownloadAbort(defaultAPIParams, id); err != nil {
+	if err = api.AbortDownload(defaultAPIParams, id); err != nil {
 		return
 	}
 
@@ -468,7 +478,7 @@ func startLRUHandler(c *cli.Context) (err error) {
 	bckArgs := makeList(parseStrFlag(c, listBucketsFlag), ",")
 	buckets := make([]cmn.Bck, len(bckArgs))
 	for idx, bckArg := range bckArgs {
-		bck, _, err := parseBckObjectURI(bckArg)
+		bck, err := parseBckURI(c, bckArg)
 		if err != nil {
 			return err
 		}

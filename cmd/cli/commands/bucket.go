@@ -18,6 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/cmd/cli/templates"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/urfave/cli"
+	"k8s.io/apimachinery/pkg/util/duration"
 )
 
 const (
@@ -64,6 +65,7 @@ func createBucket(c *cli.Context, bck cmn.Bck, props ...cmn.BucketPropsToUpdate)
 				}
 				return fmt.Errorf(desc)
 			}
+			return fmt.Errorf("create bucket %q failed: %s", bck, herr.Message)
 		}
 		return fmt.Errorf("create bucket %q failed: %s", bck, err.Error())
 	}
@@ -107,8 +109,8 @@ func renameBucket(c *cli.Context, fromBck, toBck cmn.Bck) (err error) {
 }
 
 // Copy ais bucket
-func copyBucket(c *cli.Context, fromBck, toBck cmn.Bck) (err error) {
-	if _, err = api.CopyBucket(defaultAPIParams, fromBck, toBck); err != nil {
+func copyBucket(c *cli.Context, fromBck, toBck cmn.Bck, msg *cmn.CopyBckMsg) (err error) {
+	if _, err = api.CopyBucket(defaultAPIParams, fromBck, toBck, msg); err != nil {
 		return
 	}
 
@@ -121,6 +123,9 @@ func copyBucket(c *cli.Context, fromBck, toBck cmn.Bck) (err error) {
 func evictBucket(c *cli.Context, bck cmn.Bck) (err error) {
 	if flagIsSet(c, dryRunFlag) {
 		fmt.Fprintf(c.App.Writer, "EVICT: %q\n", bck)
+		return
+	}
+	if err = ensureHasProvider(bck, c.Command.Name); err != nil {
 		return
 	}
 	if err = api.EvictCloudBucket(defaultAPIParams, bck); err != nil {
@@ -158,7 +163,7 @@ func listBucketNames(c *cli.Context, query cmn.QueryBcks) (err error) {
 }
 
 // Lists objects in bucket
-func listBucketObj(c *cli.Context, bck cmn.Bck) error {
+func listObjects(c *cli.Context, bck cmn.Bck) error {
 	objectListFilter, err := newObjectListFilter(c)
 	if err != nil {
 		return err
@@ -177,7 +182,7 @@ func listBucketObj(c *cli.Context, bck cmn.Bck) error {
 	if flagIsSet(c, cachedFlag) {
 		msg.Flags = cmn.SelectCached
 	}
-	props := parseStrSliceFlag(c, objPropsFlag)
+	props := strings.Split(parseStrFlag(c, objPropsFlag), ",")
 	if cmn.StringInSlice("all", props) {
 		msg.AddProps(cmn.GetPropsAll...)
 	} else {
@@ -249,8 +254,18 @@ func listBucketObj(c *cli.Context, bck cmn.Bck) error {
 		}
 	}
 
+	cb := func(ctx *api.ProgressContext) {
+		fmt.Fprintf(c.App.Writer, "\rFetched %d objects (elapsed: %s)",
+			ctx.Info().Count, duration.HumanDuration(ctx.Elapsed()))
+		// If it is a final message, move to new line, to keep output tidy
+		if ctx.IsFinished() {
+			fmt.Fprintln(c.App.Writer)
+		}
+	}
+	ctx := api.NewProgressContext(cb, longCommandTime)
+
 	// retrieve the entire bucket list and print it
-	objList, err := api.ListObjects(defaultAPIParams, bck, msg, uint(limit))
+	objList, err := api.ListObjects(defaultAPIParams, bck, msg, uint(limit), ctx)
 	if err != nil {
 		return err
 	}
@@ -277,25 +292,9 @@ func fetchSummaries(query cmn.QueryBcks, fast, cached bool) (summaries cmn.Bucke
 
 // TODO: support `allow` and `deny` verbs/operations on existing access permissions
 
-func reformatBucketProps(nvs cmn.SimpleKVs) error {
-	if v, ok := nvs[cmn.HeaderBackendBck]; ok {
-		delete(nvs, cmn.HeaderBackendBck)
-		var originBck cmn.Bck
-		if v != emptyOrigin {
-			var (
-				objName string
-				err     error
-			)
-			originBck, objName, err = parseBckObjectURI(v)
-			if err != nil {
-				return err
-			}
-			if objName != "" {
-				return fmt.Errorf("invalid format of %q", cmn.HeaderBackendBck)
-			}
-		}
-		nvs[cmn.HeaderBackendBckName] = originBck.Name
-		nvs[cmn.HeaderBackendBckProvider] = originBck.Provider
+func reformatBucketProps(nvs cmn.SimpleKVs) (err error) {
+	if err = _reformatBackendProps(nvs); err != nil {
+		return
 	}
 
 	if v, ok := nvs[cmn.HeaderBucketAccessAttrs]; ok {
@@ -315,6 +314,44 @@ func reformatBucketProps(nvs cmn.SimpleKVs) error {
 		}
 	}
 	return nil
+}
+
+func _reformatBackendProps(nvs cmn.SimpleKVs) (err error) {
+	var (
+		originBck cmn.Bck
+		v         string
+		objName   string
+		ok        bool
+	)
+
+	if v, ok = nvs[cmn.HeaderBackendBck]; ok {
+		delete(nvs, cmn.HeaderBackendBck)
+	} else if v, ok = nvs[cmn.HeaderBackendBckName]; !ok {
+		goto validate
+	}
+
+	if v != emptyOrigin {
+		originBck, objName, err = cmn.ParseBckObjectURI(v)
+		if err != nil {
+			return err
+		}
+		if objName != "" {
+			return fmt.Errorf("invalid format of %q", cmn.HeaderBackendBck)
+		}
+	}
+
+	nvs[cmn.HeaderBackendBckName] = originBck.Name
+	if v, ok = nvs[cmn.HeaderBackendBckProvider]; ok && v != "" {
+		nvs[cmn.HeaderBackendBckProvider], err = cmn.NormalizeProvider(v)
+	} else {
+		nvs[cmn.HeaderBackendBckProvider] = originBck.Provider
+	}
+
+validate:
+	if nvs[cmn.HeaderBackendBckProvider] != "" && nvs[cmn.HeaderBackendBckName] == "" {
+		return fmt.Errorf("invalid format %q cannot be empty when %q is set", cmn.HeaderBackendBckName, cmn.HeaderBackendBckProvider)
+	}
+	return err
 }
 
 // Sets bucket properties
@@ -339,9 +376,8 @@ func resetBucketProps(c *cli.Context, bck cmn.Bck) (err error) {
 // Get bucket props
 func showBucketProps(c *cli.Context) (err error) {
 	var (
-		bck     cmn.Bck
-		p       *cmn.BucketProps
-		objName string
+		bck cmn.Bck
+		p   *cmn.BucketProps
 	)
 
 	if c.NArg() > 2 {
@@ -349,11 +385,12 @@ func showBucketProps(c *cli.Context) (err error) {
 	}
 
 	section := c.Args().Get(1)
-	if bck, objName, err = parseBckObjectURI(c.Args().First()); err != nil {
+	objPath := c.Args().First()
+
+	if isWebURL(objPath) {
+		bck = parseURLtoBck(objPath)
+	} else if bck, err = parseBckURI(c, objPath); err != nil {
 		return
-	}
-	if objName != "" {
-		return objectNameArgumentNotSupported(c, objName)
 	}
 	if _, p, err = validateBucket(c, bck, "", false); err != nil {
 		return
@@ -443,9 +480,19 @@ func printBucketNames(c *cli.Context, bucketNames cmn.BucketNames, showHeaders b
 			}
 		}
 		if showHeaders {
-			fmt.Fprintf(c.App.Writer, "%s Buckets (%d)\n", strings.ToUpper(provider), len(filtered))
+			dspProvider := provider
+			if provider == cmn.ProviderHTTP {
+				dspProvider = "HTTP(S)"
+			}
+			fmt.Fprintf(c.App.Writer, "%s Buckets (%d)\n", strings.ToUpper(dspProvider), len(filtered))
 		}
 		for _, bck := range filtered {
+			if provider == cmn.ProviderHTTP {
+				if props, err := api.HeadBucket(defaultAPIParams, bck); err == nil {
+					fmt.Fprintf(c.App.Writer, "  %s (%s)\n", bck, props.Extra.OrigURLBck)
+					continue
+				}
+			}
 			fmt.Fprintf(c.App.Writer, "  %s\n", bck)
 		}
 	}
@@ -531,7 +578,6 @@ func (o *objectListFilter) filter(entries []*cmn.BucketEntry) (matching, rest []
 func newObjectListFilter(c *cli.Context) (*objectListFilter, error) {
 	objFilter := &objectListFilter{}
 
-	// if fastFlag is enabled, allFlag is enabled automatically because obj.Status is unset
 	if !flagIsSet(c, allItemsFlag) {
 		// Filter out files with status different than OK
 		objFilter.addFilter(func(obj *cmn.BucketEntry) bool { return obj.IsStatusOK() })

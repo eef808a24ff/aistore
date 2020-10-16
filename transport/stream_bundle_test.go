@@ -22,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/NVIDIA/aistore/tutils"
 	"github.com/NVIDIA/aistore/tutils/tassert"
 )
@@ -103,12 +104,12 @@ func testBundle(t *testing.T, nvs cmn.SimpleKVs) {
 	slab, _ := MMSA.GetSlab(32 * cmn.KiB)
 	rbuf := slab.Alloc()
 	defer slab.Free(rbuf)
-	receive := func(w http.ResponseWriter, hdr transport.Header, objReader io.Reader, err error) {
+	receive := func(w http.ResponseWriter, hdr transport.ObjHdr, objReader io.Reader, err error) {
 		tassert.CheckFatal(t, err)
 		written, _ := io.CopyBuffer(ioutil.Discard, objReader, rbuf)
 		cmn.Assert(written == hdr.ObjAttrs.Size)
 	}
-	callback := func(_ transport.Header, _ io.ReadCloser, _ unsafe.Pointer, _ error) {
+	callback := func(_ transport.ObjHdr, _ io.ReadCloser, _ unsafe.Pointer, _ error) {
 		numCompleted.Inc()
 	}
 
@@ -137,8 +138,8 @@ func testBundle(t *testing.T, nvs cmn.SimpleKVs) {
 		}
 	}
 	_, _ = random.Read(wbuf)
-	sb := transport.NewStreamBundle(sowner, &lsnode, httpclient,
-		transport.SBArgs{Network: network, Trname: trname, Multiplier: multiplier, Extra: extra})
+	sb := bundle.NewStreams(sowner, &lsnode, httpclient,
+		bundle.Args{Network: network, Trname: trname, Multiplier: multiplier, Extra: extra})
 	var numGs int64 = 10
 	if testing.Short() {
 		numGs = 1
@@ -148,10 +149,10 @@ func testBundle(t *testing.T, nvs cmn.SimpleKVs) {
 		hdr := genRandomHeader(random)
 		if num%7 == 0 {
 			hdr.ObjAttrs.Size = 0
-			err = sb.Send(transport.Obj{Hdr: hdr, Callback: callback}, nil)
+			err = sb.Send(&transport.Obj{Hdr: hdr, Callback: callback}, nil)
 		} else {
 			reader := &randReader{buf: wbuf, hdr: hdr, slab: slab, clone: true} // FIXME: multiplier reopen
-			err = sb.Send(transport.Obj{Hdr: hdr, Callback: callback}, reader)
+			err = sb.Send(&transport.Obj{Hdr: hdr, Callback: callback}, reader)
 		}
 		if err != nil {
 			t.Fatalf("%s: exiting with err [%v]\n", sb, err)

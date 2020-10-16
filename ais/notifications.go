@@ -8,22 +8,27 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/downloader"
 	"github.com/NVIDIA/aistore/hk"
+	"github.com/NVIDIA/aistore/nl"
+	"github.com/NVIDIA/aistore/query"
+	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 	jsoniter "github.com/json-iterator/go"
 )
 
-///////////////////////////
-// notification receiver //
-// see also cmn/notif.go //
-///////////////////////////
+////////////////////////////////
+// notification receiver      //
+// see also cluster/notif.go //
+//////////////////////////////
 
 // TODO: cmn.UponProgress as periodic (byte-count, object-count)
 // TODO: batch housekeeping for pending notifications
@@ -32,30 +37,17 @@ import (
 
 // notification category
 const (
-	notifInvalid = iota
-	notifXact
-	notifCache
-)
-
-var notifCatText = map[int]string{
-	notifInvalid: "invalid",
-	notifXact:    "xaction",
-	notifCache:   "cache",
-}
-
-const (
 	notifsName       = ".notifications.prx"
 	notifsHousekeepT = 2 * time.Minute
 	notifsRemoveMult = 3 // time-to-keep multiplier (time = notifsRemoveMult * notifsHousekeepT)
 )
 
 type (
-	notifCallback func(n notifListener, msg interface{}, err error)
-	notifs        struct {
+	notifs struct {
 		sync.RWMutex
 		p       *proxyrunner
-		m       map[string]notifListener // running  [UUID => notifListener]
-		fin     map[string]notifListener // finished [UUID => notifListener]
+		m       map[string]nl.NotifListener // running  [UUID => NotifListener]
+		fin     map[string]nl.NotifListener // finished [UUID => NotifListener]
 		fmu     sync.RWMutex
 		smapVer int64
 	}
@@ -65,60 +57,16 @@ type (
 		Finished []*notifListenMsg `json:"finished"`
 	}
 
-	notifListener interface {
-		callback(notifs *notifs, n notifListener, msg interface{}, err error, nows ...int64)
-		lock()
-		unlock()
-		rlock()
-		runlock()
-		notifiers() cluster.NodeMap
-		incRC() int
-		notifTy() int
-		kind() string
-		bcks() []cmn.Bck
-		addErr(string /*sid*/, error)
-		err() error
-		UUID() string
-		Category() int
-		finTime() int64
-		finished() bool
-		String() string
-		getOwner() string
-		setOwner(string)
-		hrwOwner(smap *smapX)
-	}
-
-	notifListenerBase struct {
-		sync.RWMutex
-		UUIDX       string            // UUID
-		Srcs        cluster.NodeMap   // expected notifiers
-		Errs        map[string]string // [node-ID => ErrMsg]
-		f           notifCallback     // optional listening-side callback
-		rc          int               // refcount
-		Ty          int               // notification category (above)
-		FinTime     atomic.Int64      // timestamp when finished
-		Owned       string            // "": not owned | equalIC: IC | otherwise, pid + IC
-		SmapVersion int64             // smap version in which NL is added
-		// common info
-		Action string
-		Bck    []cmn.Bck
-		// ownership
-	}
+	nlFilter registry.XactFilter
 
 	//
 	// notification messages
 	//
-	notifMsg struct {
-		Ty     int32          `json:"type"`    // enumerated type, one of (notifXact, et al.) - see above
-		Flags  int32          `json:"flags"`   // TODO: add
-		Snode  *cluster.Snode `json:"snode"`   // node
-		Data   []byte         `json:"message"` // typed message
-		ErrMsg string         `json:"err"`     // error.Error()
-	}
+
 	// receiver to start listening
 	// TODO: explore other encoding formats (e.g. GOB) to simplify Marshal and Unmarshal logic
 	notifListenMsg struct {
-		nl notifListener
+		nl nl.NotifListener
 	}
 	jsonNL struct {
 		Type string              `json:"type"`
@@ -128,90 +76,8 @@ type (
 
 // interface guard
 var (
-	_ notifListener     = &notifListenerBase{}
 	_ cluster.Slistener = &notifs{}
 )
-
-func newNLB(uuid string, smap *smapX, ty int, action string, bck ...cmn.Bck) *notifListenerBase {
-	cmn.Assert(ty > notifInvalid)
-	return &notifListenerBase{UUIDX: uuid, Srcs: smap.Tmap.Clone(), SmapVersion: smap.version(), Ty: ty, Action: action, Bck: bck}
-}
-
-///////////////////////
-// notifListenerBase //
-///////////////////////
-
-// is called after all notifiers will have notified OR on failure (err != nil)
-func (nlb *notifListenerBase) callback(notifs *notifs, nl notifListener, msg interface{}, err error, nows ...int64) {
-	if nlb.FinTime.CAS(0, 1) {
-		var now int64
-		if len(nows) > 0 {
-			now = nows[0]
-		} else {
-			now = time.Now().UnixNano()
-		}
-		// is optional
-		if nlb.f != nil {
-			nlb.f(nl, msg, err) // invoke user-supplied callback and pass user-supplied notifListener
-		}
-		nlb.FinTime.Store(now)
-		notifs.fmu.Lock()
-		notifs.fin[nl.UUID()] = nl
-		notifs.fmu.Unlock()
-	}
-}
-func (nlb *notifListenerBase) lock()                      { nlb.Lock() }
-func (nlb *notifListenerBase) unlock()                    { nlb.Unlock() }
-func (nlb *notifListenerBase) rlock()                     { nlb.RLock() }
-func (nlb *notifListenerBase) runlock()                   { nlb.RUnlock() }
-func (nlb *notifListenerBase) notifiers() cluster.NodeMap { return nlb.Srcs }
-func (nlb *notifListenerBase) incRC() int                 { nlb.rc++; return nlb.rc }
-func (nlb *notifListenerBase) notifTy() int               { return nlb.Ty }
-func (nlb *notifListenerBase) UUID() string               { return nlb.UUIDX }
-func (nlb *notifListenerBase) Category() int              { return nlb.Ty }
-func (nlb *notifListenerBase) finTime() int64             { return nlb.FinTime.Load() }
-func (nlb *notifListenerBase) finished() bool             { return nlb.finTime() > 0 }
-func (nlb *notifListenerBase) addErr(sid string, err error) {
-	if nlb.Errs == nil {
-		nlb.Errs = make(map[string]string, 2)
-	}
-	nlb.Errs[sid] = err.Error()
-}
-
-func (nlb *notifListenerBase) err() error {
-	for _, err := range nlb.Errs {
-		return errors.New(err)
-	}
-	return nil
-}
-
-func (nlb *notifListenerBase) String() string {
-	var tm, res string
-	hdr := fmt.Sprintf("%s-%q", notifText(nlb.Ty), nlb.UUIDX)
-	if tfin := nlb.FinTime.Load(); tfin > 0 {
-		if nlb.Errs != nil {
-			res = fmt.Sprintf("-fail(%+v)", nlb.Errs)
-		}
-		tm = cmn.FormatTimestamp(time.Unix(0, tfin))
-		return fmt.Sprintf("%s-%s%s", hdr, tm, res)
-	}
-	if nlb.rc > 0 {
-		return fmt.Sprintf("%s-%d/%d", hdr, nlb.rc, len(nlb.Srcs))
-	}
-	return hdr
-}
-
-func (nlb *notifListenerBase) getOwner() string  { return nlb.Owned }
-func (nlb *notifListenerBase) setOwner(o string) { nlb.Owned = o }
-func (nlb *notifListenerBase) kind() string      { return nlb.Action }
-func (nlb *notifListenerBase) bcks() []cmn.Bck   { return nlb.Bck }
-
-// effectively, cache owner
-func (nlb *notifListenerBase) hrwOwner(smap *smapX) {
-	psiOwner, err := cluster.HrwIC(&smap.Smap, nlb.UUID())
-	cmn.AssertNoErr(err) // TODO -- FIXME: handle
-	nlb.setOwner(psiOwner.ID())
-}
 
 ////////////
 // notifs //
@@ -219,43 +85,45 @@ func (nlb *notifListenerBase) hrwOwner(smap *smapX) {
 
 func (n *notifs) init(p *proxyrunner) {
 	n.p = p
-	n.m = make(map[string]notifListener, 64)
-	n.fin = make(map[string]notifListener, 64)
+	n.m = make(map[string]nl.NotifListener, 64)
+	n.fin = make(map[string]nl.NotifListener, 64)
 	hk.Reg(notifsName+".gc", n.housekeep, notifsHousekeepT)
-	n.p.GetSowner().Listeners().Reg(n)
+	n.p.Sowner().Listeners().Reg(n)
 }
 
 func (n *notifs) String() string { return notifsName }
 
 // start listening
-func (n *notifs) add(nl notifListener) {
+func (n *notifs) add(nl nl.NotifListener) {
 	cmn.Assert(nl.UUID() != "")
-	cmn.Assert(nl.Category() > notifInvalid)
 	n.Lock()
-	_, ok := n.m[nl.UUID()]
-	cmn.AssertMsg(!ok, nl.UUID())
+	if _, ok := n.m[nl.UUID()]; ok {
+		n.Unlock()
+		return
+	}
 	n.m[nl.UUID()] = nl
+	nl.SetAddedTime()
 	n.Unlock()
-	glog.Infoln(nl.String())
+	glog.Infoln("add " + nl.String())
 }
 
-func (n *notifs) del(nl notifListener, locked ...bool) {
+func (n *notifs) del(nl nl.NotifListener, locked bool) {
 	var ok bool
-	if len(locked) == 0 {
+	if !locked {
 		n.Lock()
 	}
 	if _, ok = n.m[nl.UUID()]; ok {
 		delete(n.m, nl.UUID())
 	}
-	if len(locked) == 0 {
+	if !locked {
 		n.Unlock()
 	}
 	if ok {
-		glog.Infoln(nl.String())
+		glog.Infoln("del " + nl.String())
 	}
 }
 
-func (n *notifs) entry(uuid string) (notifListener, bool) {
+func (n *notifs) entry(uuid string) (nl.NotifListener, bool) {
 	n.RLock()
 	entry, exists := n.m[uuid]
 	n.RUnlock()
@@ -271,89 +139,191 @@ func (n *notifs) entry(uuid string) (notifListener, bool) {
 	return nil, false
 }
 
-// verb /v1/notifs
+func (n *notifs) find(flt nlFilter) (nl nl.NotifListener, exists bool) {
+	if flt.ID != "" {
+		return n.entry(flt.ID)
+	}
+	n.RLock()
+	nl, exists = _findNL(n.m, flt)
+	n.RUnlock()
+	if exists || (flt.OnlyRunning != nil && *flt.OnlyRunning) {
+		return
+	}
+	n.fmu.RLock()
+	nl, exists = _findNL(n.fin, flt)
+	n.fmu.RUnlock()
+	return
+}
+
+// PRECONDITION: Lock for `nls` must be held.
+// returns a listener that matches the filter condition.
+// for finished xaction listeners, returns latest listener (i.e. having highest finish time)
+func _findNL(nls map[string]nl.NotifListener, flt nlFilter) (nl nl.NotifListener, exists bool) {
+	var ftime int64
+	for _, listener := range nls {
+		if listener.EndTime() < ftime {
+			continue
+		}
+		if flt.match(listener) {
+			ftime = listener.EndTime()
+			nl, exists = listener, true
+		}
+		if exists && !listener.Finished() {
+			return
+		}
+	}
+	return
+}
+
+// verb /v1/notifs/[progress|finished]
 func (n *notifs) handler(w http.ResponseWriter, r *http.Request) {
 	var (
-		notifMsg = &notifMsg{}
-		msg      interface{}
+		notifMsg = &cluster.NotifMsg{}
+		nl       nl.NotifListener
 		errMsg   error
 		uuid     string
 		tid      = r.Header.Get(cmn.HeaderCallerID) // sender node ID
+		exists   bool
 	)
 	if r.Method != http.MethodPost {
 		cmn.InvalidHandlerWithMsg(w, r, "invalid method for /notifs path")
 		return
 	}
-	if _, err := n.p.checkRESTItems(w, r, 0, false, cmn.Version, cmn.Notifs); err != nil {
+	apiItems, err := n.p.checkRESTItems(w, r, 1, false, cmn.Version, cmn.Notifs)
+	if err != nil {
+		return
+	}
+	if apiItems[0] != cmn.Progress && apiItems[0] != cmn.Finished {
+		n.p.invalmsghdlrf(w, r, "Invalid route /notifs/%s", apiItems[0])
 		return
 	}
 	if cmn.ReadJSON(w, r, notifMsg) != nil {
 		return
 	}
-	switch notifMsg.Ty {
-	case notifXact:
-		stats := &cmn.BaseXactStatsExt{}
-		if eru := jsoniter.Unmarshal(notifMsg.Data, stats); eru != nil {
-			n.p.invalmsghdlrstatusf(w, r, 0, "%s: failed to unmarshal %s: %v", n.p.si, notifMsg, eru)
-			return
-		}
-		uuid = stats.IDX
-		msg = stats
-	case notifCache:
-		return // TODO -- FIXME: implement
-	default:
-		n.p.invalmsghdlrstatusf(w, r, 0, "%s: unknown notification type %s", n.p.si, notifMsg)
+
+	// NOTE: the sender is asynchronous - ignores the response -
+	//       which is why we consider `not-found`, `already-finished`,
+	//       and `unknown-notifier` benign non-error conditions
+	uuid = notifMsg.UUID
+	if !withRetry(func() bool { nl, exists = n.entry(uuid); return exists }) {
 		return
 	}
-	nl, exists := n.entry(uuid)
-	if !exists {
-		n.p.invalmsghdlrstatusf(w, r, http.StatusNotFound, "%s: unknown UUID %q (%s)", n.p.si, uuid, notifMsg)
+	if nl.Finished() {
 		return
 	}
-	if nl.finished() {
-		n.p.invalmsghdlrstatusf(w, r, 0, "%s: %q already finished (msg=%s)", n.p.si, uuid, notifMsg)
+
+	var (
+		srcs    = nl.Notifiers()
+		tsi, ok = srcs[tid]
+	)
+	if !ok {
 		return
 	}
 	//
-	// notifListener and notifMsg must have the same type
+	// NotifListener and notifMsg must have the same type
 	//
-	cmn.Assert(nl.notifTy() == int(notifMsg.Ty))
+	nl.RLock()
+	if nl.HasFinished(tsi) {
+		n.p.invalmsghdlrsilent(w, r, fmt.Sprintf("%s: duplicate %s from %s, %s", n.p.si, notifMsg, tid, nl))
+		nl.RUnlock()
+		return
+	}
+	nl.RUnlock()
+
 	if notifMsg.ErrMsg != "" {
 		errMsg = errors.New(notifMsg.ErrMsg)
 	}
-	nl.lock()
-	err, status, done := n.handleMsg(nl, tid, errMsg)
-	nl.unlock()
-	if done {
-		nl.callback(n, nl, msg, nil)
-		n.del(nl)
+
+	// NOTE: Default case is not required - will reach here only for valid types.
+	switch apiItems[0] {
+	// TODO: implement on Started notification
+	case cmn.Progress:
+		err = n.handleProgress(nl, tsi, notifMsg.Data, errMsg)
+	case cmn.Finished:
+		err = n.handleFinished(nl, tsi, notifMsg.Data, errMsg)
 	}
+
 	if err != nil {
-		n.p.invalmsghdlr(w, r, err.Error(), status)
+		n.p.invalmsghdlr(w, r, err.Error())
 	}
 }
 
-// is called under notifListener.lock()
-func (n *notifs) handleMsg(nl notifListener, tid string, srcErr error) (err error, status int, done bool) {
-	srcs := nl.notifiers()
-	tsi, ok := srcs[tid]
-	if !ok {
-		err = fmt.Errorf("%s: %s from unknown node %s", n.p.si, nl, tid)
-		status = http.StatusNotFound
-		return
-	}
-	if tsi == nil {
-		err = fmt.Errorf("%s: duplicate %s from node %s", n.p.si, nl, tid)
-		return
-	}
+func (n *notifs) handleProgress(nl nl.NotifListener, tsi *cluster.Snode, data []byte,
+	srcErr error) (err error) {
+	nl.Lock()
+	defer nl.Unlock()
+
 	if srcErr != nil {
-		nl.addErr(tid, srcErr)
+		nl.SetErr(srcErr)
 	}
-	srcs[tid] = nil
-	if rc := nl.incRC(); rc >= len(srcs) {
-		done = true
+	if data != nil {
+		stats, _, _, err := nl.UnmarshalStats(data)
+		debug.AssertNoErr(err)
+		nl.SetStats(tsi.ID(), stats)
 	}
 	return
+}
+
+func (n *notifs) handleFinished(nl nl.NotifListener, tsi *cluster.Snode, data []byte,
+	srcErr error) (err error) {
+	var (
+		stats   interface{}
+		aborted bool
+	)
+
+	nl.Lock()
+	// data can either be `nil` or a valid encoded stats
+	if data != nil {
+		stats, _, aborted, err = nl.UnmarshalStats(data)
+		debug.AssertNoErr(err)
+		nl.SetStats(tsi.ID(), stats)
+	}
+
+	done := n.markFinished(nl, tsi, srcErr, aborted)
+	nl.Unlock()
+
+	if done {
+		n.done(nl)
+	}
+	return
+}
+
+// PRECONDITION: `nl` should be under lock.
+func (n *notifs) markFinished(nl nl.NotifListener, tsi *cluster.Snode, srcErr error, aborted bool) (done bool) {
+	nl.MarkFinished(tsi)
+	if aborted {
+		nl.SetAborted()
+		if srcErr == nil {
+			detail := fmt.Sprintf("%s, node %s", nl, tsi)
+			srcErr = cmn.NewAbortedErrorDetails(nl.Kind(), detail)
+		}
+	}
+
+	if srcErr != nil {
+		nl.SetErr(srcErr)
+	}
+	return nl.AllFinished() || aborted
+}
+
+func (n *notifs) done(nl nl.NotifListener) {
+	n.fmu.Lock()
+	n.fin[nl.UUID()] = nl
+	n.fmu.Unlock()
+	n.del(nl, false)
+
+	if nl.Aborted() {
+		config := cmn.GCO.Get()
+		args := &bcastArgs{
+			req:     nl.AbortArgs(),
+			network: cmn.NetworkIntraControl,
+			timeout: config.Timeout.MaxKeepalive,
+			nodes:   []cluster.NodeMap{nl.Notifiers()},
+		}
+		args.nodeCount = len(args.nodes[0])
+		args.skipNodes = nl.FinNotifiers()
+		n.p.bcastToNodesAsync(args)
+	}
+	nl.Callback(nl, time.Now().UnixNano())
 }
 
 //
@@ -364,7 +334,7 @@ func (n *notifs) housekeep() time.Duration {
 	now := time.Now().UnixNano()
 	n.fmu.Lock()
 	for uuid, nl := range n.fin {
-		if time.Duration(now-nl.finTime()) > notifsRemoveMult*notifsHousekeepT {
+		if time.Duration(now-nl.EndTime()) > notifsRemoveMult*notifsHousekeepT {
 			delete(n.fin, uuid)
 		}
 	}
@@ -374,54 +344,13 @@ func (n *notifs) housekeep() time.Duration {
 		return notifsHousekeepT
 	}
 	n.RLock()
-	tempn := make(map[string]notifListener, len(n.m))
+	tempn := make(map[string]nl.NotifListener, len(n.m))
 	for uuid, nl := range n.m {
 		tempn[uuid] = nl
 	}
 	n.RUnlock()
-	args := bcastArgs{
-		req:     cmn.ReqArgs{Method: http.MethodGet, Query: make(url.Values, 2)},
-		timeout: cmn.GCO.Get().Timeout.MaxKeepalive,
-	}
-	for uuid, nl := range tempn {
-		if nl.notifTy() == notifCache { // TODO -- FIXME: implement
-			continue
-		}
-		cmn.AssertMsg(nl.notifTy() == notifXact, nl.String())
-		args.req.Path = cmn.URLPath(cmn.Version, cmn.Xactions)
-		args.req.Query.Set(cmn.URLParamWhat, cmn.GetWhatXactStats)
-		args.req.Query.Set(cmn.URLParamUUID, uuid)
-		args.fv = func() interface{} { return &cmn.BaseXactStatsExt{} }
-		results := n.p.bcastToGroup(args)
-		for res := range results {
-			var (
-				msg  interface{}
-				err  error
-				done bool
-			)
-			if res.err == nil {
-				switch nl.notifTy() {
-				case notifXact:
-					msg, err, done = n.hkXact(nl, res)
-				default:
-					cmn.Assert(false)
-				}
-			} else if res.status == http.StatusNotFound { // consider silent done at res.si
-				err = fmt.Errorf("%s: %s not found at %s", n.p.si, nl, res.si)
-				done = true // NOTE: not-found at one ==> all done
-				nl.lock()
-				nl.addErr(res.si.ID(), err)
-				nl.unlock()
-			} else if glog.FastV(4, glog.SmoduleAIS) {
-				glog.Errorf("%s: %s, node %s, err: %v", n.p.si, nl, res.si, res.err)
-			}
-
-			if done {
-				nl.callback(n, nl, msg, err, now)
-				n.del(nl)
-				break
-			}
-		}
+	for _, nl := range tempn {
+		n.syncStats(nl, notifsHousekeepT)
 	}
 	// cleanup temp cloned notifs
 	for u := range tempn {
@@ -430,35 +359,85 @@ func (n *notifs) housekeep() time.Duration {
 	return notifsHousekeepT
 }
 
-func (n *notifs) getOwner(uuid string) (o string, exists bool) {
-	var nl notifListener
-	if nl, exists = n.entry(uuid); exists {
-		o = nl.getOwner()
-	}
-	return
-}
+func (n *notifs) syncStats(nl nl.NotifListener, dur ...time.Duration) {
+	var (
+		progressInterval = cmn.GCO.Get().Periodic.NotifTime
+		done             bool
+	)
 
-func (n *notifs) hkXact(nl notifListener, res callResult) (msg interface{}, err error, done bool) {
-	stats := res.v.(*cmn.BaseXactStatsExt)
-	msg = stats
-	if stats.Finished() {
-		if stats.Aborted() {
-			detail := fmt.Sprintf("%s, node %s", nl, res.si)
-			err = cmn.NewAbortedErrorDetails(stats.Kind(), detail)
-			done = true // NOTE: one abort ==> all done
-			nl.lock()
-			nl.addErr(res.si.ID(), err)
-			nl.unlock()
-		} else {
-			nl.lock()
-			_, _, done = n.handleMsg(nl, res.si.ID(), err)
-			nl.unlock()
+	nl.RLock()
+	uptoDateNodes, syncRequired := nl.NodesUptoDate(dur...)
+	nl.RUnlock()
+	if !syncRequired {
+		return
+	}
+
+	args := &bcastArgs{
+		network: cmn.NetworkIntraControl,
+		timeout: cmn.GCO.Get().Timeout.MaxKeepalive,
+	}
+
+	// nodes to fetch stats from
+	args.req = nl.QueryArgs()
+	args.nodes = []cluster.NodeMap{nl.Notifiers()}
+	args.skipNodes = uptoDateNodes
+	args.nodeCount = len(args.nodes[0]) - len(args.skipNodes)
+	debug.Assert(args.nodeCount > 0) // Ensure that there is at least one node to fetch.
+
+	results := n.p.bcastToNodes(args)
+	for res := range results {
+		if res.err == nil {
+			stats, finished, aborted, err := nl.UnmarshalStats(res.bytes)
+			if err != nil {
+				glog.Errorf("%s: failed to parse stats from %s, err: %v", n.p.si, res.si, err)
+				continue
+			}
+			nl.Lock()
+			if finished {
+				done = done || n.markFinished(nl, res.si, nil, aborted)
+			}
+			nl.SetStats(res.si.ID(), stats)
+			nl.Unlock()
+		} else if res.status == http.StatusNotFound {
+			if mono.Since(nl.AddedTime()) < progressInterval {
+				// likely didn't start yet - skipping
+				continue
+			}
+			err := fmt.Errorf("%s: %s not found at %s", n.p.si, nl, res.si)
+			nl.Lock()
+			done = done || n.markFinished(nl, res.si, err, true) // NOTE: not-found at one ==> all done
+			nl.Unlock()
+		} else if glog.FastV(4, glog.SmoduleAIS) {
+			glog.Errorf("%s: %s, node %s, err: %v", n.p.si, nl, res.si, res.err)
 		}
 	}
+
+	if done {
+		n.done(nl)
+	}
+}
+
+// Return stats from each node for a given UUID.
+func (n *notifs) queryStats(uuid string, durs ...time.Duration) (stats *nl.NodeStats, exists bool) {
+	var nl nl.NotifListener
+	nl, exists = n.entry(uuid)
+	if !exists {
+		return
+	}
+	n.syncStats(nl, durs...)
+	stats = nl.NodeStats()
 	return
 }
 
-// TODO: consider Smap versioning per notifListener
+func (n *notifs) getOwner(uuid string) (o string, exists bool) {
+	var nl nl.NotifListener
+	if nl, exists = n.entry(uuid); exists {
+		o = nl.GetOwner()
+	}
+	return
+}
+
+// TODO: consider Smap versioning per NotifListener
 func (n *notifs) ListenSmapChanged() {
 	if !n.p.ClusterStarted() {
 		return
@@ -474,13 +453,13 @@ func (n *notifs) ListenSmapChanged() {
 	}
 
 	var (
-		remnl = make(map[string]notifListener)
+		remnl = make(map[string]nl.NotifListener)
 		remid = make(cmn.SimpleKVs)
 	)
 	n.RLock()
 	for uuid, nl := range n.m {
-		nl.rlock()
-		srcs := nl.notifiers()
+		nl.RLock()
+		srcs := nl.Notifiers()
 		for id, si := range srcs {
 			if si == nil {
 				continue
@@ -491,7 +470,7 @@ func (n *notifs) ListenSmapChanged() {
 				break
 			}
 		}
-		nl.runlock()
+		nl.RUnlock()
 	}
 	n.RUnlock()
 	if len(remnl) == 0 {
@@ -502,19 +481,29 @@ func (n *notifs) ListenSmapChanged() {
 		s := fmt.Sprintf("%s: stop waiting for %s", n.p.si, nl)
 		sid := remid[uuid]
 		err := &errNodeNotFound{s, sid, n.p.si, smap}
-		nl.lock()
-		nl.addErr(sid, err)
-		nl.unlock()
-		nl.callback(n, nl, nil /*msg*/, err, now)
+		nl.Lock()
+		nl.SetErr(err)
+		nl.SetAborted()
+		nl.Unlock()
 	}
-	n.Lock()
+	n.fmu.Lock()
 	for uuid, nl := range remnl {
+		cmn.Assert(nl.UUID() == uuid)
+		n.fin[uuid] = nl
+	}
+	n.fmu.Unlock()
+	n.Lock()
+	for _, nl := range remnl {
 		n.del(nl, true /*locked*/)
+	}
+	n.Unlock()
+
+	for uuid, nl := range remnl {
+		nl.Callback(nl, now)
 		// cleanup
 		delete(remnl, uuid)
 		delete(remid, uuid)
 	}
-	n.Unlock()
 }
 
 func (n *notifs) MarshalJSON() (data []byte, err error) {
@@ -558,20 +547,23 @@ func (n *notifs) UnmarshalJSON(data []byte) (err error) {
 }
 
 // PRECONDITION: Lock for `nls` must be held
-func _mergeNLs(nls map[string]notifListener, msgs []*notifListenMsg) {
+func _mergeNLs(nls map[string]nl.NotifListener, msgs []*notifListenMsg) {
 	for _, m := range msgs {
 		if _, ok := nls[m.nl.UUID()]; !ok {
 			nls[m.nl.UUID()] = m.nl
+			m.nl.SetAddedTime()
 		}
 	}
 }
 
-func newNLMsg(nl notifListener) *notifListenMsg {
+func newNLMsg(nl nl.NotifListener) *notifListenMsg {
 	return &notifListenMsg{nl: nl}
 }
 
 func (n *notifListenMsg) MarshalJSON() (data []byte, err error) {
-	t := jsonNL{Type: n.nl.kind()}
+	n.nl.RLock()
+	defer n.nl.RUnlock()
+	t := jsonNL{Type: n.nl.Kind()}
 	t.NL, err = jsoniter.Marshal(n.nl)
 	if err != nil {
 		return
@@ -585,9 +577,11 @@ func (n *notifListenMsg) UnmarshalJSON(data []byte) (err error) {
 		return
 	}
 	if t.Type == cmn.ActQueryObjects {
-		n.nl = &notifListenerQuery{}
+		n.nl = &query.NotifListenerQuery{}
+	} else if isDLType(t.Type) {
+		n.nl = &downloader.NotifDownloadListerner{}
 	} else {
-		n.nl = &notifListenerBase{}
+		n.nl = &xaction.NotifXactListener{}
 	}
 	err = jsoniter.Unmarshal(t.NL, &n.nl)
 	if err != nil {
@@ -596,18 +590,31 @@ func (n *notifListenMsg) UnmarshalJSON(data []byte) (err error) {
 	return
 }
 
-//////////
-// misc //
-//////////
-
-func notifText(ty int) string {
-	const unk = "unknown"
-	if txt, ok := notifCatText[ty]; ok {
-		return txt
-	}
-	return unk
+func isDLType(t string) bool {
+	return t == string(downloader.DlTypeMulti) ||
+		t == string(downloader.DlTypeCloud) ||
+		t == string(downloader.DlTypeSingle) ||
+		t == string(downloader.DlTypeRange)
 }
 
-func (msg *notifMsg) String() string {
-	return fmt.Sprintf("%s[%s,%v]<=%s", notifText(int(msg.Ty)), string(msg.Data), msg.ErrMsg, msg.Snode)
+//
+// Notification listener filter (nlFilter)
+//
+
+func (nf *nlFilter) match(nl nl.NotifListener) bool {
+	if nl.UUID() == nf.ID {
+		return true
+	}
+
+	if nl.Kind() == nf.Kind {
+		if nf.Bck == nil || nf.Bck.IsEmpty() {
+			return true
+		}
+		for _, bck := range nl.Bcks() {
+			if cmn.QueryBcks(nf.Bck.Bck).Contains(bck) {
+				return true
+			}
+		}
+	}
+	return false
 }

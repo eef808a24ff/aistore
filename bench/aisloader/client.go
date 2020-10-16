@@ -18,6 +18,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 )
 
+const longListTime = 10 * time.Second
+
 var (
 	// AisLoader, being a stress loading tool, should have different from
 	// AIS cluster timeouts. And if HTTPS is used, certificate check is
@@ -159,7 +161,7 @@ func putWithTrace(proxyURL string, bck cmn.Bck, object string, cksum *cmn.Cksum,
 	reqArgs := cmn.ReqArgs{
 		Method: http.MethodPut,
 		Base:   proxyURL,
-		Path:   cmn.URLPath(cmn.Version, cmn.Objects, bck.Name, object),
+		Path:   cmn.JoinWords(cmn.Version, cmn.Objects, bck.Name, object),
 		Query:  cmn.AddBckToQuery(nil, bck),
 		BodyR:  reader,
 	}
@@ -242,7 +244,7 @@ func prepareGetRequest(proxyURL string, bck cmn.Bck, objName string, offset, len
 	reqArgs := cmn.ReqArgs{
 		Method: http.MethodGet,
 		Base:   proxyURL,
-		Path:   cmn.URLPath(cmn.Version, cmn.Objects, bck.Name, objName),
+		Path:   cmn.JoinWords(cmn.Version, cmn.Objects, bck.Name, objName),
 		Query:  query,
 		Header: hdr,
 	}
@@ -253,9 +255,7 @@ func prepareGetRequest(proxyURL string, bck cmn.Bck, objName string, offset, len
 // same as above with HTTP trace
 func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool,
 	offset, length int64) (int64, httpLatencies, error) {
-	var (
-		hdrCksumValue, hdrCksumType string
-	)
+	var hdrCksumValue, hdrCksumType string
 
 	req, err := prepareGetRequest(proxyURL, bck, objName, offset, length)
 	if err != nil {
@@ -304,9 +304,7 @@ func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool
 
 // getDiscard sends a GET request and discards returned data
 func getDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool, offset, length int64) (int64, error) {
-	var (
-		hdrCksumValue, hdrCksumType string
-	)
+	var hdrCksumValue, hdrCksumType string
 
 	req, err := prepareGetRequest(proxyURL, bck, objName, offset, length)
 	if err != nil {
@@ -338,7 +336,7 @@ func getDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool, off
 func getConfig(server string) (httpLatencies, error) {
 	tctx := newTraceCtx()
 
-	url := server + cmn.URLPath(cmn.Version, cmn.Daemon)
+	url := server + cmn.JoinWords(cmn.Version, cmn.Daemon)
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req.URL.RawQuery = api.GetWhatRawQuery(cmn.GetWhatConfig, "")
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), tctx.trace))
@@ -357,10 +355,19 @@ func getConfig(server string) (httpLatencies, error) {
 	return l, err
 }
 
+func listObjCallback(ctx *api.ProgressContext) {
+	fmt.Printf("\rFetched %d objects", ctx.Info().Count)
+	// Final message moves output to new line, to keep output tidy
+	if ctx.IsFinished() {
+		fmt.Println()
+	}
+}
+
 // listObjectNames returns a slice of object names of all objects that match the prefix in a bucket.
 func listObjectNames(baseParams api.BaseParams, bck cmn.Bck, prefix string) ([]string, error) {
 	msg := &cmn.SelectMsg{Prefix: prefix, PageSize: cmn.DefaultListPageSizeAIS}
-	objList, err := api.ListObjects(baseParams, bck, msg, 0)
+	ctx := api.NewProgressContext(listObjCallback, longListTime)
+	objList, err := api.ListObjects(baseParams, bck, msg, 0, ctx)
 	if err != nil {
 		return nil, err
 	}

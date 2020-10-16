@@ -27,6 +27,10 @@ type (
 		io.ReadCloser
 		Open() (io.ReadCloser, error)
 	}
+	WriterAt interface {
+		io.Writer
+		io.WriterAt
+	}
 	// ReadSizer is the interface that adds Size method to the basic reader.
 	ReadSizer interface {
 		io.Reader
@@ -114,6 +118,7 @@ func NewByteHandle(bt []byte) *ByteHandle {
 func (b *ByteHandle) Close() error {
 	return nil
 }
+
 func (b *ByteHandle) Open() (io.ReadCloser, error) {
 	return ioutil.NopCloser(bytes.NewReader(b.b)), nil
 }
@@ -331,23 +336,21 @@ func RemoveFile(path string) error {
 
 // and computes checksum if requested
 func CopyFile(src, dst string, buf []byte, cksumType string) (written int64, cksum *CksumHash, err error) {
-	var (
-		srcFile, dstFile *os.File
-	)
+	var srcFile, dstFile *os.File
 	if srcFile, err = os.Open(src); err != nil {
 		return
 	}
 	if dstFile, err = CreateFile(dst); err != nil {
 		glog.Errorf("Failed to create %s: %v", dst, err)
-		debug.AssertNoErr(srcFile.Close())
+		Close(srcFile)
 		return
 	}
 	written, cksum, err = CopyAndChecksum(dstFile, srcFile, buf, cksumType)
 	if err != nil {
 		glog.Errorf("Failed to copy %s -> %s: %v", src, dst, err)
 	}
-	debug.AssertNoErr(dstFile.Close())
-	debug.AssertNoErr(srcFile.Close())
+	Close(dstFile)
+	Close(srcFile)
 	return
 }
 
@@ -495,4 +498,10 @@ func ChecksumBytes(b []byte, cksumType string) (cksum *Cksum, err error) {
 		return nil, err
 	}
 	return &hash.Cksum, nil
+}
+
+func Close(closer io.Closer) error {
+	err := closer.Close()
+	debug.AssertNoErr(err)
+	return err
 }

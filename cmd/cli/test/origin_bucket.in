@@ -5,7 +5,3 @@ ais set props ais://$BUCKET backend_bck=cloud://something // FAIL "backend bucke
 ais set props ais://$BUCKET backend_bck=gcp:// // FAIL "backend bucket name should not be empty"
 
 ais show props ais://$BUCKET backend_bck -v
-ais set props ais://$BUCKET backend_bck=gcp://something
-ais show props ais://$BUCKET backend_bck -v
-ais set props ais://$BUCKET backend_bck=none
-ais show props ais://$BUCKET backend_bck -v

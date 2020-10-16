@@ -15,12 +15,15 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/stats/statsd"
+	jsoniter "github.com/json-iterator/go"
 )
 
-//
-// NOTE Naming Convention: "*.n" - counter, "*.µs" - latency, "*.size" - size (in bytes),
-// "*.bps" - throughput (in byte/s), "*.id" - ID
-//
+// Naming Convention:
+//  -> "*.n" - counter
+//  -> "*.ns" - latency (nanoseconds)
+//  -> "*.size" - size (bytes)
+//  -> "*.bps" - throughput (in byte/s)
+//  -> "*.id" - ID
 const (
 	// KindCounter - QPS and byte counts (always incremented, never reset)
 	GetColdCount   = "get.cold.n"
@@ -32,8 +35,8 @@ const (
 	// rebalance
 	RebTxCount = "reb.tx.n"
 	RebTxSize  = "reb.tx.size"
-	RebRxCount = "reb.tx.n"
-	RebRxSize  = "reb.tx.size"
+	RebRxCount = "reb.rx.n"
+	RebRxSize  = "reb.rx.size"
 	// errors
 	ErrCksumCount    = "err.cksum.n"
 	ErrCksumSize     = "err.cksum.size"
@@ -43,17 +46,17 @@ const (
 	RestartCount = "restart.n"
 
 	// KindLatency
-	PutLatency      = "put.µs"
-	AppendLatency   = "append.µs"
-	GetRedirLatency = "get.redir.µs"
-	PutRedirLatency = "put.redir.µs"
-	DownloadLatency = "dl.µs"
+	PutLatency      = "put.ns"
+	AppendLatency   = "append.ns"
+	GetRedirLatency = "get.redir.ns"
+	PutRedirLatency = "put.redir.ns"
+	DownloadLatency = "dl.ns"
 
 	// DSort
 	DSortCreationReqCount    = "dsort.creation.req.n"
-	DSortCreationReqLatency  = "dsort.creation.req.µs"
+	DSortCreationReqLatency  = "dsort.creation.req.ns"
 	DSortCreationRespCount   = "dsort.creation.resp.n"
-	DSortCreationRespLatency = "dsort.creation.resp.µs"
+	DSortCreationRespLatency = "dsort.creation.resp.ns"
 
 	// Downloader
 	DownloadSize = "dl.size"
@@ -175,6 +178,7 @@ func (r *Trunner) GetWhatStats() interface{} {
 }
 
 func (r *Trunner) log(uptime time.Duration) {
+	jsonCompat := jsoniter.ConfigCompatibleWithStandardLibrary
 	r.lines = r.lines[:0]
 
 	// copy stats, reset latencies
@@ -214,7 +218,7 @@ func (r *Trunner) doAdd(nv NamedVal64) {
 	)
 
 	v, ok := s.Tracker[name]
-	cmn.AssertMsg(ok, "Invalid stats name '"+name+"'")
+	cmn.Assertf(ok, "invalid stats name: %q", name)
 
 	// most target stats can be handled by CoreStats.doAdd
 	// stats that track data IO are unique to target and are handled here

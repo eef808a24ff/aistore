@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,13 +22,16 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
-	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
+
+//
+// PUT, GET, APPEND, and COPY object
+//
 
 type (
 	putObjInfo struct {
@@ -96,6 +100,14 @@ type (
 		cksum *cmn.Cksum // Expected checksum of the final object.
 	}
 
+	copyObjInfo struct {
+		cluster.CopyObjectParams
+		t         *targetrunner
+		localOnly bool // copy locally with no HRW=>target
+		uncache   bool // uncache the source
+		finalize  bool // copies and EC (as in poi.finalize())
+	}
+
 	writerOnly struct{ io.Writer }
 )
 
@@ -131,7 +143,7 @@ func (poi *putObjInfo) putObject() (err error, errCode int) {
 			stats.NamedVal64{Name: stats.PutLatency, Value: int64(delta)},
 		)
 		if glog.FastV(4, glog.SmoduleAIS) {
-			glog.Infof("PUT %s: %d µs", lom, int64(delta/time.Microsecond))
+			glog.Infof("PUT %s: %s", lom, delta)
 		}
 	}
 	return nil, 0
@@ -143,9 +155,9 @@ func (poi *putObjInfo) finalize() (err error, errCode int) {
 			if err1 == nil {
 				err1 = err
 			}
-			poi.t.fshc(err, poi.workFQN)
-			if err = cmn.RemoveFile(poi.workFQN); err != nil {
-				glog.Errorf("Nested error: %s => (remove %s => err: %v)", err1, poi.workFQN, err)
+			poi.t.fshc(err1, poi.workFQN)
+			if err2 := cmn.RemoveFile(poi.workFQN); err2 != nil {
+				glog.Errorf("Nested error: %s => (remove %s => err: %v)", err1, poi.workFQN, err2)
 			}
 		}
 		poi.lom.Uncache()
@@ -170,16 +182,16 @@ func (poi *putObjInfo) tryFinalize() (err error, errCode int) {
 	)
 	if bck.IsRemote() && !poi.migrated {
 		var version string
-		if bck.IsCloud() {
+		if bck.IsCloud() || bck.IsHTTP() {
 			version, err, errCode = poi.putCloud()
 		} else {
 			version, err, errCode = poi.putRemoteAIS()
 		}
 		if err != nil {
-			err = fmt.Errorf("%s: PUT failed, err: %v", lom, err)
+			glog.Errorf("%s: PUT failed, err: %v", lom, err)
 			return
 		}
-		if lom.VerConf().Enabled {
+		if lom.VersionConf().Enabled {
 			lom.SetVersion(version)
 		}
 	}
@@ -198,7 +210,7 @@ func (poi *putObjInfo) tryFinalize() (err error, errCode int) {
 	lom.Lock(true)
 	defer lom.Unlock(true)
 
-	if bck.IsAIS() && lom.VerConf().Enabled && !poi.migrated {
+	if bck.IsAIS() && lom.VersionConf().Enabled && !poi.migrated {
 		if err = lom.IncVersion(); err != nil {
 			return
 		}
@@ -239,7 +251,7 @@ func (poi *putObjInfo) putCloud() (ver string, err error, errCode int) {
 		customMD[cluster.VersionObjMD] = ver
 	}
 	lom.SetCustomMD(customMD)
-	debug.AssertNoErr(file.Close())
+	cmn.Close(file)
 	return
 }
 
@@ -291,11 +303,12 @@ func (poi *putObjInfo) writeToFile() (err error) {
 	// cleanup
 	defer func() { // free & cleanup on err
 		slab.Free(buf)
-		debug.AssertNoErr(reader.Close())
+		cmn.Close(reader)
 
 		if err != nil {
 			if nestedErr := file.Close(); nestedErr != nil {
-				glog.Errorf("Nested (%v): failed to close received object %s, err: %v", err, poi.workFQN, nestedErr)
+				glog.Errorf("Nested (%v): failed to close received object %s, err: %v",
+					err, poi.workFQN, nestedErr)
 			}
 			if nestedErr := cmn.RemoveFile(poi.workFQN); nestedErr != nil {
 				glog.Errorf("Nested (%v): failed to remove %s, err: %v", err, poi.workFQN, nestedErr)
@@ -426,7 +439,7 @@ do:
 	}
 	// exists && remote|cloud: check ver if requested
 	if !coldGet && goi.lom.Bck().IsRemote() {
-		if goi.lom.Version() != "" && goi.lom.VerConf().ValidateWarmGet {
+		if goi.lom.Version() != "" && goi.lom.VersionConf().ValidateWarmGet {
 			goi.lom.Unlock(false)
 			if coldGet, err, errCode = goi.t.CheckCloudVersion(goi.ctx, goi.lom); err != nil {
 				goi.lom.Uncache()
@@ -565,12 +578,12 @@ func (goi *getObjInfo) tryRestoreObject() (doubleCheck bool, err error, errCode 
 		tsi, gfnNode         *cluster.Snode
 		smap                 = goi.t.owner.smap.get()
 		tname                = goi.t.si.String()
-		marked               = xaction.GetResilverMarked()
+		marked               = registry.GetResilverMarked()
 		interrupted, running = marked.Interrupted, marked.Xact != nil
 		gfnActive            = goi.t.gfn.local.active()
 		ecEnabled            = goi.lom.Bprops().EC.Enabled
 	)
-	tsi, err = cluster.HrwTarget(goi.lom.Uname(), &smap.Smap)
+	tsi, err = cluster.HrwTarget(goi.lom.Uname(), &smap.Smap, true /*include maintenance*/)
 	if err != nil {
 		return
 	}
@@ -588,10 +601,10 @@ func (goi *getObjInfo) tryRestoreObject() (doubleCheck bool, err error, errCode 
 	// we might be able to restore it if it was replicated. In this case even
 	// just one additional target might be sufficient. This won't succeed if
 	// an object was sliced, neither will ecmanager.RestoreObject(lom)
-	enoughECRestoreTargets := goi.lom.Bprops().EC.RequiredRestoreTargets() <= goi.t.owner.smap.Get().CountTargets()
+	enoughECRestoreTargets := goi.lom.Bprops().EC.RequiredRestoreTargets() <= smap.CountTargets()
 
 	// cluster-wide lookup ("get from neighbor")
-	marked = xaction.GetRebMarked()
+	marked = registry.GetRebMarked()
 	interrupted, running = marked.Interrupted, marked.Xact != nil
 	if running {
 		doubleCheck = true
@@ -638,13 +651,16 @@ gfn:
 }
 
 func (goi *getObjInfo) getFromNeighbor(lom *cluster.LOM, tsi *cluster.Snode) (ok bool) {
+	header := make(http.Header)
+	header.Add(cmn.HeaderCallerID, goi.t.Snode().ID())
 	query := url.Values{}
 	query.Add(cmn.URLParamIsGFNRequest, "true")
 	query = cmn.AddBckToQuery(query, lom.Bck().Bck)
 	reqArgs := cmn.ReqArgs{
 		Method: http.MethodGet,
 		Base:   tsi.URL(cmn.NetworkIntraData),
-		Path:   cmn.URLPath(cmn.Version, cmn.Objects, lom.BckName(), lom.ObjName),
+		Header: header,
+		Path:   cmn.JoinWords(cmn.Version, cmn.Objects, lom.BckName(), lom.ObjName),
 		Query:  query,
 	}
 	req, _, cancel, err := reqArgs.ReqWithTimeout(lom.Config().Timeout.SendFile)
@@ -659,10 +675,8 @@ func (goi *getObjInfo) getFromNeighbor(lom *cluster.LOM, tsi *cluster.Snode) (ok
 		glog.Errorf("GFN failure, URL %q, err: %v", reqArgs.URL(), err)
 		return
 	}
-	var (
-		workFQN = fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfileRemote)
-	)
-	lom.ParseHdr(resp.Header)
+	workFQN := fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfileRemote)
+	lom.FromHTTPHdr(resp.Header)
 	poi := &putObjInfo{
 		t:        goi.t,
 		lom:      lom,
@@ -690,7 +704,7 @@ func (goi *getObjInfo) finalize(coldGet bool) (retry bool, err error, errCode in
 	)
 	defer func() {
 		if file != nil {
-			debug.AssertNoErr(file.Close())
+			cmn.Close(file)
 		}
 		if buf != nil {
 			slab.Free(buf)
@@ -846,7 +860,7 @@ func (goi *getObjInfo) finalize(coldGet bool) (retry bool, err error, errCode in
 
 	delta := time.Since(goi.started)
 	if glog.FastV(4, glog.SmoduleAIS) {
-		s := fmt.Sprintf("GET: %s(%s), %d µs", goi.lom, cmn.B2S(written, 1), int64(delta/time.Microsecond))
+		s := fmt.Sprintf("GET: %s(%s), %s", goi.lom, cmn.B2S(written, 1), delta)
 		if coldGet {
 			s += " (cold)"
 		}
@@ -878,7 +892,7 @@ func (aoi *appendObjInfo) appendObject() (newHandle string, err error, errCode i
 			}
 			aoi.hi.partialCksum = cmn.NewCksumHash(aoi.lom.CksumConf().Type)
 		} else {
-			f, err = os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, 0644)
+			f, err = os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, 0o644)
 			if err != nil {
 				errCode = http.StatusInternalServerError
 				return
@@ -900,7 +914,7 @@ func (aoi *appendObjInfo) appendObject() (newHandle string, err error, errCode i
 		_, err = io.CopyBuffer(w, aoi.r, buf)
 
 		slab.Free(buf)
-		debug.AssertNoErr(f.Close())
+		cmn.Close(f)
 		if err != nil {
 			errCode = http.StatusInternalServerError
 			return
@@ -921,8 +935,16 @@ func (aoi *appendObjInfo) appendObject() (newHandle string, err error, errCode i
 			errCode = http.StatusInternalServerError
 			return
 		}
-		if _, err := aoi.t.PromoteFile(filePath, aoi.lom.Bck(), aoi.lom.ObjName, partialCksum,
-			true /*overwrite*/, false /*safe*/, false /*verbose*/); err != nil {
+		params := cluster.PromoteFileParams{
+			SrcFQN:    filePath,
+			Bck:       aoi.lom.Bck(),
+			ObjName:   aoi.lom.ObjName,
+			Cksum:     partialCksum,
+			Overwrite: true,
+			KeepOrig:  false,
+			Verbose:   false,
+		}
+		if _, err := aoi.t.PromoteFile(params); err != nil {
 			return "", err, 0
 		}
 	default:
@@ -935,7 +957,7 @@ func (aoi *appendObjInfo) appendObject() (newHandle string, err error, errCode i
 		stats.NamedVal64{Name: stats.AppendLatency, Value: int64(delta)},
 	)
 	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("PUT %s: %d µs", aoi.lom, int64(delta/time.Microsecond))
+		glog.Infof("PUT %s: %s", aoi.lom, delta)
 	}
 	return
 }
@@ -968,4 +990,255 @@ func combineAppendHandle(nodeID, filePath string, partialCksum *cmn.CksumHash) s
 	cksumTy := partialCksum.Type()
 	cksumBinary := base64.StdEncoding.EncodeToString(buf)
 	return nodeID + "|" + filePath + "|" + cksumTy + "|" + cksumBinary
+}
+
+/////////////////
+// COPY OBJECT //
+/////////////////
+
+func (coi *copyObjInfo) copyObject(srcLOM *cluster.LOM, objNameTo string) (copied bool, err error) {
+	cmn.Assert(coi.DP == nil)
+
+	if srcLOM.Bck().IsRemote() || coi.BckTo.IsRemote() {
+		// There will be no logic to create local copies etc, we can simply use copyReader
+		coi.DP = &cluster.LomReader{}
+		copied, _, err = coi.copyReader(srcLOM, objNameTo)
+		return copied, err
+	}
+
+	// Local bucket to local bucket copying.
+
+	si := coi.t.si
+	if !coi.localOnly {
+		smap := coi.t.owner.smap.Get()
+		if si, err = cluster.HrwTarget(coi.BckTo.MakeUname(objNameTo), smap); err != nil {
+			return
+		}
+	}
+
+	srcLOM.Lock(false)
+	if err = srcLOM.Load(false); err != nil {
+		if !cmn.IsObjNotExist(err) {
+			err = fmt.Errorf("%s: err: %v", srcLOM, err)
+		}
+
+		srcLOM.Unlock(false)
+		return
+	}
+
+	if coi.uncache {
+		defer srcLOM.Uncache()
+	}
+
+	if si.ID() != coi.t.si.ID() {
+		params := cluster.SendToParams{ObjNameTo: objNameTo, Tsi: si, DM: coi.DM, Locked: true}
+		copied, _, err = coi.putRemote(srcLOM, params) // NOTE: srcLOM.Unlock inside
+		return
+	}
+	if coi.DryRun {
+		defer srcLOM.Unlock(false)
+		// TODO: replace with something similar to srcLOM.FQN == dst.FQN, but dstBck might not exist.
+		if srcLOM.Bck().Bck.Equal(coi.BckTo.Bck) && srcLOM.ObjName == objNameTo {
+			return false, nil
+		}
+		return true, nil
+	}
+
+	if !srcLOM.TryUpgradeLock() {
+		// We haven't managed to upgrade the lock so we must do it slow way...
+		srcLOM.Unlock(false)
+		srcLOM.Lock(true)
+		if err = srcLOM.Load(false); err != nil {
+			srcLOM.Unlock(true)
+			return
+		}
+	}
+
+	// At this point we must have an exclusive lock for the object.
+	defer srcLOM.Unlock(true)
+
+	dst := &cluster.LOM{T: coi.t, ObjName: objNameTo}
+	err = dst.Init(coi.BckTo.Bck)
+	if err != nil {
+		return
+	}
+
+	// Lock destination for writing if the destination has a different uname.
+	if srcLOM.Uname() != dst.Uname() {
+		dst.Lock(true)
+		defer dst.Unlock(true)
+	}
+
+	// Resilvering with a single mountpath.
+	if srcLOM.FQN == dst.FQN {
+		return
+	}
+
+	if err = dst.Load(false); err == nil {
+		if srcLOM.Cksum().Equal(dst.Cksum()) {
+			return
+		}
+	} else if cmn.IsErrBucketNought(err) {
+		return
+	}
+
+	if dst, err = srcLOM.CopyObject(dst.FQN, coi.Buf); err == nil {
+		copied = true
+		dst.ReCache()
+		if coi.finalize {
+			coi.t.putMirror(dst)
+		}
+	}
+
+	return
+}
+
+/////////////////
+// COPY READER //
+/////////////////
+
+// copyReader puts a new object to a cluster, according to a reader taken from coi.DP.Reader(lom) The reader returned
+// from coi.DP is responsible for any locking or source LOM, if necessary. If the reader doesn't take any locks, it has
+// to consider object content changing in the middle of copying.
+//
+// LOM can be meta of a cloud object. It creates some problems. However, it's DP who is responsible for providing a reader,
+// so DP should tak any steps necessary to do so. It includes handling cold get, warm get etc.
+//
+// If destination bucket is remote bucket, copyReader will always create a cached copy of an object on one of the
+// targets as well as make put to the relevant cloud provider.
+// TODO: make it possible to skip caching an object from a cloud bucket.
+func (coi *copyObjInfo) copyReader(lom *cluster.LOM, objNameTo string) (copied bool, size int64, err error) {
+	cmn.Assert(coi.DP != nil)
+
+	var (
+		si = coi.t.si
+
+		reader  cmn.ReadOpenCloser
+		cleanUp func()
+	)
+
+	if si, err = cluster.HrwTarget(coi.BckTo.MakeUname(objNameTo), coi.t.owner.smap.Get()); err != nil {
+		return
+	}
+
+	if si.ID() != coi.t.si.ID() {
+		params := cluster.SendToParams{ObjNameTo: objNameTo, Tsi: si, DM: coi.DM}
+		return coi.putRemote(lom, params)
+	}
+
+	// DryRun: just get a reader and discard it. Init on dstLOM would cause and error as dstBck doesn't exist.
+	if coi.DryRun {
+		return coi.dryRunCopyReader(lom)
+	}
+
+	dst := &cluster.LOM{T: coi.t, ObjName: objNameTo}
+	if err = dst.Init(coi.BckTo.Bck); err != nil {
+		return
+	}
+
+	if reader, _, cleanUp, err = coi.DP.Reader(lom); err != nil {
+		return false, 0, err
+	}
+	defer cleanUp()
+
+	params := cluster.PutObjectParams{
+		Reader:       reader,
+		WorkFQN:      fs.CSM.GenContentFQN(lom.FQN, fs.WorkfileType, "cpy-dp"),
+		WithFinalize: true,
+		RecvType:     cluster.Migrated,
+	}
+
+	if err := coi.t.PutObject(dst, params); err != nil {
+		return false, 0, err
+	}
+	return true, dst.Size(), err
+}
+
+// nolint:unused // This function might become useful if we decide to introduce copying an object directly to a cloud.
+//
+// Provider, without intermediate object caching on a target.
+func (coi *copyObjInfo) copyReaderDirectlyToCloud(lom *cluster.LOM, objNameTo string) (copied bool, size int64, err error) {
+	cmn.Assert(coi.BckTo.IsRemote())
+	var (
+		reader  io.ReadCloser
+		objMeta cmn.ObjHeaderMetaProvider
+		cleanUp func()
+	)
+
+	if reader, objMeta, cleanUp, err = coi.DP.Reader(lom); err != nil {
+		return false, 0, err
+	}
+
+	defer func() {
+		reader.Close()
+		cleanUp()
+	}()
+
+	dstLOM := &cluster.LOM{T: coi.t, ObjName: objNameTo}
+	// Cloud bucket has to exist, so it has to be in BMD.
+	if err := dstLOM.Init(coi.BckTo.Bck); err != nil {
+		return false, 0, err
+	}
+
+	if _, err, _ = coi.t.Cloud(coi.BckTo).PutObj(context.Background(), reader, dstLOM); err != nil {
+		return false, 0, err
+	}
+	return true, objMeta.Size(), nil
+}
+
+func (coi *copyObjInfo) dryRunCopyReader(lom *cluster.LOM) (copied bool, size int64, err error) {
+	cmn.Assert(coi.DryRun)
+	cmn.Assert(coi.DP != nil)
+
+	var (
+		reader  io.ReadCloser
+		cleanUp func()
+	)
+
+	if reader, _, cleanUp, err = coi.DP.Reader(lom); err != nil {
+		return false, 0, err
+	}
+
+	defer func() {
+		reader.Close()
+		cleanUp()
+	}()
+
+	written, err := io.Copy(ioutil.Discard, reader)
+	return err == nil, written, err
+}
+
+// PUT object onto designated target
+func (coi *copyObjInfo) putRemote(lom *cluster.LOM, params cluster.SendToParams) (copied bool, size int64, err error) {
+	if coi.DP == nil {
+		if coi.DryRun {
+			if params.Locked {
+				lom.Unlock(false)
+			}
+			return true, lom.Size(), nil
+		}
+
+		var file *cmn.FileHandle // Closed by `SendTo()`
+		if file, err = cmn.NewFileHandle(lom.FQN); err != nil {
+			return false, 0, fmt.Errorf("failed to open %s, err: %v", lom.FQN, err)
+		}
+		params.Reader = file
+		params.HdrMeta = lom
+	} else {
+		var cleanUp func()
+		if params.Reader, params.HdrMeta, cleanUp, err = coi.DP.Reader(lom); err != nil {
+			return false, 0, err
+		}
+		defer cleanUp()
+		if coi.DryRun {
+			written, err := io.Copy(ioutil.Discard, params.Reader)
+			params.Reader.Close()
+			return err == nil, written, err
+		}
+	}
+	params.BckTo = coi.BckTo
+	if err := coi.t.sendTo(lom, params); err != nil {
+		return false, 0, err
+	}
+	return true, params.HdrMeta.Size(), nil
 }

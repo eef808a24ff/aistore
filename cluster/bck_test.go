@@ -59,17 +59,12 @@ var _ = Describe("Bck", func() {
 		DescribeTable("should not be equal",
 			func(a, b *Bck) {
 				a.Props, b.Props = &cmn.BucketProps{}, &cmn.BucketProps{}
-				Expect(a.Equal(b, true /*same BID*/)).To(BeFalse())
+				Expect(a.Equal(b, true /*same BID*/, true /* same backend*/)).To(BeFalse())
 			},
 			Entry(
 				"not matching names",
 				NewBck("a", cmn.ProviderAIS, cmn.NsGlobal),
 				NewBck("b", cmn.ProviderAIS, cmn.NsGlobal),
-			),
-			Entry(
-				"empty providers",
-				NewBck("a", "", cmn.NsGlobal),
-				NewBck("a", "", cmn.NsGlobal),
 			),
 			Entry(
 				"not matching local namespace",
@@ -94,20 +89,35 @@ var _ = Describe("Bck", func() {
 			Entry(
 				"not matching providers #2",
 				NewBck("a", cmn.ProviderAIS, cmn.NsGlobal),
-				NewBck("a", cmn.AnyCloud, cmn.NsGlobal),
+				NewBck("a", cmn.ProviderAmazon, cmn.NsGlobal),
 			),
 			Entry(
 				"not matching providers #3",
 				NewBck("a", "", cmn.NsGlobal),
-				NewBck("a", cmn.AnyCloud, cmn.NsGlobal),
+				NewBck("a", cmn.ProviderAzure, cmn.NsGlobal),
+			),
+			Entry(
+				"not matching Cloud providers #4",
+				NewBck("a", cmn.ProviderAmazon, cmn.NsGlobal),
+				NewBck("a", cmn.ProviderGoogle, cmn.NsGlobal),
+			),
+			Entry(
+				"not matching Cloud providers #5",
+				NewBck("a", cmn.ProviderGoogle, cmn.NsGlobal),
+				NewBck("a", cmn.ProviderAmazon, cmn.NsGlobal),
 			),
 		)
 
 		DescribeTable("should be equal",
 			func(a, b *Bck) {
 				a.Props, b.Props = &cmn.BucketProps{}, &cmn.BucketProps{}
-				Expect(a.Equal(b, true /*same BID*/)).To(BeTrue())
+				Expect(a.Equal(b, true /*same BID*/, true /* same backend */)).To(BeTrue())
 			},
+			Entry(
+				"empty providers",
+				NewBck("a", "", cmn.NsGlobal),
+				NewBck("a", "", cmn.NsGlobal),
+			),
 			Entry(
 				"matching AIS providers",
 				NewBck("a", cmn.ProviderAIS, cmn.NsGlobal),
@@ -122,16 +132,6 @@ var _ = Describe("Bck", func() {
 				"matching cloud namespaces",
 				NewBck("a", cmn.ProviderAIS, cmn.Ns{UUID: "uuid", Name: "ns"}),
 				NewBck("a", cmn.ProviderAIS, cmn.Ns{UUID: "uuid", Name: "ns"}),
-			),
-			Entry(
-				"matching Cloud providers",
-				NewBck("a", cmn.ProviderGoogle, cmn.NsGlobal),
-				NewBck("a", cmn.ProviderAmazon, cmn.NsGlobal),
-			),
-			Entry(
-				"matching Cloud providers #2",
-				NewBck("a", cmn.ProviderAmazon, cmn.NsGlobal),
-				NewBck("a", cmn.ProviderGoogle, cmn.NsGlobal),
 			),
 		)
 	})

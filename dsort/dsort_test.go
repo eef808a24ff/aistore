@@ -109,6 +109,7 @@ type extractCreatorMock struct {
 func (ec *extractCreatorMock) ExtractShard(lom *cluster.LOM, f *io.SectionReader, extractor extract.RecordExtractor, toDisk bool) (int64, int, error) {
 	return 0, 0, nil
 }
+
 func (ec *extractCreatorMock) CreateShard(s *extract.Shard, w io.Writer, loadContent extract.LoadContentFunc) (int64, error) {
 	ec.createShard(s, w, loadContent)
 	return 0, nil
@@ -177,7 +178,7 @@ func (t *targetNodeMock) setHandlers(handlers map[string]http.HandlerFunc) {
 func (t *targetNodeMock) setup() {
 	// set default handlers
 	defaultHandlers := map[string]http.HandlerFunc{
-		cmn.URLPath(cmn.Version, cmn.Sort, cmn.Records) + "/": func(w http.ResponseWriter, r *http.Request) {
+		cmn.JoinWords(cmn.Version, cmn.Sort, cmn.Records) + "/": func(w http.ResponseWriter, r *http.Request) {
 			manager, _ := t.managers.Get(globalManagerUUID)
 			manager.incrementReceived()
 		},
@@ -288,7 +289,7 @@ var _ = Describe("Distributed Sort", func() {
 
 	Describe("participateInRecordDistribution", func() {
 		Describe("Simple smoke tests", func() {
-			var runSmokeRecordDistribution = func(targetCnt int) {
+			runSmokeRecordDistribution := func(targetCnt int) {
 				ctx := &testContext{
 					targetCnt: targetCnt,
 				}
@@ -355,7 +356,7 @@ var _ = Describe("Distributed Sort", func() {
 
 					for _, target := range tctx.targets {
 						handlers := map[string]http.HandlerFunc{
-							cmn.URLPath(cmn.Version, cmn.Sort, cmn.Records) + "/": recordsHandler(target.managers),
+							cmn.JoinWords(cmn.Version, cmn.Sort, cmn.Records) + "/": recordsHandler(target.managers),
 						}
 						target.setHandlers(handlers)
 					}

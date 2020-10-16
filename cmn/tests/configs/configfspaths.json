@@ -32,6 +32,7 @@
   },
   "periodic": {
     "stats_time":        "10s",
+    "notif_time":        "30s",
     "retry_sync_time":   "2s"
   },
   "timeout": {
@@ -107,8 +108,6 @@
       "port_intra_data":    "10080"
     },
     "http": {
-      "rproxy":		"",
-      "rproxy_cache":		true,
       "server_crt":	"server.crt",
       "server_key":		"server.key",
       "use_https":		false

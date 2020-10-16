@@ -15,18 +15,15 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	jsoniter "github.com/json-iterator/go"
 )
 
-var (
-	errInvalidTarget = errors.New("invalid target")
-)
+var errInvalidTarget = errors.New("invalid target")
 
 // buildDlObjs returns list of objects that must be downloaded by target.
 func buildDlObjs(t cluster.Target, bck *cluster.Bck, objects cmn.SimpleKVs) ([]dlObj, error) {
 	var (
-		smap = t.GetSowner().Get()
+		smap = t.Sowner().Get()
 		sid  = t.Snode().ID()
 	)
 
@@ -81,7 +78,7 @@ func normalizeObjName(objName string) (string, error) {
 	return url.PathUnescape(u.Path)
 }
 
-func ParseStartDownloadRequest(ctx context.Context, t cluster.Target, bck *cluster.Bck, id string, dlb DlBody) (DlJob, error) {
+func ParseStartDownloadRequest(ctx context.Context, t cluster.Target, bck *cluster.Bck, id string, dlb DlBody, dlXact *Downloader) (DlJob, error) {
 	switch dlb.Type {
 	case DlTypeCloud:
 		dp := &DlCloudBody{}
@@ -92,7 +89,7 @@ func ParseStartDownloadRequest(ctx context.Context, t cluster.Target, bck *clust
 		if err := dp.Validate(); err != nil {
 			return nil, err
 		}
-		return newCloudBucketDlJob(ctx, t, id, bck, dp)
+		return newCloudBucketDlJob(ctx, t, id, bck, dp, dlXact)
 
 	case DlTypeMulti:
 		dp := &DlMultiBody{}
@@ -103,7 +100,7 @@ func ParseStartDownloadRequest(ctx context.Context, t cluster.Target, bck *clust
 		if err := dp.Validate(); err != nil {
 			return nil, err
 		}
-		return newMultiDlJob(t, id, bck, dp)
+		return newMultiDlJob(t, id, bck, dp, dlXact)
 
 	case DlTypeRange:
 		dp := &DlRangeBody{}
@@ -114,7 +111,7 @@ func ParseStartDownloadRequest(ctx context.Context, t cluster.Target, bck *clust
 		if err := dp.Validate(); err != nil {
 			return nil, err
 		}
-		return newRangeDlJob(t, id, bck, dp)
+		return newRangeDlJob(t, id, bck, dp, dlXact)
 
 	case DlTypeSingle:
 		dp := &DlSingleBody{}
@@ -125,7 +122,7 @@ func ParseStartDownloadRequest(ctx context.Context, t cluster.Target, bck *clust
 		if err := dp.Validate(); err != nil {
 			return nil, err
 		}
-		return newSingleDlJob(t, id, bck, dp)
+		return newSingleDlJob(t, id, bck, dp, dlXact)
 
 	default:
 		return nil, errors.New("input does not match any of the supported formats (single, range, multi, cloud)")
@@ -237,7 +234,7 @@ func headLink(link string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	debug.AssertNoErr(resp.Body.Close())
+	cmn.Close(resp.Body)
 	return resp, nil
 }
 

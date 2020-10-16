@@ -14,7 +14,7 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 const (
@@ -139,7 +139,7 @@ func (p *proxyrunner) proxyElection(vr *VoteRecord, curPrimary *cluster.Snode) {
 		glog.Infoln("Already in primary state")
 		return
 	}
-	xele := xaction.Registry.RenewElection()
+	xele := registry.Registry.RenewElection()
 	if xele == nil {
 		return
 	}
@@ -148,7 +148,7 @@ func (p *proxyrunner) proxyElection(vr *VoteRecord, curPrimary *cluster.Snode) {
 	xele.Finish()
 }
 
-func (p *proxyrunner) doProxyElection(vr *VoteRecord, curPrimary *cluster.Snode, xact *xaction.Election) {
+func (p *proxyrunner) doProxyElection(vr *VoteRecord, curPrimary *cluster.Snode, xact cluster.Xact) {
 	var (
 		err    = context.DeadlineExceeded
 		config = cmn.GCO.Get()
@@ -189,7 +189,7 @@ func (p *proxyrunner) doProxyElection(vr *VoteRecord, curPrimary *cluster.Snode,
 	p.becomeNewPrimary(vr.Primary /* proxyIDToRemove */)
 }
 
-func (p *proxyrunner) electAmongProxies(vr *VoteRecord, xact *xaction.Election) (winner bool, errors map[string]bool) {
+func (p *proxyrunner) electAmongProxies(vr *VoteRecord, xact cluster.Xact) (winner bool, errors map[string]bool) {
 	// Simple Majority Vote
 	resch := p.requestVotes(vr)
 	errors = make(map[string]bool)
@@ -233,7 +233,7 @@ func (p *proxyrunner) requestVotes(vr *VoteRecord) chan voteResult {
 		q   = url.Values{}
 	)
 	q.Set(cmn.URLParamPrimaryCandidate, p.si.ID())
-	results := p.callAll(http.MethodGet, cmn.URLPath(cmn.Version, cmn.Vote, cmn.Proxy), cmn.MustMarshal(&msg), q)
+	results := p.callAll(http.MethodGet, cmn.JoinWords(cmn.Version, cmn.Vote, cmn.Proxy), cmn.MustMarshal(&msg), q)
 	resCh := make(chan voteResult, len(results))
 	for res := range results {
 		if res.err != nil {
@@ -266,7 +266,7 @@ func (p *proxyrunner) confirmElectionVictory(vr *VoteRecord) map[string]bool {
 		},
 	}
 
-	res := p.callAll(http.MethodPut, cmn.URLPath(cmn.Version, cmn.Vote, cmn.Voteres), cmn.MustMarshal(msg))
+	res := p.callAll(http.MethodPut, cmn.JoinWords(cmn.Version, cmn.Vote, cmn.Voteres), cmn.MustMarshal(msg))
 	errors := make(map[string]bool)
 	for r := range res {
 		if r.err != nil {
@@ -478,31 +478,40 @@ func (h *httprunner) httpsetprimaryproxy(w http.ResponseWriter, r *http.Request)
 	if _, err := h.checkRESTItems(w, r, 0, false, cmn.Version, cmn.Vote, cmn.Voteres); err != nil {
 		return
 	}
-
 	msg := VoteResultMessage{}
 	if err := cmn.ReadJSON(w, r, &msg); err != nil {
 		return
 	}
-
 	vr := msg.Result
-	glog.Infof("%s: received vote result: new primary %s", h.si, vr.Candidate)
+	glog.Infof("%s: received vote result: new primary %s (old %s)", h.si, vr.Candidate, vr.Primary)
 
-	newPrimary, oldPrimary := vr.Candidate, vr.Primary
-	err := h.owner.smap.modify(func(clone *smapX) error {
-		psi := clone.GetProxy(newPrimary)
-		if psi == nil {
-			return &errNodeNotFound{"cannot accept new primary election", newPrimary, h.si, clone}
-		}
-		clone.Primary = psi
-		if oldPrimary != "" && clone.GetProxy(oldPrimary) != nil {
-			clone.delProxy(oldPrimary)
-		}
-		glog.Infof("resulting %s", clone.pp())
-		return nil
-	})
+	ctx := &smapModifier{
+		pre: h._votedPrimary,
+		nid: vr.Candidate,
+		sid: vr.Primary,
+	}
+	err := h.owner.smap.modify(ctx)
 	if err != nil {
 		h.invalmsghdlr(w, r, err.Error())
 	}
+}
+
+func (h *httprunner) _votedPrimary(ctx *smapModifier, clone *smapX) error {
+	newPrimary, oldPrimary := ctx.nid, ctx.sid
+	psi := clone.GetProxy(newPrimary)
+	if psi == nil {
+		return &errNodeNotFound{"cannot accept new primary election", newPrimary, h.si, clone}
+	}
+	clone.Primary = psi
+	if oldPrimary != "" && clone.GetProxy(oldPrimary) != nil {
+		clone.delProxy(oldPrimary)
+	}
+	if glog.FastV(4, glog.SmoduleAIS) {
+		glog.Infof("%s: voted-primary result: %s", h.si, clone.pp())
+	} else {
+		glog.Infof("%s: voted-primary result: %s", h.si, clone)
+	}
+	return nil
 }
 
 func (h *httprunner) sendElectionRequest(vr *VoteInitiation, nextPrimaryProxy *cluster.Snode) error {
@@ -514,7 +523,7 @@ func (h *httprunner) sendElectionRequest(vr *VoteInitiation, nextPrimaryProxy *c
 		req: cmn.ReqArgs{
 			Method: http.MethodPut,
 			Base:   nextPrimaryProxy.IntraControlNet.DirectURL,
-			Path:   cmn.URLPath(cmn.Version, cmn.Vote, cmn.VoteInit),
+			Path:   cmn.JoinWords(cmn.Version, cmn.Vote, cmn.VoteInit),
 			Body:   body,
 		},
 		timeout: cmn.DefaultTimeout,

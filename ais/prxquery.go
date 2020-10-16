@@ -5,58 +5,12 @@
 package ais
 
 import (
-	"errors"
-	"fmt"
 	"net/http"
-	"sort"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/query"
 )
-
-type (
-	// TODO: add more, like target finished, query aborted by user etc.
-	notifListenerQuery struct {
-		notifListenerBase
-		Targets    []*cluster.Snode
-		WorkersCnt uint
-	}
-)
-
-func newQueryListener(uuid string, ty int, smap *smapX, msg *query.InitMsg) (*notifListenerQuery, error) {
-	cmn.Assert(uuid != "")
-	numNodes := len(smap.Tmap)
-	if msg.WorkersCnt != 0 && msg.WorkersCnt < uint(numNodes) {
-		// FIXME: this should not be necessary. Proxy could know that if worker's
-		//  target is done, worker should be redirected to the next not-done target.
-		//  However, it should be done once query is able to keep more detailed
-		//  information about targets.
-		return nil, fmt.Errorf("expected WorkersCnt to be at least %d", numNodes)
-	}
-
-	// Ensure same order on all nodes
-	targets := smap.Tmap.Nodes()
-	sort.SliceStable(targets, func(i, j int) bool {
-		return targets[i].DaemonID < targets[j].DaemonID
-	})
-	return &notifListenerQuery{
-		notifListenerBase: *newNLB(uuid, smap, ty, cmn.ActQueryObjects, msg.QueryMsg.From.Bck),
-		WorkersCnt:        msg.WorkersCnt,
-		Targets:           targets,
-	}, nil
-}
-
-func (q *notifListenerQuery) workersTarget(workerID uint) (*cluster.Snode, error) {
-	if q.WorkersCnt == 0 {
-		return nil, errors.New("query registered with 0 workers")
-	}
-	if workerID == 0 {
-		return nil, errors.New("workerID cannot be empty")
-	}
-	return q.Targets[workerID%uint(len(q.Targets))], nil
-}
 
 // Proxy exposes 2 methods:
 // - Init(query) -> handle - initializes a query on proxy and targets
@@ -95,7 +49,7 @@ func (p *proxyrunner) httpquerypost(w http.ResponseWriter, r *http.Request) {
 	args := bcastArgs{
 		req: cmn.ReqArgs{
 			Method: http.MethodPost,
-			Path:   cmn.URLPath(cmn.Version, cmn.Query, cmn.Init),
+			Path:   cmn.JoinWords(cmn.Version, cmn.Query, cmn.Init),
 			Body:   cmn.MustMarshal(msg),
 			Header: header,
 		},
@@ -110,12 +64,12 @@ func (p *proxyrunner) httpquerypost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	nlq, err := newQueryListener(handle, notifCache, smap, msg)
+	nlq, err := query.NewQueryListener(handle, &smap.Smap, msg)
 	if err != nil {
 		p.invalmsghdlr(w, r, err.Error())
 		return
 	}
-	nlq.hrwOwner(smap)
+	nlq.SetHrwOwner(&smap.Smap)
 	p.ic.registerEqual(regIC{nl: nlq, smap: smap, msg: msg})
 
 	w.Write([]byte(handle))
@@ -156,13 +110,13 @@ func (p *proxyrunner) httpquerygetworkertarget(w http.ResponseWriter, r *http.Re
 	if !ok {
 		return
 	}
-	state := nl.(*notifListenerQuery)
-	if err := state.err(); err != nil {
+	state := nl.(*query.NotifListenerQuery)
+	if err := state.Err(false); err != nil {
 		p.invalmsghdlr(w, r, err.Error())
 		return
 	}
 
-	target, err := state.workersTarget(msg.WorkerID)
+	target, err := state.WorkersTarget(msg.WorkerID)
 	if err != nil {
 		p.invalmsghdlr(w, r, err.Error())
 		return
@@ -198,7 +152,7 @@ func (p *proxyrunner) httpquerygetnext(w http.ResponseWriter, r *http.Request) {
 		results = p.bcastToGroup(bcastArgs{
 			req: cmn.ReqArgs{
 				Method: http.MethodGet,
-				Path:   cmn.URLPath(cmn.Version, cmn.Query, cmn.Peek),
+				Path:   cmn.JoinWords(cmn.Version, cmn.Query, cmn.Peek),
 				Body:   cmn.MustMarshal(msg),
 				Header: map[string][]string{cmn.HeaderAccept: {cmn.ContentMsgPack}},
 			},
@@ -227,7 +181,7 @@ func (p *proxyrunner) httpquerygetnext(w http.ResponseWriter, r *http.Request) {
 
 	if len(result.Entries) > 0 {
 		last := result.Entries[len(result.Entries)-1]
-		discardResults := p.callTargets(http.MethodPut, cmn.URLPath(cmn.Version, cmn.Query, cmn.Discard, msg.Handle, last.Name), nil)
+		discardResults := p.callTargets(http.MethodPut, cmn.JoinWords(cmn.Version, cmn.Query, cmn.Discard, msg.Handle, last.Name), nil)
 
 		for res := range discardResults {
 			if res.err != nil && res.status != http.StatusNotFound {

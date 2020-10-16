@@ -9,41 +9,42 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"time"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/downloader"
-	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/nl"
+	"github.com/NVIDIA/aistore/xaction/registry"
 	jsoniter "github.com/json-iterator/go"
 )
 
 // NOTE: This request is internal so we can have asserts there.
 // [METHOD] /v1/download
 func (t *targetrunner) downloadHandler(w http.ResponseWriter, r *http.Request) {
-	if _, pid, _ := t.validRedirect(w, r, cmn.Download, false); pid == "" {
-		return
-	}
 	var (
 		response   interface{}
 		respErr    error
 		statusCode int
 	)
-	downloaderXact, err := xaction.Registry.RenewDownloader(t, t.statsT)
+	xact, err := registry.Registry.RenewDownloader(t, t.statsT)
 	if err != nil {
 		t.invalmsghdlr(w, r, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	downloaderXact := xact.(*downloader.Downloader)
 	switch r.Method {
 	case http.MethodPost:
 		_, err := cmn.MatchRESTItems(r.URL.Path, 0, false, cmn.Version, cmn.Download)
 		debug.AssertNoErr(err)
 
 		var (
-			ctx  = context.Background()
-			uuid = r.URL.Query().Get(cmn.URLParamUUID)
-			dlb  = downloader.DlBody{}
+			ctx              = context.Background()
+			uuid             = r.URL.Query().Get(cmn.URLParamUUID)
+			dlb              = downloader.DlBody{}
+			progressInterval = downloader.DownloadProgressInterval
 		)
 		debug.Assert(uuid != "")
 		if err := cmn.ReadJSON(w, r, &dlb); err != nil {
@@ -54,8 +55,18 @@ func (t *targetrunner) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		if err := jsoniter.Unmarshal(dlb.RawMessage, &dlBodyBase); err != nil {
 			return
 		}
+
+		if dlBodyBase.ProgressInterval != "" {
+			if dur, err := time.ParseDuration(dlBodyBase.ProgressInterval); err == nil {
+				progressInterval = dur
+			} else {
+				t.invalmsghdlrf(w, r, "%s: invalid progress interval %q, err: %v", t.si, dlBodyBase.ProgressInterval, err)
+				return
+			}
+		}
+
 		bck := cluster.NewBckEmbed(dlBodyBase.Bck)
-		if err := bck.Init(t.GetBowner(), t.Snode()); err != nil {
+		if err := bck.Init(t.Bowner(), t.Snode()); err != nil {
 			t.invalmsghdlr(w, r, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -64,7 +75,7 @@ func (t *targetrunner) downloadHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		dlJob, err := downloader.ParseStartDownloadRequest(ctx, t, bck, uuid, dlb)
+		dlJob, err := downloader.ParseStartDownloadRequest(ctx, t, bck, uuid, dlb, downloaderXact)
 		if err != nil {
 			t.invalmsghdlr(w, r, err.Error())
 			return
@@ -72,6 +83,16 @@ func (t *targetrunner) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		if glog.FastV(4, glog.SmoduleAIS) {
 			glog.Infof("Downloading: %s", dlJob.ID())
 		}
+
+		dlJob.AddNotif(&downloader.NotifDownload{
+			NotifBase: nl.NotifBase{
+				When:     cluster.UponProgress,
+				Interval: progressInterval,
+				Dsts:     []string{equalIC},
+				F:        t.callerNotifyFin,
+				P:        t.callerNotifyProgress,
+			},
+		}, dlJob)
 		response, respErr, statusCode = downloaderXact.Download(dlJob)
 	case http.MethodGet:
 		_, err := cmn.MatchRESTItems(r.URL.Path, 0, false, cmn.Version, cmn.Download)
@@ -85,9 +106,9 @@ func (t *targetrunner) downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 		if payload.ID != "" {
 			if glog.FastV(4, glog.SmoduleAIS) {
-				glog.Infof("Getting status of download: %s", payload)
+				glog.Infof("Getting status of download: %v", payload)
 			}
-			response, respErr, statusCode = downloaderXact.JobStatus(payload.ID)
+			response, respErr, statusCode = downloaderXact.JobStatus(payload.ID, payload.OnlyActiveTasks)
 		} else {
 			var regex *regexp.Regexp
 			if payload.Regex != "" {
@@ -114,12 +135,12 @@ func (t *targetrunner) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		switch items[0] {
 		case cmn.Abort:
 			if glog.FastV(4, glog.SmoduleAIS) {
-				glog.Infof("Aborting download: %s", payload)
+				glog.Infof("Aborting download: %v", payload)
 			}
 			response, respErr, statusCode = downloaderXact.AbortJob(payload.ID)
 		case cmn.Remove:
 			if glog.FastV(4, glog.SmoduleAIS) {
-				glog.Infof("Removing download: %s", payload)
+				glog.Infof("Removing download: %v", payload)
 			}
 			response, respErr, statusCode = downloaderXact.RemoveJob(payload.ID)
 		default:

@@ -6,12 +6,15 @@ package integration
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/tutils"
 	"github.com/NVIDIA/aistore/tutils/tassert"
@@ -19,21 +22,19 @@ import (
 
 const (
 	// Public object name to download from Google Cloud Storage(GCS)
-	GcsFilename = "LT80400212013126LGN01_B10.TIF"
-	GcsObjXML   = "LT08/PRE/040/021/LT80400212013126LGN01/" + GcsFilename
+	gcsFilename = "LT80400212013126LGN01_B10.TIF"
+	gcsObjXML   = "LT08/PRE/040/021/LT80400212013126LGN01/" + gcsFilename
 	// Public GCS bucket
-	GcsBck = "gcp-public-data-landsat"
-	// wihtout this query GCS returns only object's information
-	GcsQry      = "?alt=media"
-	GcsHostJSON = "www.googleapis.com"
-	GcsHostXML  = "storage.googleapis.com"
-	GcsTmpFile  = "/tmp/rproxy_test_download.tiff"
+	gcsBck = "gcp-public-data-landsat"
+	// Without this query GCS returns only object's information
+	gcsQuery    = "?alt=media"
+	gcsHostJSON = "www.googleapis.com"
+	gcsHostXML  = "storage.googleapis.com"
+	gcsTmpFile  = "/tmp/rproxy_test_download.tiff"
 )
 
-var (
-	// reformat object name from XML to JSON API requirements
-	GcsObjJSON = strings.ReplaceAll(GcsObjXML, "/", "%2F")
-)
+// reformat object name from XML to JSON API requirements
+var gcsObjJSON = strings.ReplaceAll(gcsObjXML, "/", "%2F")
 
 // search for the full path of cached object
 func pathForCached() string {
@@ -45,11 +46,13 @@ func pathForCached() string {
 		if err != nil || info == nil {
 			return nil
 		}
-		if info.IsDir() || !strings.Contains(path, "/cloud/") {
+
+		// TODO -- FIXME - avoid hardcoded on-disk layout
+		if info.IsDir() || !strings.Contains(path, cmn.ProviderHTTP+"/") {
 			return nil
 		}
 
-		if strings.HasSuffix(path, GcsFilename) {
+		if strings.HasSuffix(path, gcsFilename) {
 			fpath = path
 			return filepath.SkipDir
 		}
@@ -61,31 +64,42 @@ func pathForCached() string {
 
 // generate URL to request object from GCS
 func genObjURL(isSecure, isXML bool) (s string) {
-	if isSecure {
+	if isSecure || !isXML { // Using JSON requires HTTPS: "SSL is required to perform this operation."
 		s = "https://"
 	} else {
 		s = "http://"
 	}
 	if isXML {
-		s += fmt.Sprintf("%s/%s/%s", GcsHostXML, GcsBck, GcsObjXML)
+		s += fmt.Sprintf("%s/%s/%s", gcsHostXML, gcsBck, gcsObjXML)
 	} else {
-		s += fmt.Sprintf("%s/storage/v1/b/%s/o/%s", GcsHostJSON, GcsBck, GcsObjJSON)
+		s += fmt.Sprintf("%s/storage/v1/b/%s/o/%s%s", gcsHostJSON, gcsBck, gcsObjJSON, gcsQuery)
 	}
 	return s
 }
 
 // build command line for CURL
-func genCURLCmdLine(isSecure, isXML bool, proxyURL string) []string {
+func genCURLCmdLine(resURL, proxyURL string, targets cluster.NodeMap) []string {
+	var noProxy []string
+	for _, t := range targets {
+		if !cmn.StringInSlice(t.PublicNet.NodeIPAddr, noProxy) {
+			noProxy = append(noProxy, t.PublicNet.NodeIPAddr)
+		}
+	}
+	// TODO:  "--proxy-insecure" requires `curl` 7.58.0+ and is needed when we USE_HTTPS (see #885)
 	return []string{
 		"-L", "-X", "GET",
-		fmt.Sprintf("%s%s", genObjURL(isSecure, isXML), GcsQry),
-		"-o", GcsTmpFile,
+		resURL,
+		"-o", gcsTmpFile,
 		"-x", proxyURL,
+		"--max-redirs", "3",
+		"--noproxy", strings.Join(noProxy, ","),
+		"--insecure",
 	}
 }
 
-// extract download speed from CURL output (from the last non-empty line)
-func extractSpeed(lines []string) int64 {
+// Extract download speed from CURL output.
+func extractSpeed(out []byte) int64 {
+	lines := strings.Split(string(out), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		if lines[i] == "" {
 			continue
@@ -99,15 +113,14 @@ func extractSpeed(lines []string) int64 {
 }
 
 func TestRProxyGCS(t *testing.T) {
-	const coeff = 3 // cached download speed must be at least coeff times faster
+	var (
+		resURL   = genObjURL(false, true)
+		proxyURL = tutils.GetPrimaryURL()
+		smap     = tutils.GetClusterMap(t, proxyURL)
+	)
 
-	proxyURL := tutils.GetPrimaryURL()
-	config := tutils.GetClusterConfig(t)
-
-	// the test requires very specific configuration that cannot be enabled
-	// on the fly. That is why it is not Fatal error
-	if config.Net.HTTP.RevProxy != cmn.RevProxyCloud {
-		t.Skipf("%s requires the cluster deployed in reverse proxy mode", t.Name())
+	if cmn.IsHTTPS(proxyURL) {
+		t.Skip("test doesn't work for HTTPS")
 	}
 
 	// look for leftovers and cleanup if found
@@ -116,59 +129,95 @@ func TestRProxyGCS(t *testing.T) {
 		tutils.Logf("Found in cache: %s. Removing...\n", pathCached)
 		os.Remove(pathCached)
 	}
-	if _, err := os.Stat(GcsTmpFile); err == nil {
-		os.Remove(GcsTmpFile)
-	}
-
-	tutils.Logf("First time download via XML API\n")
-	cmdline := genCURLCmdLine(false, true, proxyURL)
+	os.Remove(gcsTmpFile)
+	cmdline := genCURLCmdLine(resURL, proxyURL, smap.Tmap)
+	tutils.Logf("First time download via XML API: %s\n", cmdline)
 	out, err := exec.Command("curl", cmdline...).CombinedOutput()
-	t.Log(string(out))
+	tutils.Logln(string(out))
 	tassert.CheckFatal(t, err)
 
 	pathCached = pathForCached()
-	if pathCached == "" {
-		t.Fatalf("Object was not cached")
-	}
+	tassert.Fatalf(t, pathCached != "", "object was not cached")
+
 	defer func() {
-		os.Remove(GcsTmpFile)
+		os.Remove(gcsTmpFile)
 		os.Remove(pathCached)
 	}()
 
 	tutils.Logf("Cached at: %q\n", pathCached)
-	lines := strings.Split(string(out), "\n")
-	speedCold := extractSpeed(lines)
-	if speedCold == 0 {
-		t.Fatal("Failed to detect speed for cold download")
-	}
+	speedCold := extractSpeed(out)
+	tassert.Fatalf(t, speedCold != 0, "Failed to detect speed for cold download")
 
-	tutils.Logf("HTTPS download\n")
-	cmdline = genCURLCmdLine(true, true, proxyURL)
+	tutils.Logf("HTTP download\n")
+	cmdline = genCURLCmdLine(resURL, proxyURL, smap.Tmap)
 	out, err = exec.Command("curl", cmdline...).CombinedOutput()
-	t.Log(string(out))
+	tutils.Logln(string(out))
 	tassert.CheckFatal(t, err)
-	lines = strings.Split(string(out), "\n")
-	speedHTTPS := extractSpeed(lines)
-	if speedHTTPS == 0 {
-		t.Fatal("Failed to detect speed for HTTPS download")
-	}
+	speedHTTP := extractSpeed(out)
+	tassert.Fatalf(t, speedHTTP != 0, "Failed to detect speed for HTTP download")
 
-	tutils.Logf("Cache check via JSON API\n")
-	cmdline = genCURLCmdLine(false, false, proxyURL)
-	out, err = exec.Command("curl", cmdline...).CombinedOutput()
-	t.Log(string(out))
-	tassert.CheckFatal(t, err)
-	lines = strings.Split(string(out), "\n")
-	speedCache := extractSpeed(lines)
-	if speedCache == 0 {
-		t.Fatal("Failed to detect speed for cached download")
-	}
+	/*
+		TODO: uncomment when target supports HTTPS client
+
+		tutils.Logf("HTTPS download\n")
+		cmdline = genCURLCmdLine(true, true, proxyURL, smap.Tmap)
+		out, err = exec.Command("curl", cmdline...).CombinedOutput()
+		tutils.Logln(string(out))
+		tassert.CheckFatal(t, err)
+		speedHTTPS := extractSpeed(out)
+		tassert.Fatalf(t, speedHTTPS != 0, "Failed to detect speed for HTTPS download")
+
+
+		tutils.Logf("Check via JSON API\n")
+		cmdline = genCURLCmdLine(false, false, proxyURL, smap.Tmap)
+		tutils.Logf("JSON: %s\n", cmdline)
+		out, err = exec.Command("curl", cmdline...).CombinedOutput()
+		t.Log(string(out))
+		tassert.CheckFatal(t, err)
+		speedJSON := extractSpeed(out)
+		tassert.Fatalf(t, speedJSON != 0, "Failed to detect speed for JSON download")
+	*/
 
 	tutils.Logf("Cold download speed:   %s\n", cmn.B2S(speedCold, 1))
-	tutils.Logf("HTTPS download speed:  %s\n", cmn.B2S(speedHTTPS, 1))
-	tutils.Logf("Cached download speed: %s\n", cmn.B2S(speedCache, 1))
-	tutils.Logf("Cached is %v times faster than Cold\n", speedCache/speedCold)
-	if speedCache < speedCold*coeff || speedCache < speedHTTPS*coeff {
-		t.Error("Downloading did not use the cache")
+	tutils.Logf("HTTP download speed:   %s\n", cmn.B2S(speedHTTP, 1))
+	/*
+		TODO: uncomment when target supports HTTPS client
+
+		tutils.Logf("HTTPS download speed:  %s\n", cmn.B2S(speedHTTPS, 1))
+		tutils.Logf("JSON download speed:   %s\n", cmn.B2S(speedJSON, 1))
+	*/
+	tutils.Logf("HTTP (cached) is %.1f times faster than Cold\n", float64(speedHTTP)/float64(speedCold))
+}
+
+func TestRProxyInvalidURL(t *testing.T) {
+	var (
+		proxyURL   = tutils.GetPrimaryURL()
+		baseParams = tutils.BaseAPIParams(proxyURL)
+	)
+
+	client := tutils.NewClientWithProxy(proxyURL)
+
+	tests := []struct {
+		url        string
+		statusCode int
+	}{
+		{url: "http://archive.ics.uci.edu/ml/datasets/Abalone", statusCode: http.StatusBadRequest},
+		{url: "http://storage.googleapis.com/kubernetes-release/release", statusCode: http.StatusNotFound},
+		{url: "http://invalid.invaliddomain.com/test/webpage.txt", statusCode: http.StatusBadRequest}, // Invalid domain
+	}
+
+	for _, test := range tests {
+		hbo, err := cmn.NewHTTPObjPath(test.url)
+		tassert.CheckError(t, err)
+		api.DestroyBucket(baseParams, hbo.Bck)
+
+		res, err := client.Get(test.url)
+		tassert.CheckError(t, err)
+		res.Body.Close()
+		tassert.Errorf(t, res.StatusCode == test.statusCode, "%q: expected status %d - got %d", test.url, test.statusCode, res.StatusCode)
+
+		_, err = api.HeadBucket(baseParams, hbo.Bck)
+		tassert.Errorf(t, err != nil, "shouldn't create bucket (%s) for invalid resource URL", hbo.Bck)
+		api.DestroyBucket(baseParams, hbo.Bck)
 	}
 }

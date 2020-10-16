@@ -10,9 +10,12 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/query"
 	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 // There are 3 methods exposed by targets:
@@ -38,12 +41,10 @@ func (t *targetrunner) httpquerypost(w http.ResponseWriter, r *http.Request) {
 	if _, err := t.checkRESTItems(w, r, 0, false, cmn.Version, cmn.Query, cmn.Init); err != nil {
 		return
 	}
-
 	var (
 		handle = r.Header.Get(cmn.HeaderHandle) // TODO: should it be from header or from body?
+		msg    = &query.InitMsg{}
 	)
-	smap := t.owner.smap.get()
-	msg := &query.InitMsg{}
 	if err := cmn.ReadJSON(w, r, msg); err != nil {
 		return
 	}
@@ -68,7 +69,7 @@ func (t *targetrunner) httpquerypost(w http.ResponseWriter, r *http.Request) {
 		smsg.Flags = cmn.SelectCached
 	}
 
-	xact, isNew, err := xaction.Registry.RenewObjectsListingXact(ctx, t, q, smsg)
+	xact, isNew, err := registry.Registry.RenewQuery(ctx, t, q, smsg)
 	if err != nil {
 		t.invalmsghdlr(w, r, err.Error())
 		return
@@ -77,11 +78,10 @@ func (t *targetrunner) httpquerypost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	xact.AddNotif(&cmn.NotifXact{
-		NotifBase: cmn.NotifBase{When: cmn.UponTerm, Ty: notifCache, Dsts: smap.IC.Keys(), F: t.xactCallerNotify},
+	xact.AddNotif(&xaction.NotifXact{
+		NotifBase: nl.NotifBase{When: cluster.UponTerm, Dsts: []string{equalIC}, F: t.callerNotifyFin},
 	})
-
-	go xact.Start()
+	go xact.Run()
 }
 
 func (t *targetrunner) httpqueryget(w http.ResponseWriter, r *http.Request) {
@@ -107,9 +107,7 @@ func (t *targetrunner) httpquerygetworkertarget(w http.ResponseWriter, _ *http.R
 }
 
 func (t *targetrunner) httpquerygetobjects(w http.ResponseWriter, r *http.Request) {
-	var (
-		entries []*cmn.BucketEntry
-	)
+	var entries []*cmn.BucketEntry
 
 	apiItems, err := t.checkRESTItems(w, r, 1, false, cmn.Version, cmn.Query)
 	if err != nil {

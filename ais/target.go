@@ -23,7 +23,6 @@ import (
 	"github.com/NVIDIA/aistore/ais/cloud"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/dbdriver"
 	"github.com/NVIDIA/aistore/dsort"
@@ -31,10 +30,12 @@ import (
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/mirror"
+	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/reb"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -46,6 +47,7 @@ const (
 
 	nodeRestartedMarker = ".noderestarted"
 )
+
 const (
 	clusterClockDrift = 5 * time.Millisecond // is expected to be bounded by
 )
@@ -71,10 +73,7 @@ type (
 		timedLookup atomic.Bool
 		refCount    uint32
 	}
-	clouds struct {
-		ais *cloud.AisCloudProvider
-		ext cluster.CloudProvider
-	}
+	clouds map[string]cluster.CloudProvider
 	// main
 	targetrunner struct {
 		httprunner
@@ -91,7 +90,6 @@ type (
 		regstate regstate     // the state of being registered with the primary, can be (en/dis)abled via API
 		gmm      *memsys.MMSA // system pagesize-based memory manager and slab allocator
 		smm      *memsys.MMSA // system MMSA for small-size allocations
-		k8sNode  string       // env (cmn.k8sHostNameEnv)
 	}
 )
 
@@ -100,6 +98,7 @@ type (
 //////////////
 
 func (gfn *baseGFN) active() bool { return gfn.lookup.Load() }
+
 func (gfn *baseGFN) Activate() bool {
 	previous := gfn.lookup.Swap(true)
 	glog.Infoln(gfn.tag, "activated")
@@ -148,8 +147,14 @@ func (gfn *globalGFN) activateTimed() {
 	glog.Infoln(gfn.tag, "activated timed")
 
 	go func() {
+		const sleep = 5 * time.Second
 		for {
-			time.Sleep(timedInterval)
+			for tm := time.Duration(0); tm < timedInterval; tm += sleep {
+				time.Sleep(sleep)
+				if !gfn.timedLookup.Load() {
+					return
+				}
+			}
 
 			gfn.mtx.Lock()
 			// If we woke up after defined schedule we are safe to deactivate.
@@ -165,6 +170,17 @@ func (gfn *globalGFN) activateTimed() {
 			gfn.mtx.Unlock()
 		}
 	}()
+}
+
+// Deactivates timed GFN only if timed GFN has been activated only once before.
+func (gfn *globalGFN) abortTimed() {
+	gfn.mtx.Lock()
+	defer gfn.mtx.Unlock()
+	if gfn.refCount == 1 {
+		glog.Infoln(gfn.tag, "aborted timed")
+		gfn.timedLookup.Store(false)
+		gfn.refCount = 0
+	}
 }
 
 ///////////////////
@@ -214,8 +230,6 @@ func (t *targetrunner) Run() error {
 
 	cluster.InitTarget()
 
-	t.k8sNode = cmn.DetectK8s()
-
 	//
 	// join cluster
 	//
@@ -262,9 +276,7 @@ func (t *targetrunner) Run() error {
 		return err
 	}
 	t.dbDriver = driver
-	defer func() {
-		debug.AssertNoErr(driver.Close())
-	}()
+	defer cmn.Close(driver)
 
 	// transactions
 	t.transactions.init(t)
@@ -281,13 +293,13 @@ func (t *targetrunner) Run() error {
 	}
 	t.rebManager = reb.NewManager(t, config, getstorstatsrunner())
 	t.initRecvHandlers()
-	ec.Init(t, xaction.Registry)
+	ec.Init(t)
 
-	marked := xaction.GetResilverMarked()
+	marked := registry.GetResilverMarked()
 	if marked.Interrupted {
 		go func() {
 			glog.Infoln("resuming resilver...")
-			t.rebManager.RunResilver("", false /*skipGlobMisplaced*/)
+			t.runResilver("", false /*skipGlobMisplaced*/)
 		}()
 	}
 
@@ -299,81 +311,86 @@ func (t *targetrunner) Run() error {
 	return nil
 }
 
-func (t *targetrunner) checkK8s() error {
-	if t.k8sNode == "" {
-		return fmt.Errorf("%s: the operation requires Kubernetes deployment", t.si)
-	}
-	return nil
-}
-
-func (c *clouds) init(t *targetrunner) {
+func (c clouds) init(t *targetrunner) {
 	config := cmn.GCO.Get()
-	c.ais = cloud.NewAIS(t) // ais cloud is always present
+	ais := cloud.NewAIS(t)
+	c[cmn.ProviderAIS] = ais // ais cloud is always present
 	if aisConf, ok := config.Cloud.ProviderConf(cmn.ProviderAIS); ok {
-		if err := c.ais.Apply(aisConf, "init"); err != nil {
+		if err := ais.Apply(aisConf, "init"); err != nil {
 			glog.Errorf("%s: %v - proceeding to start anyway...", t.si, err)
 		}
 	}
+
+	c[cmn.ProviderHTTP], _ = cloud.NewHTTP(t, config)
 	if err := c.initExt(t); err != nil {
 		cmn.ExitLogf("%v", err)
 	}
 }
 
 // 3rd part cloud: empty stubs unless populated via build tags
-func (c *clouds) initExt(t *targetrunner) (err error) {
+func (c clouds) initExt(t *targetrunner) (err error) {
 	config := cmn.GCO.Get()
-	switch config.Cloud.Provider {
-	case cmn.ProviderAmazon:
-		c.ext, err = cloud.NewAWS(t)
-	case cmn.ProviderGoogle:
-		c.ext, err = cloud.NewGCP(t)
-	case cmn.ProviderAzure:
-		c.ext, err = cloud.NewAzure(t)
-	case "":
-		c.ext, _ = cloud.NewDummyCloud(t)
-	default:
-		err = fmt.Errorf("unknown cloud provider: %q", config.Cloud.Provider)
+	for provider := range config.Cloud.Providers {
+		switch provider {
+		case cmn.ProviderAmazon:
+			c[provider], err = cloud.NewAWS(t)
+		case cmn.ProviderGoogle:
+			c[provider], err = cloud.NewGCP(t)
+		case cmn.ProviderAzure:
+			c[provider], err = cloud.NewAzure(t)
+		default:
+			err = fmt.Errorf("unknown cloud provider: %q", provider)
+		}
+		if err != nil {
+			return
+		}
 	}
 	return
 }
 
 func (t *targetrunner) initRecvHandlers() {
-	var (
-		networkHandlers = []networkHandler{
-			{r: cmn.Buckets, h: t.bucketHandler,
-				net: []string{cmn.NetworkPublic, cmn.NetworkIntraControl, cmn.NetworkIntraData}},
-			{r: cmn.Objects, h: t.objectHandler, net: []string{cmn.NetworkPublic, cmn.NetworkIntraData}},
-			{r: cmn.Daemon, h: t.daemonHandler, net: []string{cmn.NetworkPublic, cmn.NetworkIntraControl}},
-			{r: cmn.Metasync, h: t.metasyncHandler, net: []string{cmn.NetworkIntraControl}},
-			{r: cmn.Health, h: t.healthHandler, net: []string{cmn.NetworkIntraControl}},
-			{r: cmn.Xactions, h: t.xactHandler, net: []string{cmn.NetworkIntraControl}},
-			{r: cmn.Rebalance, h: t.rebManager.RespHandler, net: []string{cmn.NetworkIntraData}},
-			{r: cmn.EC, h: t.ecHandler, net: []string{cmn.NetworkIntraData}},
-			{r: cmn.Vote, h: t.voteHandler, net: []string{cmn.NetworkIntraControl}},
-			{r: cmn.Txn, h: t.txnHandler, net: []string{cmn.NetworkIntraControl}},
+	networkHandlers := []networkHandler{
+		{
+			r: cmn.Buckets, h: t.bucketHandler,
+			net: []string{cmn.NetworkPublic, cmn.NetworkIntraControl, cmn.NetworkIntraData},
+		},
+		{r: cmn.Objects, h: t.objectHandler, net: []string{cmn.NetworkPublic, cmn.NetworkIntraData}},
+		{r: cmn.Daemon, h: t.daemonHandler, net: []string{cmn.NetworkPublic, cmn.NetworkIntraControl}},
+		{r: cmn.Metasync, h: t.metasyncHandler, net: []string{cmn.NetworkIntraControl}},
+		{r: cmn.Health, h: t.healthHandler, net: []string{cmn.NetworkIntraControl}},
+		{r: cmn.Xactions, h: t.xactHandler, net: []string{cmn.NetworkIntraControl}},
+		{r: cmn.Rebalance, h: t.rebManager.RespHandler, net: []string{cmn.NetworkIntraData}},
+		{r: cmn.EC, h: t.ecHandler, net: []string{cmn.NetworkIntraData}},
+		{r: cmn.Vote, h: t.voteHandler, net: []string{cmn.NetworkIntraControl}},
+		{r: cmn.Txn, h: t.txnHandler, net: []string{cmn.NetworkIntraControl}},
 
-			{r: cmn.Tokens, h: t.tokenHandler, net: []string{cmn.NetworkPublic}},
+		{r: cmn.Tokens, h: t.tokenHandler, net: []string{cmn.NetworkPublic}},
 
-			{r: cmn.Download, h: t.downloadHandler, net: []string{cmn.NetworkIntraControl}},
-			{r: cmn.Sort, h: dsort.SortHandler,
-				net: []string{cmn.NetworkIntraControl, cmn.NetworkIntraData}},
-			{r: cmn.ETL, h: t.etlHandler,
-				net: []string{cmn.NetworkPublic, cmn.NetworkIntraControl}},
+		{r: cmn.Download, h: t.downloadHandler, net: []string{cmn.NetworkIntraControl}},
+		{
+			r: cmn.Sort, h: dsort.SortHandler,
+			net: []string{cmn.NetworkIntraControl, cmn.NetworkIntraData},
+		},
+		{
+			r: cmn.ETL, h: t.etlHandler,
+			net: []string{cmn.NetworkPublic, cmn.NetworkIntraControl},
+		},
 
-			{r: cmn.Query, h: t.queryHandler, net: []string{cmn.NetworkPublic, cmn.NetworkIntraControl}},
+		{r: cmn.Query, h: t.queryHandler, net: []string{cmn.NetworkPublic, cmn.NetworkIntraControl}},
 
-			{r: "/" + cmn.S3, h: t.s3Handler, net: []string{cmn.NetworkPublic, cmn.NetworkIntraData}},
-			{r: "/", h: cmn.InvalidHandler,
-				net: []string{cmn.NetworkPublic, cmn.NetworkIntraControl, cmn.NetworkIntraData}},
-		}
-	)
+		{r: "/" + cmn.S3, h: t.s3Handler, net: []string{cmn.NetworkPublic, cmn.NetworkIntraData}},
+		{
+			r: "/", h: cmn.InvalidHandler,
+			net: []string{cmn.NetworkPublic, cmn.NetworkIntraControl, cmn.NetworkIntraData},
+		},
+	}
 	t.registerNetworkHandlers(networkHandlers)
 }
 
 // stop gracefully
 func (t *targetrunner) Stop(err error) {
 	glog.Infof("Stopping %s, err: %v", t.GetRunName(), err)
-	xaction.Registry.AbortAll()
+	registry.Registry.AbortAll()
 	if t.publicServer.s != nil {
 		t.unregister() // ignore errors
 	}
@@ -413,14 +430,14 @@ func (t *targetrunner) objectHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		t.httpobjget(w, r)
+	case http.MethodHead:
+		t.httpobjhead(w, r)
 	case http.MethodPut:
 		t.httpobjput(w, r)
 	case http.MethodDelete:
 		t.httpobjdelete(w, r)
 	case http.MethodPost:
 		t.httpobjpost(w, r)
-	case http.MethodHead:
-		t.httpobjhead(w, r)
 	default:
 		cmn.InvalidHandlerWithMsg(w, r, "invalid method for /objects path")
 	}
@@ -436,6 +453,10 @@ func (t *targetrunner) ecHandler(w http.ResponseWriter, r *http.Request) {
 		cmn.InvalidHandlerWithMsg(w, r, "invalid method for /slices path")
 	}
 }
+
+///////////////////////
+// httpbck* handlers //
+///////////////////////
 
 // GET /v1/buckets/bucket-name
 func (t *targetrunner) httpbckget(w http.ResponseWriter, r *http.Request) {
@@ -461,252 +482,6 @@ func (t *targetrunner) httpbckget(w http.ResponseWriter, r *http.Request) {
 		}
 	default:
 		t.invalmsghdlrf(w, r, "Invalid route /buckets/%s", apiItems[0])
-	}
-}
-
-func (t *targetrunner) validRedirect(w http.ResponseWriter, r *http.Request, tag string,
-	tok bool) (tid, pid string, query url.Values) {
-	var (
-		smap = t.owner.smap.get()
-	)
-	query = r.URL.Query()
-	tid, pid = query.Get(cmn.URLParamTargetID), query.Get(cmn.URLParamProxyID)
-	if pid == "" {
-		if tid != "" && tok {
-			if smap.GetTarget(tid) != nil {
-				return
-			}
-			t.invalmsghdlrf(w, r, "%s: %q from unknown [%s], %s", t.si, tag, tid, smap)
-			tid = ""
-			return
-		}
-		tid = ""
-		t.invalmsghdlrf(w, r, "%s: %q is expected to be redirected", t.si, tag)
-		return
-	}
-	if smap.GetProxy(pid) == nil {
-		err := &errNodeNotFound{tag + " from unknown", pid, t.si, smap}
-		t.invalmsghdlr(w, r, err.Error())
-		pid = ""
-	}
-	return
-}
-
-// Returns a slice. Does not use GFN.
-func (t *targetrunner) httpecget(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := t.checkRESTItems(w, r, 3, false, cmn.Version, cmn.EC)
-	if err != nil {
-		return
-	}
-
-	if apiItems[0] == ec.URLMeta {
-		t.sendECMetafile(w, r, apiItems[1:])
-	} else if apiItems[0] == ec.URLCT {
-		t.sendECCT(w, r, apiItems[1:])
-	} else {
-		t.invalmsghdlrf(w, r, "invalid EC URL path %s", apiItems[0])
-	}
-}
-
-func (t *targetrunner) sendECCT(w http.ResponseWriter, r *http.Request, apiItems []string) {
-	var (
-		config = cmn.GCO.Get()
-	)
-	bucket, objName := apiItems[0], apiItems[1]
-	bck, err := newBckFromQuery(bucket, r.URL.Query())
-	if err != nil {
-		t.invalmsghdlr(w, r, err.Error(), http.StatusBadRequest)
-		return
-	}
-	lom := &cluster.LOM{T: t, ObjName: objName}
-	if err = lom.Init(bck.Bck, config); err != nil {
-		if _, ok := err.(*cmn.ErrorRemoteBucketDoesNotExist); ok {
-			t.BMDVersionFixup(r, cmn.Bck{}, true /* sleep */)
-			err = lom.Init(bck.Bck, config)
-		}
-		if err != nil {
-			t.invalmsghdlr(w, r, err.Error())
-			return
-		}
-	}
-	sliceFQN := lom.ParsedFQN.MpathInfo.MakePathFQN(bck.Bck, ec.SliceType, objName)
-	finfo, err := os.Stat(sliceFQN)
-	if err != nil {
-		t.invalmsghdlrsilent(w, r, err.Error(), http.StatusNotFound)
-		return
-	}
-	file, err := os.Open(sliceFQN)
-	if err != nil {
-		t.fshc(err, sliceFQN)
-		t.invalmsghdlr(w, r, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	buf, slab := t.gmm.Alloc(finfo.Size())
-	w.Header().Set("Content-Length", strconv.FormatInt(finfo.Size(), 10))
-	_, err = io.CopyBuffer(w, file, buf)
-	slab.Free(buf)
-	debug.AssertNoErr(file.Close())
-	if err != nil {
-		glog.Errorf("Failed to send slice %s/%s: %v", bck, objName, err)
-	}
-}
-
-// Returns a CT's metadata.
-func (t *targetrunner) sendECMetafile(w http.ResponseWriter, r *http.Request, apiItems []string) {
-	bucket, objName := apiItems[0], apiItems[1]
-	bck, err := newBckFromQuery(bucket, r.URL.Query())
-	if err != nil {
-		t.invalmsghdlrsilent(w, r, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if err = bck.Init(t.owner.bmd, t.si); err != nil {
-		if _, ok := err.(*cmn.ErrorRemoteBucketDoesNotExist); !ok { // is ais
-			t.invalmsghdlrsilent(w, r, err.Error())
-			return
-		}
-	}
-	md, err := ec.ObjectMetadata(bck, objName)
-	if err != nil {
-		if os.IsNotExist(err) {
-			t.invalmsghdlrsilent(w, r, err.Error(), http.StatusNotFound)
-		} else {
-			t.invalmsghdlrsilent(w, r, err.Error(), http.StatusInternalServerError)
-		}
-		return
-	}
-	w.Write(md.Marshal())
-}
-
-// GET /v1/objects/bucket[+"/"+objName]
-// Checks if the object exists locally (if not, downloads it) and sends it back
-// If the bucket is in the Cloud one and ValidateWarmGet is enabled there is an extra
-// check whether the object exists locally. Version is checked as well if configured.
-func (t *targetrunner) httpobjget(w http.ResponseWriter, r *http.Request) {
-	var (
-		config       = cmn.GCO.Get()
-		query        = r.URL.Query()
-		isGFNRequest = cmn.IsParseBool(query.Get(cmn.URLParamIsGFNRequest))
-	)
-	apiItems, err := t.checkRESTItems(w, r, 2, false, cmn.Version, cmn.Objects)
-	if err != nil {
-		return
-	}
-	bucket, objName := apiItems[0], apiItems[1]
-	started := time.Now()
-	if redirDelta := t.redirectLatency(started, query); redirDelta != 0 {
-		t.statsT.Add(stats.GetRedirLatency, redirDelta)
-	}
-	bck, err := newBckFromQuery(bucket, query)
-	if err != nil {
-		t.invalmsghdlr(w, r, err.Error(), http.StatusBadRequest)
-		return
-	}
-	lom := &cluster.LOM{T: t, ObjName: objName}
-	if err = lom.Init(bck.Bck, config); err != nil {
-		if _, ok := err.(*cmn.ErrorRemoteBucketDoesNotExist); ok {
-			t.BMDVersionFixup(r, cmn.Bck{}, true /* sleep */)
-			err = lom.Init(bck.Bck, config)
-		}
-		if err != nil {
-			t.invalmsghdlr(w, r, err.Error())
-			return
-		}
-	}
-	if cmn.IsETLRequest(query) {
-		t.doETL(w, r, query.Get(cmn.URLParamUUID), bck, objName)
-		return
-	}
-	goi := &getObjInfo{
-		started: started,
-		t:       t,
-		lom:     lom,
-		w:       w,
-		ctx:     context.Background(),
-		ranges:  cmn.RangesQuery{Range: r.Header.Get(cmn.HeaderRange), Size: 0},
-		isGFN:   isGFNRequest,
-		chunked: config.Net.HTTP.Chunked,
-	}
-	if err, errCode := goi.getObject(); err != nil {
-		if cmn.IsErrConnectionReset(err) {
-			glog.Errorf("GET %s: %v", lom, err)
-		} else {
-			t.invalmsghdlr(w, r, err.Error(), errCode)
-		}
-	}
-}
-
-// PUT /v1/objects/bucket-name/object-name
-func (t *targetrunner) httpobjput(w http.ResponseWriter, r *http.Request) {
-	var (
-		query    url.Values
-		tid, pid string
-	)
-	apiItems, err := t.checkRESTItems(w, r, 2, false, cmn.Version, cmn.Objects)
-	if err != nil {
-		return
-	}
-	bucket, objName := apiItems[0], apiItems[1]
-	started := time.Now()
-	if tid, pid, query = t.validRedirect(w, r, r.Method, true); tid == "" && pid == "" {
-		return
-	}
-	if pid != "" {
-		if redelta := t.redirectLatency(started, query); redelta != 0 {
-			t.statsT.Add(stats.PutRedirLatency, redelta)
-		}
-	}
-	config := cmn.GCO.Get()
-	if cs := fs.GetCapStatus(); cs.Err != nil {
-		go t.RunLRU("" /*uuid*/, false)
-		if cs.OOS {
-			t.invalmsghdlr(w, r, cs.Err.Error())
-			return
-		}
-	}
-	bck, err := newBckFromQuery(bucket, query)
-	if err != nil {
-		t.invalmsghdlr(w, r, err.Error(), http.StatusBadRequest)
-		return
-	}
-	lom := &cluster.LOM{T: t, ObjName: objName}
-	if err = lom.Init(bck.Bck, config); err != nil {
-		if _, ok := err.(*cmn.ErrorRemoteBucketDoesNotExist); ok {
-			t.BMDVersionFixup(r, cmn.Bck{}, true /* sleep */)
-			err = lom.Init(bck.Bck, config)
-		}
-		if err != nil {
-			t.invalmsghdlr(w, r, err.Error())
-			return
-		}
-	}
-	if lom.Bck().IsAIS() && lom.VerConf().Enabled {
-		lom.Load() // need to know the current version if versioning enabled
-	}
-	if objSrc, hasObjSrc := lom.GetCustomMD(cluster.SourceObjMD); hasObjSrc && objSrc != cluster.SourceWebObjMD {
-		bck := lom.Bck()
-		if bck.IsAIS() {
-			t.invalmsghdlr(w, r, "cannot override cloud-downloaded object")
-			return
-		}
-		if bck.CloudBck().Provider != objSrc {
-			t.invalmsghdlr(w, r, "cannot override cloud-downloaded object with an object from different cloud provider")
-			return
-		}
-	}
-	lom.SetAtimeUnix(started.UnixNano())
-	appendTy := query.Get(cmn.URLParamAppendType)
-	if appendTy == "" {
-		if err, errCode := t.doPut(r, lom, started); err != nil {
-			t.fshc(err, lom.FQN)
-			t.invalmsghdlr(w, r, err.Error(), errCode)
-		}
-	} else {
-		if handle, err, errCode := t.doAppend(r, lom, started); err != nil {
-			t.invalmsghdlr(w, r, err.Error(), errCode)
-		} else {
-			w.Header().Set(cmn.HeaderAppendHandle, handle)
-		}
 	}
 }
 
@@ -762,7 +537,7 @@ func (t *targetrunner) httpbckdelete(w http.ResponseWriter, r *http.Request) {
 			rangeMsg = &cmn.RangeMsg{}
 			listMsg  = &cmn.ListMsg{}
 		)
-		args := &xaction.DeletePrefetchArgs{
+		args := &registry.DeletePrefetchArgs{
 			Ctx:   context.Background(),
 			UUID:  msg.UUID,
 			Evict: msg.Action == cmn.ActEvictObjects,
@@ -775,58 +550,23 @@ func (t *targetrunner) httpbckdelete(w http.ResponseWriter, r *http.Request) {
 			t.invalmsghdlrf(w, r, "invalid %s action message: %s, %T", msg.Action, msg.Name, msg.Value)
 			return
 		}
-		xact, err := xaction.Registry.RenewEvictDelete(t, bck, args)
+		xact, err := registry.Registry.RenewEvictDelete(t, bck, args)
 		if err != nil {
 			t.invalmsghdlr(w, r, err.Error())
 			return
 		}
+
+		xact.AddNotif(&xaction.NotifXact{
+			NotifBase: nl.NotifBase{
+				When: cluster.UponTerm,
+				Dsts: []string{equalIC},
+				F:    t.callerNotifyFin,
+			},
+		})
 		go xact.Run()
 	default:
 		t.invalmsghdlrf(w, r, fmtUnknownAct, msg)
 	}
-}
-
-// DELETE [ { action } ] /v1/objects/bucket-name/object-name
-func (t *targetrunner) httpobjdelete(w http.ResponseWriter, r *http.Request) {
-	var (
-		msg   cmn.ActionMsg
-		evict bool
-		query = r.URL.Query()
-	)
-	apiItems, err := t.checkRESTItems(w, r, 2, false, cmn.Version, cmn.Objects)
-	if err != nil {
-		return
-	}
-	bucket, objName := apiItems[0], apiItems[1]
-	if err := cmn.ReadJSON(w, r, &msg, true /*optional=allow empty body*/); err != nil {
-		return
-	}
-	evict = msg.Action == cmn.ActEvictObjects
-
-	bck, err := newBckFromQuery(bucket, query)
-	if err != nil {
-		t.invalmsghdlr(w, r, err.Error(), http.StatusBadRequest)
-		return
-	}
-	lom := &cluster.LOM{T: t, ObjName: objName}
-	if err = lom.Init(bck.Bck); err != nil {
-		t.invalmsghdlr(w, r, err.Error())
-		return
-	}
-	err, errCode := t.objDelete(context.Background(), lom, evict)
-	if err != nil {
-		if errCode == http.StatusNotFound {
-			t.invalmsghdlrsilent(w, r,
-				fmt.Sprintf("object %s/%s doesn't exist", lom.Bck(), lom.ObjName),
-				http.StatusNotFound,
-			)
-		} else {
-			t.invalmsghdlrstatusf(w, r, errCode, "error deleting %s: %v", lom, err)
-		}
-		return
-	}
-	// EC cleanup if EC is enabled
-	ec.ECM.CleanupObject(lom)
 }
 
 // POST /v1/buckets/bucket-name
@@ -888,10 +628,9 @@ func (t *targetrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 		}
 		var (
 			err      error
-			xact     *xaction.Prefetch
 			rangeMsg = &cmn.RangeMsg{}
 			listMsg  = &cmn.ListMsg{}
-			args     = &xaction.DeletePrefetchArgs{Ctx: context.Background()}
+			args     = &registry.DeletePrefetchArgs{Ctx: context.Background()}
 		)
 		if err = cmn.MorphMarshal(msg.Value, &rangeMsg); err == nil {
 			args.RangeMsg = rangeMsg
@@ -902,11 +641,7 @@ func (t *targetrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		args.UUID = msg.UUID
-		xact, err = xaction.Registry.RenewPrefetch(t, bck, args)
-		if err != nil {
-			t.invalmsghdlr(w, r, err.Error())
-			return
-		}
+		xact := registry.Registry.RenewPrefetch(t, bck, args)
 		go xact.Run()
 	case cmn.ActListObjects:
 		// list the bucket and return
@@ -921,28 +656,12 @@ func (t *targetrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 			stats.NamedVal64{Name: stats.ListLatency, Value: int64(delta)},
 		)
 		if glog.FastV(4, glog.SmoduleAIS) {
-			glog.Infof("LIST: %s, %d µs", bucket, int64(delta/time.Microsecond))
+			glog.Infof("LIST: %s, %s", bucket, delta)
 		}
 	case cmn.ActSummaryBucket:
 		if !t.bucketSummary(w, r, bck, msg) {
 			return
 		}
-	default:
-		t.invalmsghdlrf(w, r, fmtUnknownAct, msg)
-	}
-}
-
-// POST /v1/objects/bucket-name/object-name
-func (t *targetrunner) httpobjpost(w http.ResponseWriter, r *http.Request) {
-	var msg cmn.ActionMsg
-	if cmn.ReadJSON(w, r, &msg) != nil {
-		return
-	}
-	switch msg.Action {
-	case cmn.ActRenameObject:
-		t.renameObject(w, r, &msg)
-	case cmn.ActPromote:
-		t.promoteFQN(w, r, &msg)
 	default:
 		t.invalmsghdlrf(w, r, fmtUnknownAct, msg)
 	}
@@ -954,6 +673,7 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 		bucketProps cmn.SimpleKVs
 		code        int
 		inBMD       = true
+		ctx         = context.Background()
 		hdr         = w.Header()
 		query       = r.URL.Query()
 	)
@@ -982,15 +702,24 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 		t.bucketPropsToHdr(bck, hdr)
 		return
 	}
+	if bck.IsHTTP() {
+		originalURL := query.Get(cmn.URLParamOrigURL)
+		ctx = context.WithValue(ctx, cmn.CtxOriginalURL, originalURL)
+		if !inBMD && originalURL == "" {
+			err = cmn.NewErrorRemoteBucketDoesNotExist(bck.Bck, t.si.String())
+			t.invalmsghdlrsilent(w, r, err.Error(), http.StatusNotFound)
+			return
+		}
+	}
 	// + cloud
-	bucketProps, err, code = t.Cloud(bck).HeadBucket(context.Background(), bck)
+	bucketProps, err, code = t.Cloud(bck).HeadBucket(ctx, bck)
 	if err != nil {
 		if !inBMD {
 			if code == http.StatusNotFound {
 				err = cmn.NewErrorRemoteBucketDoesNotExist(bck.Bck, t.si.String())
 				t.invalmsghdlrsilent(w, r, err.Error(), code)
 			} else {
-				err = fmt.Errorf("%s: bucket %s, err: %v", t.si, bucket, err)
+				err = fmt.Errorf("%s: bucket %s, err: %v", t.si, bck, err)
 				t.invalmsghdlr(w, r, err.Error(), code)
 			}
 			return
@@ -998,35 +727,309 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 		bucketProps = make(cmn.SimpleKVs)
 		glog.Warningf("%s: bucket %s, err: %v(%d)", t.si, bck, err, code)
 		bucketProps[cmn.HeaderCloudProvider] = bck.Provider
+		// TODO: what about `HTTP` cloud?
 		bucketProps[cmn.HeaderCloudOffline] = strconv.FormatBool(bck.IsCloud())
 		bucketProps[cmn.HeaderRemoteAisOffline] = strconv.FormatBool(bck.IsRemoteAIS())
 	}
 	for k, v := range bucketProps {
+		if k == cmn.HeaderBucketVerEnabled && bck.Props != nil {
+			if curr := strconv.FormatBool(bck.VersionConf().Enabled); curr != v {
+				// e.g., change via vendor-provided CLI and similar
+				glog.Errorf("%s: %s versioning got out of sync: %s != %s", t.si, bck, v, curr)
+			}
+		}
 		hdr.Set(k, v)
 	}
 	t.bucketPropsToHdr(bck, hdr)
 }
 
-// HEAD /v1/objects/bucket-name/object-name
-func (t *targetrunner) httpobjhead(w http.ResponseWriter, r *http.Request) {
-	var (
-		errCode        int
-		exists         bool
-		query          = r.URL.Query()
-		checkExists    = cmn.IsParseBool(query.Get(cmn.URLParamCheckExists))
-		checkExistsAny = cmn.IsParseBool(query.Get(cmn.URLParamCheckExistsAny))
-		// TODO: add cmn.URLParamHeadCloudAlways  - to always resync props from the Cloud
-		silent = cmn.IsParseBool(query.Get(cmn.URLParamSilent))
-	)
+///////////////////////
+// httpobj* handlers //
+///////////////////////
 
+// GET /v1/objects/<bucket-name>/<object-name>
+//
+// Initially validates if the request is internal request (either from proxy
+// or target) and calls getObject.
+//
+// Checks if the object exists locally (if not, downloads it) and sends it back
+// If the bucket is in the Cloud one and ValidateWarmGet is enabled there is an extra
+// check whether the object exists locally. Version is checked as well if configured.
+func (t *targetrunner) httpobjget(w http.ResponseWriter, r *http.Request) {
 	apiItems, err := t.checkRESTItems(w, r, 2, false, cmn.Version, cmn.Objects)
 	if err != nil {
 		return
 	}
+
 	var (
-		bucket, objName = apiItems[0], apiItems[1]
-		invalidHandler  = t.invalmsghdlr
-		hdr             = w.Header()
+		query    = r.URL.Query()
+		ptime    = isRedirect(query)
+		features = cmn.GCO.Get().Client.Features
+
+		bucket  = apiItems[0]
+		objName = apiItems[1]
+	)
+
+	if !isIntraCall(r.Header) && ptime == "" && !features.IsSet(cmn.FeatureDirectAccess) {
+		t.invalmsghdlrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
+			t.si, r.Method, r.RemoteAddr)
+		return
+	}
+
+	t.getObject(w, r, query, bucket, objName)
+}
+
+// getObject is main function to get the object. It doesn't check request origin,
+// so it must be done by the caller (if necessary).
+func (t *targetrunner) getObject(w http.ResponseWriter, r *http.Request, query url.Values, bucket, objName string) {
+	var (
+		ptime        = isRedirect(query)
+		config       = cmn.GCO.Get()
+		isGFNRequest = cmn.IsParseBool(query.Get(cmn.URLParamIsGFNRequest))
+		started      = time.Now()
+	)
+
+	// TODO: return TCP RST here and elsewhere
+
+	if ptime != "" {
+		if redelta := redirectLatency(started, ptime); redelta != 0 {
+			t.statsT.Add(stats.GetRedirLatency, redelta)
+		}
+	}
+	bck, err := newBckFromQuery(bucket, query)
+	if err != nil {
+		t.invalmsghdlr(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	lom := &cluster.LOM{T: t, ObjName: objName}
+	if err = lom.Init(bck.Bck, config); err != nil {
+		if _, ok := err.(*cmn.ErrorRemoteBucketDoesNotExist); ok {
+			t.BMDVersionFixup(r, cmn.Bck{}, true /* sleep */)
+			err = lom.Init(bck.Bck, config)
+		}
+		if err != nil {
+			t.invalmsghdlr(w, r, err.Error())
+			return
+		}
+	}
+
+	if isETLRequest(query) {
+		t.doETL(w, r, query.Get(cmn.URLParamUUID), bck, objName)
+		return
+	}
+	goi := &getObjInfo{
+		started: started,
+		t:       t,
+		lom:     lom,
+		w:       w,
+		ctx:     context.Background(),
+		ranges:  cmn.RangesQuery{Range: r.Header.Get(cmn.HeaderRange), Size: 0},
+		isGFN:   isGFNRequest,
+		chunked: config.Net.HTTP.Chunked,
+	}
+	if bck.IsHTTP() {
+		originalURL := query.Get(cmn.URLParamOrigURL)
+		goi.ctx = context.WithValue(goi.ctx, cmn.CtxOriginalURL, originalURL)
+	}
+	if err, errCode := goi.getObject(); err != nil {
+		if cmn.IsErrConnectionReset(err) {
+			glog.Errorf("GET %s: %v", lom, err)
+		} else {
+			t.invalmsghdlr(w, r, err.Error(), errCode)
+		}
+	}
+}
+
+// PUT /v1/objects/bucket-name/object-name
+func (t *targetrunner) httpobjput(w http.ResponseWriter, r *http.Request) {
+	var (
+		config = cmn.GCO.Get()
+		query  = r.URL.Query()
+		ptime  string
+	)
+	if ptime = isRedirect(query); ptime == "" && !isIntraPut(r.Header) {
+		// TODO: send TCP RST?
+		t.invalmsghdlrf(w, r, "%s: %s(obj) is expected to be redirected or replicated", t.si, r.Method)
+		return
+	}
+	apiItems, err := t.checkRESTItems(w, r, 2, false, cmn.Version, cmn.Objects)
+	if err != nil {
+		return
+	}
+	bucket, objName := apiItems[0], apiItems[1]
+
+	started := time.Now()
+	if ptime != "" {
+		if redelta := redirectLatency(started, ptime); redelta != 0 {
+			t.statsT.Add(stats.PutRedirLatency, redelta)
+		}
+	}
+	if cs := fs.GetCapStatus(); cs.Err != nil {
+		go t.RunLRU("" /*uuid*/, false)
+		if cs.OOS {
+			t.invalmsghdlr(w, r, cs.Err.Error())
+			return
+		}
+	}
+	bck, err := newBckFromQuery(bucket, query)
+	if err != nil {
+		t.invalmsghdlr(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	lom := &cluster.LOM{T: t, ObjName: objName}
+	if err = lom.Init(bck.Bck, config); err != nil {
+		if _, ok := err.(*cmn.ErrorRemoteBucketDoesNotExist); ok {
+			t.BMDVersionFixup(r, cmn.Bck{}, true /* sleep */)
+			err = lom.Init(bck.Bck, config)
+		}
+		if err != nil {
+			t.invalmsghdlr(w, r, err.Error())
+			return
+		}
+	}
+	if lom.Load() == nil { // if exists, check custom md
+		srcProvider, hasSrc := lom.GetCustomMD(cluster.SourceObjMD)
+		if hasSrc && srcProvider != cluster.SourceWebObjMD {
+			bck := lom.Bck()
+			if bck.IsAIS() {
+				t.invalmsghdlrf(w, r,
+					"bucket %s: cannot override %s-downloaded object", bck, srcProvider)
+				return
+			}
+			if b := bck.RemoteBck(); b != nil && b.Provider != srcProvider {
+				t.invalmsghdlrf(w, r,
+					"bucket %s: cannot override %s-downloaded object", b, srcProvider)
+				return
+			}
+		}
+	}
+	lom.SetAtimeUnix(started.UnixNano())
+	appendTy := query.Get(cmn.URLParamAppendType)
+	if appendTy == "" {
+		if err, errCode := t.doPut(r, lom, started); err != nil {
+			t.fshc(err, lom.FQN)
+			t.invalmsghdlr(w, r, err.Error(), errCode)
+		}
+	} else {
+		if handle, err, errCode := t.doAppend(r, lom, started); err != nil {
+			t.invalmsghdlr(w, r, err.Error(), errCode)
+		} else {
+			w.Header().Set(cmn.HeaderAppendHandle, handle)
+		}
+	}
+}
+
+// DELETE [ { action } ] /v1/objects/bucket-name/object-name
+func (t *targetrunner) httpobjdelete(w http.ResponseWriter, r *http.Request) {
+	var (
+		msg   cmn.ActionMsg
+		evict bool
+		query = r.URL.Query()
+	)
+	if isRedirect(query) == "" {
+		t.invalmsghdlrf(w, r, "%s: %s(obj) is expected to be redirected", t.si, r.Method)
+		return
+	}
+	apiItems, err := t.checkRESTItems(w, r, 2, false, cmn.Version, cmn.Objects)
+	if err != nil {
+		return
+	}
+	bucket, objName := apiItems[0], apiItems[1]
+	if err := cmn.ReadJSON(w, r, &msg, true /*optional=allow empty body*/); err != nil {
+		return
+	}
+	evict = msg.Action == cmn.ActEvictObjects
+
+	bck, err := newBckFromQuery(bucket, query)
+	if err != nil {
+		t.invalmsghdlr(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	lom := &cluster.LOM{T: t, ObjName: objName}
+	if err = lom.Init(bck.Bck); err != nil {
+		t.invalmsghdlr(w, r, err.Error())
+		return
+	}
+	err, errCode := t.DeleteObject(context.Background(), lom, evict)
+	if err != nil {
+		if errCode == http.StatusNotFound {
+			t.invalmsghdlrsilent(w, r,
+				fmt.Sprintf("object %s/%s doesn't exist", lom.Bck(), lom.ObjName),
+				http.StatusNotFound,
+			)
+		} else {
+			t.invalmsghdlr(w, r, err.Error(), errCode)
+		}
+		return
+	}
+	// EC cleanup if EC is enabled
+	ec.ECM.CleanupObject(lom)
+}
+
+// POST /v1/objects/bucket-name/object-name
+func (t *targetrunner) httpobjpost(w http.ResponseWriter, r *http.Request) {
+	var (
+		msg   cmn.ActionMsg
+		query = r.URL.Query()
+	)
+	if cmn.ReadJSON(w, r, &msg) != nil {
+		return
+	}
+	switch msg.Action {
+	case cmn.ActRenameObject:
+		if isRedirect(query) == "" {
+			t.invalmsghdlrf(w, r, "%s: %s-%s(obj) is expected to be redirected", t.si, r.Method, msg.Action)
+			return
+		}
+		t.renameObject(w, r, &msg)
+	case cmn.ActPromote:
+		if isRedirect(query) == "" && !isIntraCall(r.Header) {
+			t.invalmsghdlrf(w, r, "%s: %s-%s(obj) is expected to be redirected or intra-called",
+				t.si, r.Method, msg.Action)
+			return
+		}
+		t.promoteFQN(w, r, &msg)
+	default:
+		t.invalmsghdlrf(w, r, fmtUnknownAct, msg)
+	}
+}
+
+// HEAD /v1/objects/<bucket-name>/<object-name>
+//
+// Initially validates if the request is internal request (either from proxy
+// or target) and calls headObject.
+func (t *targetrunner) httpobjhead(w http.ResponseWriter, r *http.Request) {
+	var (
+		features = cmn.GCO.Get().Client.Features
+		query    = r.URL.Query()
+	)
+	if isRedirect(query) == "" && !isIntraCall(r.Header) && !features.IsSet(cmn.FeatureDirectAccess) {
+		t.invalmsghdlrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
+			t.si, r.Method, r.RemoteAddr)
+		return
+	}
+	apiItems, err := t.checkRESTItems(w, r, 2, false, cmn.Version, cmn.Objects)
+	if err != nil {
+		return
+	}
+
+	var (
+		bucket  = apiItems[0]
+		objName = apiItems[1]
+	)
+
+	t.headObject(w, r, query, bucket, objName)
+}
+
+// headObject is main function to head the object. It doesn't check request origin,
+// so it must be done by the caller (if necessary).
+func (t *targetrunner) headObject(w http.ResponseWriter, r *http.Request, query url.Values, bucket, objName string) {
+	var (
+		invalidHandler = t.invalmsghdlr
+		hdr            = w.Header()
+		checkExists    = cmn.IsParseBool(query.Get(cmn.URLParamCheckExists))
+		checkExistsAny = cmn.IsParseBool(query.Get(cmn.URLParamCheckExistsAny))
+		silent         = cmn.IsParseBool(query.Get(cmn.URLParamSilent))
 	)
 	if silent {
 		invalidHandler = t.invalmsghdlrsilent
@@ -1056,7 +1059,7 @@ func (t *targetrunner) httpobjhead(w http.ResponseWriter, r *http.Request) {
 		glog.Infof("%s %s <= %s", r.Method, lom, pid)
 	}
 
-	exists = err == nil
+	exists := err == nil
 
 	// * checkExists and checkExistsAny establish local presence of the object by looking up all mountpaths
 	// * checkExistsAny does it *even* if the object *may* not have local copies
@@ -1070,19 +1073,20 @@ func (t *targetrunner) httpobjhead(w http.ResponseWriter, r *http.Request) {
 
 	if checkExists || checkExistsAny {
 		if !exists {
-			invalidHandler(w, r, fmt.Sprintf("%s/%s %s", bucket, objName, cmn.DoesNotExist), http.StatusNotFound)
+			invalidHandler(w, r, fmt.Sprintf("%s/%s %s", bucket, objName, cmn.DoesNotExist),
+				http.StatusNotFound)
 		}
 		return
 	}
 	if lom.Bck().IsAIS() || exists { // && !lom.VerConf().Enabled) {
 		if !exists {
-			invalidHandler(w, r, fmt.Sprintf("%s/%s %s", bucket, objName, cmn.DoesNotExist), http.StatusNotFound)
+			invalidHandler(w, r, fmt.Sprintf("%s/%s %s", bucket, objName, cmn.DoesNotExist),
+				http.StatusNotFound)
 			return
 		}
-		lom.PopulateHdr(hdr)
+		lom.ToHTTPHdr(hdr)
 	} else {
-		var objMeta cmn.SimpleKVs
-		objMeta, err, errCode = t.Cloud(lom.Bck()).HeadObj(context.Background(), lom)
+		objMeta, err, errCode := t.Cloud(lom.Bck()).HeadObj(context.Background(), lom)
 		if err != nil {
 			errMsg := fmt.Sprintf("%s: HEAD request failed, err: %v", lom, err)
 			invalidHandler(w, r, errMsg, errCode)
@@ -1114,7 +1118,7 @@ func (t *targetrunner) httpobjhead(w http.ResponseWriter, r *http.Request) {
 	})
 	cmn.AssertNoErr(err)
 
-	if cmn.IsETLRequest(query) {
+	if isETLRequest(query) {
 		// We don't know neither length of on-the-fly transformed object, nor checksum.
 		hdr.Del(cmn.HeaderContentLength)
 		hdr.Del(cmn.GetPropsChecksum)
@@ -1123,8 +1127,96 @@ func (t *targetrunner) httpobjhead(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+//////////////////////
+// httpec* handlers //
+//////////////////////
+
+// Returns a slice. Does not use GFN.
+func (t *targetrunner) httpecget(w http.ResponseWriter, r *http.Request) {
+	apiItems, err := t.checkRESTItems(w, r, 3, false, cmn.Version, cmn.EC)
+	if err != nil {
+		return
+	}
+
+	if apiItems[0] == ec.URLMeta {
+		t.sendECMetafile(w, r, apiItems[1:])
+	} else if apiItems[0] == ec.URLCT {
+		t.sendECCT(w, r, apiItems[1:])
+	} else {
+		t.invalmsghdlrf(w, r, "invalid EC URL path %s", apiItems[0])
+	}
+}
+
+// Returns a CT's metadata.
+func (t *targetrunner) sendECMetafile(w http.ResponseWriter, r *http.Request, apiItems []string) {
+	bucket, objName := apiItems[0], apiItems[1]
+	bck, err := newBckFromQuery(bucket, r.URL.Query())
+	if err != nil {
+		t.invalmsghdlrsilent(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err = bck.Init(t.owner.bmd, t.si); err != nil {
+		if _, ok := err.(*cmn.ErrorRemoteBucketDoesNotExist); !ok { // is ais
+			t.invalmsghdlrsilent(w, r, err.Error())
+			return
+		}
+	}
+	md, err := ec.ObjectMetadata(bck, objName)
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.invalmsghdlrsilent(w, r, err.Error(), http.StatusNotFound)
+		} else {
+			t.invalmsghdlrsilent(w, r, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	w.Write(md.Marshal())
+}
+
+func (t *targetrunner) sendECCT(w http.ResponseWriter, r *http.Request, apiItems []string) {
+	config := cmn.GCO.Get()
+	bucket, objName := apiItems[0], apiItems[1]
+	bck, err := newBckFromQuery(bucket, r.URL.Query())
+	if err != nil {
+		t.invalmsghdlr(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	lom := &cluster.LOM{T: t, ObjName: objName}
+	if err = lom.Init(bck.Bck, config); err != nil {
+		if _, ok := err.(*cmn.ErrorRemoteBucketDoesNotExist); ok {
+			t.BMDVersionFixup(r, cmn.Bck{}, true /* sleep */)
+			err = lom.Init(bck.Bck, config)
+		}
+		if err != nil {
+			t.invalmsghdlr(w, r, err.Error())
+			return
+		}
+	}
+	sliceFQN := lom.ParsedFQN.MpathInfo.MakePathFQN(bck.Bck, ec.SliceType, objName)
+	finfo, err := os.Stat(sliceFQN)
+	if err != nil {
+		t.invalmsghdlrsilent(w, r, err.Error(), http.StatusNotFound)
+		return
+	}
+	file, err := os.Open(sliceFQN)
+	if err != nil {
+		t.fshc(err, sliceFQN)
+		t.invalmsghdlr(w, r, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	buf, slab := t.gmm.Alloc(finfo.Size())
+	w.Header().Set("Content-Length", strconv.FormatInt(finfo.Size(), 10))
+	_, err = io.CopyBuffer(w, file, buf)
+	slab.Free(buf)
+	cmn.Close(file)
+	if err != nil {
+		glog.Errorf("Failed to send slice %s/%s: %v", bck, objName, err)
+	}
+}
+
 //
-// supporting methods and misc
+// supporting methods
 //
 
 // checkCloudVersion returns (vchanged=) true if object versions differ between Cloud and local cache;
@@ -1152,10 +1244,7 @@ func (t *targetrunner) listBuckets(w http.ResponseWriter, r *http.Request, query
 		err         error
 		config      = cmn.GCO.Get()
 	)
-	// cmn.AnyCloud translates as any (one!) *3rd party* Cloud
-	if query.Provider == cmn.AnyCloud {
-		query.Provider = config.Cloud.Provider
-	}
+
 	if query.Provider != "" {
 		bucketNames, err, code = t._listBcks(query, config)
 		if err != nil {
@@ -1168,10 +1257,10 @@ func (t *targetrunner) listBuckets(w http.ResponseWriter, r *http.Request, query
 			query.Provider = provider
 			buckets, err, code = t._listBcks(query, config)
 			if err != nil {
-				glog.Errorf("failed to list buckets for %q, err: %v (status: %d)", query, err, code)
-			} else {
-				bucketNames = append(bucketNames, buckets...)
+				t.invalmsghdlrstatusf(w, r, code, "failed to list buckets for %q, err: %v", query, err)
+				return
 			}
+			bucketNames = append(bucketNames, buckets...)
 		}
 	}
 	sort.Sort(bucketNames)
@@ -1180,7 +1269,7 @@ func (t *targetrunner) listBuckets(w http.ResponseWriter, r *http.Request, query
 
 func (t *targetrunner) _listBcks(query cmn.QueryBcks, cfg *cmn.Config) (names cmn.BucketNames, err error, c int) {
 	// 3rd party cloud or remote ais
-	if query.Provider == cfg.Cloud.Provider || query.IsRemoteAIS() {
+	if _, ok := cfg.Cloud.Providers[query.Provider]; ok || query.IsRemoteAIS() {
 		bck := cluster.NewBck("", query.Provider, query.Ns)
 		names, err, c = t.Cloud(bck).ListBuckets(context.Background(), query)
 		sort.Sort(names)
@@ -1225,7 +1314,7 @@ func (t *targetrunner) doAppend(r *http.Request, lom *cluster.LOM, started time.
 
 // PUT new version and update object metadata
 // ais bucket:
-//  - if bucket versioning is enabled, the version is autoincremented
+//  - if ais bucket versioning is enabled, the version is auto-incremented
 // Cloud bucket:
 //  - returned version ID is the version
 // In both cases, new checksum is also generated and stored along with the new version.
@@ -1236,7 +1325,7 @@ func (t *targetrunner) doPut(r *http.Request, lom *cluster.LOM, started time.Tim
 		cksumValue = header.Get(cmn.HeaderObjCksumVal)
 		recvType   = r.URL.Query().Get(cmn.URLParamRecvType)
 	)
-	lom.ParseHdr(header) // TODO: check that values parsed here are not coming from the user
+	lom.FromHTTPHdr(header) // TODO: check that values parsed here are not coming from the user
 	poi := &putObjInfo{
 		started:      started,
 		t:            t,
@@ -1277,12 +1366,12 @@ func (t *targetrunner) putMirror(lom *cluster.LOM) {
 		return
 	}
 	for i := 0; i < retries; i++ {
-		xputlrep := xaction.Registry.RenewPutMirror(lom)
+		xputlrep := registry.Registry.RenewPutMirror(lom)
 		if xputlrep == nil {
 			return
 		}
-		err = xputlrep.Repl(lom)
-		if cmn.IsErrXactExpired(err) {
+		err = xputlrep.(*mirror.XactPut).Repl(lom)
+		if xaction.IsErrXactExpired(err) {
 			break
 		}
 		// retry upon race vs (just finished/timed_out)
@@ -1292,7 +1381,7 @@ func (t *targetrunner) putMirror(lom *cluster.LOM) {
 	}
 }
 
-func (t *targetrunner) objDelete(ctx context.Context, lom *cluster.LOM, evict bool) (error, int) {
+func (t *targetrunner) DeleteObject(ctx context.Context, lom *cluster.LOM, evict bool) (error, int) {
 	var (
 		cloudErr     error
 		cloudErrCode int
@@ -1337,7 +1426,7 @@ func (t *targetrunner) objDelete(ctx context.Context, lom *cluster.LOM, evict bo
 		}
 	}
 	if cloudErr != nil {
-		return fmt.Errorf("failed to delete from cloud: %w", cloudErr), cloudErrCode
+		return cloudErr, cloudErrCode
 	}
 	return errRet, 0
 }
@@ -1346,6 +1435,7 @@ func (t *targetrunner) objDelete(ctx context.Context, lom *cluster.LOM, evict bo
 // RENAME OBJECT //
 ///////////////////
 
+// TODO: unify with PromoteFile (refactor)
 func (t *targetrunner) renameObject(w http.ResponseWriter, r *http.Request, msg *cmn.ActionMsg) {
 	apiItems, err := t.checkRESTItems(w, r, 2, false, cmn.Version, cmn.Objects)
 	if err != nil {
@@ -1363,17 +1453,24 @@ func (t *targetrunner) renameObject(w http.ResponseWriter, r *http.Request, msg 
 		return
 	}
 	if lom.Bck().IsRemote() {
-		t.invalmsghdlrf(w, r, "%s: cannot rename object from remote bucket", lom)
+		t.invalmsghdlrf(w, r, "%s: cannot rename object %s from a remote bucket", t.si, lom)
 		return
 	}
 	if lom.Bck().Props.EC.Enabled {
-		t.invalmsghdlrf(w, r, "%s: cannot rename erasure-coded object", lom)
+		t.invalmsghdlrf(w, r, "%s: cannot rename erasure-coded object %s", t.si, lom)
 		return
 	}
-
 	buf, slab := t.gmm.Alloc()
-	ri := &replicInfo{smap: t.owner.smap.get(), t: t, bckTo: lom.Bck(), buf: buf, localOnly: false, finalize: true}
-	copied, err := ri.copyObject(lom, msg.Name /* new object name */)
+	coi := &copyObjInfo{
+		CopyObjectParams: cluster.CopyObjectParams{
+			BckTo: lom.Bck(),
+			Buf:   buf,
+		},
+		t:         t,
+		localOnly: false,
+		finalize:  true,
+	}
+	copied, err := coi.copyObject(lom, msg.Name /* new object name */)
 	slab.Free(buf)
 	if err != nil {
 		t.invalmsghdlr(w, r, err.Error())
@@ -1382,7 +1479,7 @@ func (t *targetrunner) renameObject(w http.ResponseWriter, r *http.Request, msg 
 	if copied {
 		lom.Lock(true)
 		if err = lom.Remove(); err != nil {
-			t.invalmsghdlr(w, r, err.Error())
+			glog.Warningf("%s: failed to delete renamed object source %s: %v", t.si, lom, err)
 		}
 		lom.Unlock(true)
 	}
@@ -1400,13 +1497,13 @@ func (t *targetrunner) promoteFQN(w http.ResponseWriter, r *http.Request, msg *c
 	}
 	bucket := apiItems[0]
 
-	params := cmn.ActValPromote{}
-	if err := cmn.MorphMarshal(msg.Value, &params); err != nil {
+	promoteArgs := cmn.ActValPromote{}
+	if err := cmn.MorphMarshal(msg.Value, &promoteArgs); err != nil {
 		return
 	}
 
-	if params.Target != "" && params.Target != t.si.ID() {
-		glog.Errorf("%s: unexpected target ID %s mismatch", t.si, params.Target)
+	if promoteArgs.Target != "" && promoteArgs.Target != t.si.ID() {
+		glog.Errorf("%s: unexpected target ID %s mismatch", t.si, promoteArgs.Target)
 	}
 
 	// 2. init & validate
@@ -1439,11 +1536,10 @@ func (t *targetrunner) promoteFQN(w http.ResponseWriter, r *http.Request, msg *c
 
 	// 3a. promote dir
 	if finfo.IsDir() {
-		if params.Verbose {
-			glog.Infof("%s: promote %+v", t.si, params)
+		if promoteArgs.Verbose {
+			glog.Infof("%s: promote %+v", t.si, promoteArgs)
 		}
-		var xact *mirror.XactDirPromote
-		xact, err = xaction.Registry.RenewDirPromote(srcFQN, bck, t, &params)
+		xact, err := registry.Registry.RenewDirPromote(t, bck, srcFQN, &promoteArgs)
 		if err != nil {
 			t.invalmsghdlr(w, r, err.Error())
 			return
@@ -1452,40 +1548,22 @@ func (t *targetrunner) promoteFQN(w http.ResponseWriter, r *http.Request, msg *c
 		return
 	}
 	// 3b. promote file
-	objName := params.ObjName
-	if objName == "" {
-		objName = filepath.Base(srcFQN)
+	objName := promoteArgs.ObjName
+	if objName == "" || objName[len(objName)-1] == os.PathSeparator {
+		objName += filepath.Base(srcFQN)
 	}
-	if _, err = t.PromoteFile(srcFQN, bck, objName, nil, /*expectedCksum*/
-		params.Overwrite, true /*safe*/, params.Verbose); err != nil {
+	params := cluster.PromoteFileParams{
+		SrcFQN:    srcFQN,
+		Bck:       bck,
+		ObjName:   objName,
+		Overwrite: promoteArgs.Overwrite,
+		KeepOrig:  promoteArgs.KeepOrig,
+		Verbose:   promoteArgs.Verbose,
+	}
+	if _, err = t.PromoteFile(params); err != nil {
 		t.invalmsghdlrf(w, r, fmtErr+" %s", t.si, msg.Action, err.Error())
 	}
 	// TODO: inc stats
-}
-
-//====================== common for both cold GET and PUT ======================================
-//
-// on err: closes and removes the file; otherwise closes and returns the size;
-// empty omd5 or oxxhash: not considered an exception even when the configuration says otherwise;
-// xxhash is always preferred over md5
-//
-//==============================================================================================
-
-func (t *targetrunner) redirectLatency(started time.Time, query url.Values) (redelta int64) {
-	s := query.Get(cmn.URLParamUnixTime)
-	if s == "" {
-		return
-	}
-	pts, err := cmn.S2UnixNano(s)
-	if err != nil {
-		glog.Errorf("unexpected: failed to convert %s to int, err: %v", s, err)
-		return
-	}
-	redelta = started.UnixNano() - pts
-	if redelta < 0 && -redelta < int64(clusterClockDrift) {
-		redelta = 0
-	}
-	return
 }
 
 // fshc wakes up FSHC and makes it to run filesystem check immediately if err != nil
@@ -1507,6 +1585,16 @@ func (t *targetrunner) fshc(err error, filepath string) {
 	getfshealthchecker().OnErr(filepath)
 }
 
-func (t *targetrunner) K8sNodeName() string {
-	return t.k8sNode
+func (t *targetrunner) runResilver(id string, skipGlobMisplaced bool, notifs ...cluster.Notif) {
+	if id == "" {
+		id = cmn.GenUUID()
+		regMsg := xactRegMsg{UUID: id, Kind: cmn.ActResilver, Srcs: []string{t.si.ID()}}
+		msg := t.newAisMsg(&cmn.ActionMsg{Action: cmn.ActRegGlobalXaction, Value: regMsg}, nil, nil)
+		t.bcastToIC(msg, false /*wait*/)
+	}
+	t.rebManager.RunResilver(id, skipGlobMisplaced, notifs...)
+}
+
+func (t *targetrunner) AbortAllXacts(tys ...string) {
+	registry.Registry.AbortAll(tys...)
 }

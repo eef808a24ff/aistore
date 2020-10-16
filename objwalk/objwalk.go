@@ -43,7 +43,7 @@ func (w *Walk) DefaultLocalObjPage(msg *cmn.SelectMsg) (*cmn.BucketList, error) 
 
 	msg.UUID = cmn.GenUUID()
 	xact := query.NewObjectsListing(w.ctx, w.t, q, msg)
-	go xact.Start()
+	go xact.Run()
 
 	cmn.Assert(!xact.TokenUnsatisfiable(msg.ContinuationToken))
 	return LocalObjPage(xact, msg.PageSize)
@@ -53,9 +53,7 @@ func (w *Walk) DefaultLocalObjPage(msg *cmn.SelectMsg) (*cmn.BucketList, error) 
 // bucket based on query.ObjectsListingXact. The bucket can be local or cloud one. In latter case the
 // function returns the list of cloud objects cached locally
 func LocalObjPage(xact *query.ObjectsListingXact, objectsCnt uint) (*cmn.BucketList, error) {
-	var (
-		err error
-	)
+	var err error
 
 	entries, err := xact.NextN(objectsCnt)
 	list := &cmn.BucketList{Entries: entries}
@@ -88,7 +86,7 @@ func (w *Walk) CloudObjPage() (*cmn.BucketList, error) {
 		config          = cmn.GCO.Get()
 		localURL        = w.t.Snode().URL(cmn.NetworkPublic)
 		localID         = w.t.Snode().ID()
-		smap            = w.t.GetSowner().Get()
+		smap            = w.t.Sowner().Get()
 		postCallback, _ = w.ctx.Value(walkinfo.CtxPostCallbackKey).(walkinfo.PostCallbackFunc)
 
 		needURL     = w.msg.WantProp(cmn.GetTargetURL)

@@ -53,24 +53,6 @@ var (
 // - mountpaths of the form <filesystem-mountpoint>/a/b/c are supported.
 
 type (
-	MPI          map[string]*MountpathInfo
-	PathRunGroup interface {
-		Reg(r PathRunner)
-		Unreg(r PathRunner)
-	}
-	// As a rule, running xactions are aborted and restarted on any mountpath change.
-	// But for a few xactions it can be too harsh. E.g, aborting and restarting
-	// `download` xaction results in waste of time and network traffic to
-	// redownload objects. These xactions should subscribe to mountpath changes
-	// as a `PathRunner`s to `PathRunGroup` events and adapt on the fly.
-	PathRunner interface {
-		cmn.Runner
-		Name() string
-		ReqAddMountpath(mpath string)
-		ReqRemoveMountpath(mpath string)
-		ReqEnableMountpath(mpath string)
-		ReqDisableMountpath(mpath string)
-	}
 	MountpathInfo struct {
 		Path       string // Cleaned OrigPath
 		OrigPath   string // As entered by the user, must be used for logging / returning errors
@@ -85,6 +67,8 @@ type (
 		cmu      sync.RWMutex
 		capacity Capacity
 	}
+	MPI map[string]*MountpathInfo
+
 	Capacity struct {
 		Used    uint64 `json:"used,string"`  // bytes
 		Avail   uint64 `json:"avail,string"` // ditto
@@ -125,16 +109,7 @@ type (
 		Err        error
 		OOS        bool
 	}
-	ChangeReq struct {
-		Action string // MountPath action enum (above)
-		Path   string // path
-	}
 )
-
-func MountpathAdd(p string) ChangeReq { return ChangeReq{Action: AddMpath, Path: p} }
-func MountpathRem(p string) ChangeReq { return ChangeReq{Action: RemoveMpath, Path: p} }
-func MountpathEnb(p string) ChangeReq { return ChangeReq{Action: EnableMpath, Path: p} }
-func MountpathDis(p string) ChangeReq { return ChangeReq{Action: DisableMpath, Path: p} }
 
 ///////////////////
 // MountpathInfo //
@@ -440,13 +415,16 @@ func LoadBalanceGET(objFQN, objMpath string, copies MPI) (fqn string) {
 func GetMpathUtil(mpath string, nowTs int64) int64 {
 	return mfs.ios.GetMpathUtil(mpath, nowTs)
 }
+
 func GetAllMpathUtils(nowTs int64) (utils map[string]int64) {
 	utils, _ = mfs.ios.GetAllMpathUtils(nowTs)
 	return
 }
+
 func LogAppend(lines []string) []string {
 	return mfs.ios.LogAppend(lines)
 }
+
 func GetSelectedDiskStats() (m map[string]*ios.SelectedDiskStats) {
 	return mfs.ios.GetSelectedDiskStats()
 }

@@ -45,8 +45,6 @@ var (
 	numops                 int
 	numfiles               int
 	numworkers             int
-	numtarget              int
-	numproxy               int
 	match                  = ".*"
 	pagesize               uint
 	fnlen                  int
@@ -60,7 +58,7 @@ var (
 	cycles                 int
 	prefixFileNumber       int
 
-	clibucket string
+	cliBck cmn.Bck
 )
 
 // nolint:maligned // no performance critical code
@@ -445,7 +443,7 @@ func (m *ioContext) ensureNumCopies(expectedCopies int) {
 	)
 	time.Sleep(time.Second)
 	xactArgs := api.XactReqArgs{Kind: cmn.ActMakeNCopies, Bck: m.bck, Timeout: rebalanceTimeout}
-	err := api.WaitForXaction(baseParams, xactArgs)
+	_, err := api.WaitForXaction(baseParams, xactArgs)
 	tassert.CheckFatal(m.t, err)
 
 	// List Bucket - primarily for the copies
@@ -483,6 +481,18 @@ func (m *ioContext) ensureNoErrors() {
 	if m.numGetErrs.Load() > 0 {
 		m.t.Fatalf("Number of get errors is non-zero: %d\n", m.numGetErrs.Load())
 	}
+}
+
+func (m *ioContext) unregisterTarget() *cluster.Snode {
+	target := tutils.ExtractTargetNodes(m.smap)[0]
+	tutils.Logf("Unregister target: %s\n", target.URL(cmn.NetworkPublic))
+	err := tutils.UnregisterNode(m.proxyURL, target.ID())
+	tassert.CheckFatal(m.t, err)
+	n := len(tutils.GetClusterMap(m.t, m.proxyURL).Tmap)
+	if n != m.originalTargetCount-1 {
+		m.t.Fatalf("%d targets expected after unregister, actually %d targets", m.originalTargetCount-1, n)
+	}
+	return target
 }
 
 func (m *ioContext) reregisterTarget(target *cluster.Snode) {
@@ -554,7 +564,7 @@ func runProviderTests(t *testing.T, f func(*testing.T, *cluster.Bck)) {
 		},
 		{
 			name: "cloud",
-			bck:  cmn.Bck{Name: clibucket, Provider: cmn.AnyCloud},
+			bck:  cliBck,
 			skipArgs: tutils.SkipTestArgs{
 				Long:  true,
 				Cloud: true,
@@ -562,8 +572,10 @@ func runProviderTests(t *testing.T, f func(*testing.T, *cluster.Bck)) {
 		},
 		{
 			name: "remote",
-			bck: cmn.Bck{Name: cmn.RandString(10),
-				Provider: cmn.ProviderAIS, Ns: cmn.Ns{UUID: tutils.RemoteCluster.UUID}},
+			bck: cmn.Bck{
+				Name:     cmn.RandString(10),
+				Provider: cmn.ProviderAIS, Ns: cmn.Ns{UUID: tutils.RemoteCluster.UUID},
+			},
 			skipArgs: tutils.SkipTestArgs{
 				RequiresRemote: true,
 			},
@@ -571,7 +583,7 @@ func runProviderTests(t *testing.T, f func(*testing.T, *cluster.Bck)) {
 		{
 			name:       "backend",
 			bck:        cmn.Bck{Name: cmn.RandString(10), Provider: cmn.ProviderAIS},
-			backendBck: cmn.Bck{Name: clibucket, Provider: cmn.AnyCloud},
+			backendBck: cliBck,
 			skipArgs: tutils.SkipTestArgs{
 				Long:  true,
 				Cloud: true,
@@ -715,7 +727,7 @@ func prefixLookupDefault(t *testing.T, proxyURL string, bck cmn.Bck, fileNames [
 	for i := 0; i < len(letters); i++ {
 		key := letters[i : i+1]
 		lookFor := fmt.Sprintf("%s/%s", prefixDir, key)
-		var msg = &cmn.SelectMsg{Prefix: lookFor}
+		msg := &cmn.SelectMsg{Prefix: lookFor}
 		objList, err := api.ListObjects(baseParams, bck, msg, 0)
 		if err != nil {
 			t.Errorf("List files with prefix failed, err = %v", err)
@@ -752,13 +764,11 @@ func prefixLookupCornerCases(t *testing.T, proxyURL string, bck cmn.Bck) {
 		{"dir1", "dir1", 2},
 		{"dir1/", "dir1/", 2},
 	}
-	var (
-		baseParams = tutils.BaseAPIParams(proxyURL)
-	)
+	baseParams := tutils.BaseAPIParams(proxyURL)
 	for idx, test := range tests {
 		p := fmt.Sprintf("%s/%s", prefixDir, test.prefix)
 		tutils.Logf("%d. Prefix: %s [%s]\n", idx, test.title, p)
-		var msg = &cmn.SelectMsg{Prefix: p}
+		msg := &cmn.SelectMsg{Prefix: p}
 		objList, err := api.ListObjects(baseParams, bck, msg, 0)
 		if err != nil {
 			t.Errorf("List files with prefix failed, err = %v", err)

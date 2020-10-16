@@ -8,22 +8,30 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
+	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/ais/cloud"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/dbdriver"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/lru"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 //
@@ -33,27 +41,30 @@ import (
 var _ cluster.Target = &targetrunner{}
 
 func (t *targetrunner) FSHC(err error, path string) { t.fshc(err, path) }
-func (t *targetrunner) GetMMSA() *memsys.MMSA       { return t.gmm }
-func (t *targetrunner) GetSmallMMSA() *memsys.MMSA  { return t.smm }
-func (t *targetrunner) GetFSPRG() fs.PathRunGroup   { return &t.fsprg }
-func (t *targetrunner) GetDB() dbdriver.Driver      { return t.dbDriver }
+func (t *targetrunner) MMSA() *memsys.MMSA          { return t.gmm }
+func (t *targetrunner) SmallMMSA() *memsys.MMSA     { return t.smm }
+func (t *targetrunner) DB() dbdriver.Driver         { return t.dbDriver }
 
 func (t *targetrunner) Cloud(bck *cluster.Bck) cluster.CloudProvider {
 	if bck.Bck.IsRemoteAIS() {
-		return t.cloud.ais
+		return t.cloud[cmn.ProviderAIS]
 	}
+	if bck.Bck.IsHTTP() {
+		return t.cloud[cmn.ProviderHTTP]
+	}
+	providerName := bck.Provider
 	if bck.Props != nil {
-		if t.cloud.ext.Provider() == bck.CloudBck().Provider {
-			return t.cloud.ext
-		}
-
-		c, _ := cloud.NewDummyCloud(t)
-		return c
+		// TODO: simplify logic
+		providerName = bck.RemoteBck().Provider
 	}
-	return t.cloud.ext
+	if ext, ok := t.cloud[providerName]; ok {
+		return ext
+	}
+	c, _ := cloud.NewDummyCloud(t)
+	return c
 }
 
-func (t *targetrunner) GetGFN(gfnType cluster.GFNType) cluster.GFN {
+func (t *targetrunner) GFN(gfnType cluster.GFNType) cluster.GFN {
 	switch gfnType {
 	case cluster.GFNLocal:
 		return &t.gfn.local
@@ -67,19 +78,35 @@ func (t *targetrunner) GetGFN(gfnType cluster.GFNType) cluster.GFN {
 // gets triggered by the stats evaluation of a remaining capacity
 // and then runs in a goroutine - see stats package, target_stats.go
 func (t *targetrunner) RunLRU(id string, force bool, bcks ...cmn.Bck) {
-	xlru := xaction.Registry.RenewLRU(id)
+	regToIC := id == ""
+	if regToIC {
+		id = cmn.GenUUID()
+	}
+
+	xlru := registry.Registry.RenewLRU(id)
 	if xlru == nil {
 		return
 	}
+
+	if regToIC && xlru.ID().String() == id {
+		regMsg := xactRegMsg{UUID: id, Kind: cmn.ActLRU, Srcs: []string{t.si.ID()}}
+		msg := t.newAisMsg(&cmn.ActionMsg{Action: cmn.ActRegGlobalXaction, Value: regMsg}, nil, nil)
+		t.bcastToIC(msg, false /*wait*/)
+	}
+
 	ini := lru.InitLRU{
 		T:                   t,
-		Xaction:             xlru,
+		Xaction:             xlru.(*lru.Xaction),
 		StatsT:              t.statsT,
 		Force:               force,
 		Buckets:             bcks,
 		GetFSUsedPercentage: ios.GetFSUsedPercentage,
 		GetFSStats:          ios.GetFSStats,
 	}
+
+	xlru.AddNotif(&xaction.NotifXact{
+		NotifBase: nl.NotifBase{When: cluster.UponTerm, Dsts: []string{equalIC}, F: t.callerNotifyFin},
+	})
 	lru.Run(&ini) // blocking
 
 	xlru.Finish()
@@ -99,10 +126,10 @@ func (t *targetrunner) GetObject(w io.Writer, lom *cluster.LOM, started time.Tim
 }
 
 // slight variation vs t.doPut() above
-func (t *targetrunner) PutObject(params cluster.PutObjectParams) error {
+func (t *targetrunner) PutObject(lom *cluster.LOM, params cluster.PutObjectParams) error {
 	poi := &putObjInfo{
 		t:       t,
-		lom:     params.LOM,
+		lom:     lom,
 		r:       params.Reader,
 		workFQN: params.WorkFQN,
 		ctx:     context.Background(),
@@ -125,23 +152,164 @@ func (t *targetrunner) PutObject(params cluster.PutObjectParams) error {
 	return err
 }
 
-func (t *targetrunner) EvictObject(lom *cluster.LOM) error {
-	ctx := context.Background()
-	err, _ := t.objDelete(ctx, lom, true /*evict*/)
+// Send params.Reader to a given target directly.
+// `params.HdrMeta` should be populated with content length, checksum, version, atime.
+// `params.Reader` is closed always, even on errors.
+func (t *targetrunner) sendTo(lom *cluster.LOM, params cluster.SendToParams) error {
+	debug.Assert(!t.Snode().Equals(params.Tsi))
+	cmn.Assert(params.HdrMeta != nil)
+	cmn.Assert(params.HdrMeta.Size() >= 0)
+
+	if params.DM != nil {
+		return _sendObjDM(lom, params)
+	}
+	err := t._sendPUT(params)
+	if params.Locked {
+		lom.Unlock(false)
+	}
 	return err
 }
 
-func (t *targetrunner) CopyObject(lom *cluster.LOM, bckTo *cluster.Bck, buf []byte, localOnly bool) (copied bool, err error) {
-	ri := &replicInfo{smap: t.owner.smap.get(),
-		bckTo:     bckTo,
-		t:         t,
-		buf:       buf,
-		localOnly: localOnly,
-		uncache:   false,
-		finalize:  false,
+//
+// streaming send/receive via bundle.DataMover
+//
+
+// _sendObjDM requires params.HdrMeta not to be nil. Even though it uses
+// transport the whole function is synchronous as callers expect that the reader
+// will be sent when function finishes.
+func _sendObjDM(lom *cluster.LOM, params cluster.SendToParams) error {
+	cmn.Assert(params.HdrMeta != nil)
+	var (
+		wg  = &sync.WaitGroup{}
+		hdr = transport.ObjHdr{}
+		cb  = func(_ transport.ObjHdr, _ io.ReadCloser, lomptr unsafe.Pointer, err error) {
+			lom = (*cluster.LOM)(lomptr)
+			if params.Locked {
+				lom.Unlock(false)
+			}
+			if err != nil {
+				glog.Errorf("failed to send %s => %s @ %s, err: %v", lom, params.BckTo, params.Tsi, err)
+			}
+			wg.Done()
+		}
+	)
+
+	wg.Add(1)
+
+	hdr.FromHdrProvider(params.HdrMeta, params.ObjNameTo, params.BckTo.Bck, nil)
+	o := &transport.Obj{Hdr: hdr, Callback: cb, CmplPtr: unsafe.Pointer(lom)}
+	if err := params.DM.Send(o, params.Reader, params.Tsi); err != nil {
+		if params.Locked {
+			lom.Unlock(false)
+		}
+		glog.Error(err)
+		return err
 	}
-	copied, err = ri.copyObject(lom, lom.ObjName)
-	return
+	wg.Wait()
+	return nil
+}
+
+func (t *targetrunner) _recvObjDM(w http.ResponseWriter, hdr transport.ObjHdr, objReader io.Reader, err error) {
+	if err != nil {
+		glog.Error(err)
+		return
+	}
+	defer cmn.DrainReader(objReader)
+	lom := &cluster.LOM{T: t, ObjName: hdr.ObjName}
+	if err := lom.Init(hdr.Bck); err != nil {
+		glog.Error(err)
+		return
+	}
+	lom.SetAtimeUnix(hdr.ObjAttrs.Atime)
+	lom.SetVersion(hdr.ObjAttrs.Version)
+
+	params := cluster.PutObjectParams{
+		Reader:       ioutil.NopCloser(objReader),
+		WorkFQN:      fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfilePut),
+		RecvType:     cluster.Migrated,
+		Cksum:        cmn.NewCksum(hdr.ObjAttrs.CksumType, hdr.ObjAttrs.CksumValue),
+		Started:      time.Now(),
+		WithFinalize: true,
+	}
+	if err := t.PutObject(lom, params); err != nil {
+		glog.Error(err)
+	}
+}
+
+// _sendPUT requires params.HdrMeta not to be nil.
+func (t *targetrunner) _sendPUT(params cluster.SendToParams) error {
+	cmn.Assert(params.HdrMeta != nil)
+	var (
+		query = cmn.AddBckToQuery(nil, params.BckTo.Bck)
+		hdr   = cmn.ToHTTPHdr(params.HdrMeta)
+	)
+
+	hdr.Set(cmn.HeaderPutterID, t.si.ID())
+	query.Add(cmn.URLParamRecvType, strconv.Itoa(int(cluster.Migrated)))
+	reqArgs := cmn.ReqArgs{
+		Method: http.MethodPut,
+		Base:   params.Tsi.URL(cmn.NetworkIntraData),
+		Path:   cmn.JoinWords(cmn.Version, cmn.Objects, params.BckTo.Name, params.ObjNameTo),
+		Query:  query,
+		Header: hdr,
+		BodyR:  params.Reader,
+	}
+	req, _, cancel, err := reqArgs.ReqWithTimeout(cmn.GCO.Get().Timeout.SendFile)
+	if err != nil {
+		errc := params.Reader.Close()
+		debug.AssertNoErr(errc)
+		err = fmt.Errorf("unexpected failure to create request, err: %w", err)
+		return err
+	}
+	defer cancel()
+	resp, err := t.httpclientGetPut.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to PUT to %s, err: %w", reqArgs.URL(), err)
+	}
+	if resp != nil && resp.Body != nil {
+		errc := resp.Body.Close()
+		debug.AssertNoErr(errc)
+	}
+	return nil
+}
+
+func (t *targetrunner) EvictObject(lom *cluster.LOM) error {
+	ctx := context.Background()
+	err, _ := t.DeleteObject(ctx, lom, true /*evict*/)
+	return err
+}
+
+// CopyObject creates a replica of an object (the `lom` argument) in accordance with the
+// `params` specification.  The destination _may_ have a different name and be located
+// in a different bucket.
+// There are a few possible scenarios:
+// - if both src and dst LOMs are from local buckets the copying then takes place between AIS targets
+//   (of this same cluster);
+// - if the src is located in a cloud bucket, we always first make sure it is also present in
+//   the AIS cluster (by performing a cold GET if need be).
+// - if the dst is cloud, we perform a regular PUT logic thus also making sure that the new
+//   replica gets created in the cloud bucket of _this_ AIS cluster.
+func (t *targetrunner) CopyObject(lom *cluster.LOM, params cluster.CopyObjectParams, localOnly bool) (copied bool, size int64, err error) {
+	var (
+		coi = &copyObjInfo{
+			CopyObjectParams: params,
+			t:                t,
+			uncache:          false,
+			finalize:         false,
+			localOnly:        localOnly,
+		}
+
+		objNameTo = lom.ObjName
+	)
+	if params.ObjNameTo != "" {
+		objNameTo = params.ObjNameTo
+	}
+	if params.DP != nil {
+		return coi.copyReader(lom, objNameTo)
+	}
+
+	copied, err = coi.copyObject(lom, objNameTo)
+	return copied, lom.Size(), err
 }
 
 // FIXME: recomputes checksum if called with a bad one (optimize)
@@ -154,12 +322,10 @@ func (t *targetrunner) GetCold(ctx context.Context, lom *cluster.LOM, prefetch b
 	} else {
 		lom.Lock(true) // one cold-GET at a time
 	}
-	var (
-		workFQN = fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfileColdget)
-	)
+	workFQN := fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfileColdget)
 	if err, errCode = t.Cloud(lom.Bck()).GetObj(ctx, workFQN, lom); err != nil {
 		lom.Unlock(true)
-		err = fmt.Errorf("%s: GET failed %d, err: %v", lom, errCode, err)
+		glog.Errorf("%s: GET failed %d, err: %v", lom, errCode, err)
 		return
 	}
 	defer func() {
@@ -194,10 +360,10 @@ func (t *targetrunner) GetCold(ctx context.Context, lom *cluster.LOM, prefetch b
 	return
 }
 
-func (t *targetrunner) PromoteFile(srcFQN string, bck *cluster.Bck, objName string,
-	computedCksum *cmn.Cksum, overwrite, safe, verbose bool) (nlom *cluster.LOM, err error) {
-	lom := &cluster.LOM{T: t, ObjName: objName}
-	if err = lom.Init(bck.Bck); err != nil {
+// TODO: unify with ActRenameObject (refactor)
+func (t *targetrunner) PromoteFile(params cluster.PromoteFileParams) (nlom *cluster.LOM, err error) {
+	lom := &cluster.LOM{T: t, ObjName: params.ObjName}
+	if err = lom.Init(params.Bck.Bck); err != nil {
 		return
 	}
 	// local or remote?
@@ -208,33 +374,33 @@ func (t *targetrunner) PromoteFile(srcFQN string, bck *cluster.Bck, objName stri
 	if si, err = cluster.HrwTarget(lom.Uname(), &smap.Smap); err != nil {
 		return
 	}
-	// remote
+	// remote; TODO: handle overwrite (lookup first)
 	if si.ID() != t.si.ID() {
-		if verbose {
-			glog.Infof("promote/PUT %s => %s @ %s", srcFQN, lom, si.ID())
+		if params.Verbose {
+			glog.Infof("promote/PUT %s => %s @ %s", params.SrcFQN, lom, si.ID())
 		}
-		buf, slab := t.gmm.Alloc()
-		lom.FQN = srcFQN
-		ri := &replicInfo{smap: smap, t: t, bckTo: lom.Bck(), buf: buf, localOnly: false}
-
-		// TODO -- FIXME: handle overwrite (lookup first)
-		_, err = ri.putRemote(lom, lom.ObjName, si)
-		slab.Free(buf)
+		lom.FQN = params.SrcFQN
+		var (
+			coi        = &copyObjInfo{t: t}
+			sendParams = cluster.SendToParams{ObjNameTo: lom.ObjName, Tsi: si}
+		)
+		coi.BckTo = lom.Bck()
+		_, _, err = coi.putRemote(lom, sendParams)
 		return
 	}
 
 	// local
 	err = lom.Load(false)
-	if err == nil && !overwrite {
+	if err == nil && !params.Overwrite {
 		err = fmt.Errorf("%s already exists", lom)
 		return
 	}
-	if verbose {
+	if params.Verbose {
 		s := ""
-		if overwrite {
+		if params.Overwrite {
 			s = "+"
 		}
-		glog.Infof("promote%s %s => %s", s, srcFQN, lom)
+		glog.Infof("promote%s %s => %s", s, params.SrcFQN, lom)
 	}
 	var (
 		cksum   *cmn.CksumHash
@@ -244,38 +410,38 @@ func (t *targetrunner) PromoteFile(srcFQN string, bck *cluster.Bck, objName stri
 		poi     = &putObjInfo{t: t, lom: lom}
 		conf    = lom.CksumConf()
 	)
-	if safe {
+	if params.KeepOrig {
 		workFQN = fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfilePut)
 
 		buf, slab := t.gmm.Alloc()
-		written, cksum, err = cmn.CopyFile(srcFQN, workFQN, buf, conf.Type)
+		written, cksum, err = cmn.CopyFile(params.SrcFQN, workFQN, buf, conf.Type)
 		slab.Free(buf)
 		if err != nil {
 			return
 		}
 		lom.SetCksum(cksum.Clone())
 	} else {
-		workFQN = srcFQN // use the file as it would be intermediate (work) file
-		fi, err = os.Stat(srcFQN)
+		workFQN = params.SrcFQN // use the file as it would be intermediate (work) file
+		fi, err = os.Stat(params.SrcFQN)
 		if err != nil {
 			return
 		}
 		written = fi.Size()
 
-		if computedCksum != nil {
+		if params.Cksum != nil {
 			// Checksum already computed somewhere else.
-			lom.SetCksum(computedCksum)
+			lom.SetCksum(params.Cksum)
 		} else {
-			clone := lom.Clone(srcFQN)
+			clone := lom.Clone(params.SrcFQN)
 			if cksum, err = clone.ComputeCksum(); err != nil {
 				return
 			}
 			lom.SetCksum(cksum.Clone())
 		}
 	}
-	if computedCksum != nil && cksum != nil {
-		if !cksum.Equal(computedCksum) {
-			err = cmn.NewBadDataCksumError(cksum.Clone(), computedCksum, srcFQN+" => "+lom.String())
+	if params.Cksum != nil && cksum != nil {
+		if !cksum.Equal(params.Cksum) {
+			err = cmn.NewBadDataCksumError(cksum.Clone(), params.Cksum, params.SrcFQN+" => "+lom.String())
 			return
 		}
 	}
@@ -302,16 +468,13 @@ func (t *targetrunner) DisableMountpath(mountpath, reason string) (disabled bool
 func (t *targetrunner) RebalanceNamespace(si *cluster.Snode) ([]byte, int, error) {
 	// pull the data
 	query := url.Values{}
-	header := make(http.Header)
-	header.Set(cmn.HeaderCallerID, t.si.ID())
 	query.Add(cmn.URLParamRebData, "true")
 	args := callArgs{
 		si: si,
 		req: cmn.ReqArgs{
 			Method: http.MethodGet,
-			Header: header,
 			Base:   si.URL(cmn.NetworkIntraData),
-			Path:   cmn.URLPath(cmn.Version, cmn.Rebalance),
+			Path:   cmn.JoinWords(cmn.Version, cmn.Rebalance),
 			Query:  query,
 		},
 		timeout: cmn.DefaultTimeout,

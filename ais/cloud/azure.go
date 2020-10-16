@@ -53,9 +53,7 @@ const (
 	leaseTime = 60
 )
 
-var (
-	_ cluster.CloudProvider = &azureProvider{}
-)
+var _ cluster.CloudProvider = &azureProvider{}
 
 func azureProto() string {
 	proto := os.Getenv(azureProtoEnvVar)
@@ -125,7 +123,7 @@ func NewAzure(t cluster.Target) (cluster.CloudProvider, error) {
 	key := azureUserKey()
 	creds, err := azblob.NewSharedKeyCredential(name, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to init credentials", err)
+		return nil, fmt.Errorf("failed to init credentials %v", err)
 	}
 	p := azblob.NewPipeline(creds, azblob.PipelineOptions{})
 	return &azureProvider{
@@ -136,14 +134,14 @@ func NewAzure(t cluster.Target) (cluster.CloudProvider, error) {
 	}, nil
 }
 
-func (ap *azureProvider) azureErrorToAISError(azureError error, bck cmn.Bck, objName string) (error, int) {
+func (ap *azureProvider) azureErrorToAISError(azureError error, bck *cmn.Bck, objName string) (error, int) {
 	stgErr, ok := azureError.(azblob.StorageError)
 	if !ok {
 		return azureError, http.StatusInternalServerError
 	}
 	switch stgErr.ServiceCode() {
 	case azblob.ServiceCodeContainerNotFound:
-		return cmn.NewErrorRemoteBucketDoesNotExist(bck, ap.t.Snode().Name()), http.StatusNotFound
+		return cmn.NewErrorRemoteBucketDoesNotExist(*bck, ap.t.Snode().Name()), http.StatusNotFound
 	case azblob.ServiceCodeBlobNotFound:
 		msg := fmt.Sprintf("%s/%s not found", bck, objName)
 		return &cmn.HTTPError{Status: http.StatusNotFound, Message: msg}, http.StatusNotFound
@@ -151,8 +149,10 @@ func (ap *azureProvider) azureErrorToAISError(azureError error, bck cmn.Bck, obj
 		msg := fmt.Sprintf("%s/%s not found", bck, objName)
 		return &cmn.HTTPError{Status: http.StatusNotFound, Message: msg}, http.StatusNotFound
 	default:
-		if stgErr.Response() != nil {
-			return azureError, stgErr.Response().StatusCode
+		resp := stgErr.Response()
+		if resp != nil {
+			resp.Body.Close()
+			return azureError, resp.StatusCode
 		}
 		return azureError, http.StatusInternalServerError
 	}
@@ -172,13 +172,13 @@ func (ap *azureProvider) ListBuckets(ctx context.Context, _ cmn.QueryBcks) (buck
 	for marker.NotDone() {
 		containers, err = ap.s.ListContainersSegment(ctx, marker, o)
 		if err != nil {
-			err, errCode = ap.azureErrorToAISError(err, cmn.Bck{Provider: cmn.ProviderAzure}, "")
+			err, errCode = ap.azureErrorToAISError(err, &cmn.Bck{Provider: cmn.ProviderAzure}, "")
 			return
 		}
 
-		for _, container := range containers.ContainerItems {
+		for idx := range containers.ContainerItems {
 			buckets = append(buckets, cmn.Bck{
-				Name:     container.Name,
+				Name:     containers.ContainerItems[idx].Name,
 				Provider: cmn.ProviderAzure,
 			})
 		}
@@ -191,7 +191,7 @@ func (ap *azureProvider) ListBuckets(ctx context.Context, _ cmn.QueryBcks) (buck
 // an object beforehand and releasing the lease after
 func (ap *azureProvider) DeleteObj(ctx context.Context, lom *cluster.LOM) (error, int) {
 	var (
-		cloudBck = lom.Bck().CloudBck()
+		cloudBck = lom.Bck().RemoteBck()
 		cntURL   = ap.s.NewContainerURL(lom.BckName())
 		blobURL  = cntURL.NewBlobURL(lom.ObjName)
 		cond     = azblob.ModifiedAccessConditions{}
@@ -222,7 +222,7 @@ func (ap *azureProvider) DeleteObj(ctx context.Context, lom *cluster.LOM) (error
 func (ap *azureProvider) HeadBucket(ctx context.Context, bck *cluster.Bck) (bucketProps cmn.SimpleKVs, err error, errCode int) {
 	var (
 		bckProps = make(cmn.SimpleKVs, 2)
-		cloudBck = bck.CloudBck()
+		cloudBck = bck.RemoteBck()
 		cntURL   = ap.s.NewContainerURL(cloudBck.Name)
 	)
 	resp, err := cntURL.GetProperties(ctx, azblob.LeaseAccessConditions{})
@@ -243,7 +243,7 @@ func (ap *azureProvider) ListObjects(ctx context.Context, bck *cluster.Bck, msg 
 
 	var (
 		h        = cmn.CloudHelpers.Azure
-		cloudBck = bck.CloudBck()
+		cloudBck = bck.RemoteBck()
 		cntURL   = ap.s.NewContainerURL(cloudBck.Name)
 		marker   = azblob.Marker{}
 		opts     = azblob.ListBlobsSegmentOptions{
@@ -267,8 +267,11 @@ func (ap *azureProvider) ListObjects(ctx context.Context, bck *cluster.Bck, msg 
 		return nil, fmt.Errorf("failed to list objects %q", cloudBck.Name), resp.StatusCode()
 	}
 	bckList = &cmn.BucketList{Entries: make([]*cmn.BucketEntry, 0, len(resp.Segment.BlobItems))}
-	for _, blob := range resp.Segment.BlobItems {
-		entry := &cmn.BucketEntry{Name: blob.Name}
+	for idx := range resp.Segment.BlobItems {
+		var (
+			blob  = &resp.Segment.BlobItems[idx]
+			entry = &cmn.BucketEntry{Name: blob.Name}
+		)
 		if blob.Properties.ContentLength != nil && msg.WantProp(cmn.GetPropsSize) {
 			entry.Size = *blob.Properties.ContentLength
 		}
@@ -298,7 +301,7 @@ func (ap *azureProvider) HeadObj(ctx context.Context, lom *cluster.LOM) (objMeta
 	objMeta = make(cmn.SimpleKVs)
 	var (
 		h        = cmn.CloudHelpers.Azure
-		cloudBck = lom.Bck().CloudBck()
+		cloudBck = lom.Bck().RemoteBck()
 		cntURL   = ap.s.NewContainerURL(cloudBck.Name)
 		blobURL  = cntURL.NewBlobURL(lom.ObjName)
 	)
@@ -327,9 +330,32 @@ func (ap *azureProvider) HeadObj(ctx context.Context, lom *cluster.LOM) (objMeta
 }
 
 func (ap *azureProvider) GetObj(ctx context.Context, workFQN string, lom *cluster.LOM) (err error, errCode int) {
+	reader, cksumToCheck, err, errCode := ap.GetObjReader(ctx, lom)
+	if err != nil {
+		return err, errCode
+	}
+	params := cluster.PutObjectParams{
+		Reader:       reader,
+		WorkFQN:      workFQN,
+		RecvType:     cluster.ColdGet,
+		Cksum:        cksumToCheck,
+		WithFinalize: false,
+	}
+	err = ap.t.PutObject(lom, params)
+	if err != nil {
+		return
+	}
+	if glog.FastV(4, glog.SmoduleAIS) {
+		glog.Infof("[get_object] %s", lom)
+	}
+	return
+}
+
+func (ap *azureProvider) GetObjReader(ctx context.Context, lom *cluster.LOM) (reader io.ReadCloser,
+	expectedCksm *cmn.Cksum, err error, errCode int) {
 	var (
 		h        = cmn.CloudHelpers.Azure
-		cloudBck = lom.Bck().CloudBck()
+		cloudBck = lom.Bck().RemoteBck()
 		cntURL   = ap.s.NewContainerURL(cloudBck.Name)
 		blobURL  = cntURL.NewBlobURL(lom.ObjName)
 	)
@@ -338,18 +364,19 @@ func (ap *azureProvider) GetObj(ctx context.Context, workFQN string, lom *cluste
 	respProps, err := blobURL.GetProperties(ctx, azblob.BlobAccessConditions{})
 	if err != nil {
 		err, status := ap.azureErrorToAISError(err, cloudBck, lom.ObjName)
-		return err, status
+		return nil, nil, err, status
 	}
 	if respProps.StatusCode() >= http.StatusBadRequest {
-		return fmt.Errorf("failed to get object props %s/%s", cloudBck, lom.ObjName), respProps.StatusCode()
+		return nil, nil, fmt.Errorf("failed to get object props %s/%s", cloudBck, lom.ObjName), respProps.StatusCode()
 	}
 	// 0, 0 = read range: the whole object
 	resp, err := blobURL.Download(ctx, 0, 0, azblob.BlobAccessConditions{}, false)
 	if err != nil {
-		return ap.azureErrorToAISError(err, cloudBck, lom.ObjName)
+		err, errCode = ap.azureErrorToAISError(err, cloudBck, lom.ObjName)
+		return nil, nil, err, errCode
 	}
 	if resp.StatusCode() >= http.StatusBadRequest {
-		return fmt.Errorf("failed to GET object %s/%s", cloudBck, lom.ObjName), resp.StatusCode()
+		return nil, nil, fmt.Errorf("failed to GET object %s/%s", cloudBck, lom.ObjName), resp.StatusCode()
 	}
 
 	var (
@@ -370,28 +397,15 @@ func (ap *azureProvider) GetObj(ctx context.Context, workFQN string, lom *cluste
 
 	lom.SetCustomMD(customMD)
 	setSize(ctx, resp.ContentLength())
-	err = ap.t.PutObject(cluster.PutObjectParams{
-		LOM:          lom,
-		Reader:       wrapReader(ctx, resp.Body(retryOpts)),
-		WorkFQN:      workFQN,
-		RecvType:     cluster.ColdGet,
-		Cksum:        cksumToCheck,
-		WithFinalize: false,
-	})
-	if err != nil {
-		return
-	}
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[get_object] %s", lom)
-	}
-	return
+
+	return wrapReader(ctx, resp.Body(retryOpts)), cksumToCheck, nil, 0
 }
 
 func (ap *azureProvider) PutObj(ctx context.Context, r io.Reader, lom *cluster.LOM) (version string, err error, errCode int) {
 	var (
 		leaseID  string
 		h        = cmn.CloudHelpers.Azure
-		cloudBck = lom.Bck().CloudBck()
+		cloudBck = lom.Bck().RemoteBck()
 		cntURL   = ap.s.NewContainerURL(cloudBck.Name)
 		blobURL  = cntURL.NewBlockBlobURL(lom.ObjName)
 		cond     = azblob.ModifiedAccessConditions{}
@@ -423,8 +437,10 @@ func (ap *azureProvider) PutObj(ctx context.Context, r io.Reader, lom *cluster.L
 		err, status := ap.azureErrorToAISError(err, cloudBck, lom.ObjName)
 		return "", err, status
 	}
-	if putResp.Response().StatusCode >= http.StatusBadRequest {
-		return "", fmt.Errorf("failed to put object %s/%s", cloudBck, lom.ObjName), putResp.Response().StatusCode
+	resp := putResp.Response()
+	resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", fmt.Errorf("failed to put object %s/%s", cloudBck, lom.ObjName), resp.StatusCode
 	}
 	if v, ok := h.EncodeVersion(string(putResp.ETag())); ok {
 		version = v

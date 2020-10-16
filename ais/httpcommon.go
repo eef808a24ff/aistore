@@ -33,7 +33,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/stats"
-	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 	"github.com/OneOfOne/xxhash"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/tinylib/msgp/msgp"
@@ -65,16 +65,16 @@ type (
 
 	// bcastArgs contains arguments for an intra-cluster broadcast call.
 	bcastArgs struct {
-		req     cmn.ReqArgs
-		network string // on of the cmn.KnownNetworks
-		timeout time.Duration
-		// Function that returns fresh value that needs to be unmarshalled.
-		// See: `callArgs.v` field.
-		fv func() interface{}
-
-		nodes []cluster.NodeMap
-		smap  *smapX
-		to    int
+		req               cmn.ReqArgs        // http args
+		network           string             // one of the cmn.KnownNetworks
+		timeout           time.Duration      // timeout
+		fv                func() interface{} // optional; returns value to be unmarshalled (see `callArgs.v`)
+		nodes             []cluster.NodeMap  // broadcast destinations
+		skipNodes         cmn.StringSet      // destination IDs to skip
+		smap              *smapX             // Smap to use
+		to                int                // enumerated alternative to nodes (above)
+		nodeCount         int                // greater or equal destination count
+		ignoreMaintenance bool               // do not skip nodes under maintenance
 	}
 
 	networkHandler struct {
@@ -262,9 +262,6 @@ func (server *netServer) listenAndServe(addr string, logger *log.Logger) error {
 	// waste time by getting and reading global configuration, string
 	// comparison and branching
 	var httpHandler http.Handler = server.mux
-	if config.Net.HTTP.RevProxy == cmn.RevProxyCloud {
-		httpHandler = server
-	}
 	server.s = &http.Server{
 		Addr:     addr,
 		Handler:  httpHandler,
@@ -320,8 +317,8 @@ func (server *netServer) shutdown() {
 ////////////////
 
 func (h *httprunner) Snode() *cluster.Snode      { return h.si }
-func (h *httprunner) GetBowner() cluster.Bowner  { return h.owner.bmd }
-func (h *httprunner) GetSowner() cluster.Sowner  { return h.owner.smap }
+func (h *httprunner) Bowner() cluster.Bowner     { return h.owner.bmd }
+func (h *httprunner) Sowner() cluster.Sowner     { return h.owner.smap }
 func (h *httprunner) ClusterStarted() bool       { return h.startup.cluster.Load() }
 func (h *httprunner) NodeStarted() bool          { return !h.startup.node.time.Load().IsZero() }
 func (h *httprunner) NodeStartedTime() time.Time { return h.startup.node.time.Load() }
@@ -338,7 +335,7 @@ func (h *httprunner) registerNetworkHandlers(networkHandlers []networkHandler) {
 		if nh.r[0] == '/' { // Check if it's an absolute path.
 			path = nh.r
 		} else {
-			path = cmn.URLPath(cmn.Version, nh.r)
+			path = cmn.JoinWords(cmn.Version, nh.r)
 		}
 		if cmn.StringInSlice(cmn.NetworkPublic, nh.net) {
 			h.registerPublicNetHandler(path, nh.h)
@@ -525,8 +522,9 @@ func mustDiffer(ip1 net.IP, port1 int, use1 bool, ip2 net.IP, port2 int, use2 bo
 // - the latter for, possibly, legitimate reasons (K8s, etc.)
 func (h *httprunner) checkPresenceNetChange(smap *smapX) error {
 	var (
-		snode   *cluster.Snode
-		changed bool
+		jsonCompat = jsoniter.ConfigCompatibleWithStandardLibrary
+		snode      *cluster.Snode
+		changed    bool
 	)
 	if h.si.IsTarget() {
 		snode = smap.GetTarget(h.si.ID())
@@ -703,7 +701,8 @@ func (h *httprunner) call(args callArgs) (res callResult) {
 
 	resp, res.err = client.Do(req)
 	if res.err != nil {
-		res.details = fmt.Sprintf("Failed to HTTP-call %s (%s %s): err %v", sid, args.req.Method, args.req.URL(), res.err)
+		res.details = fmt.Sprintf("Failed to HTTP-call %s (%s %s): err %v",
+			sid, args.req.Method, args.req.URL(), res.err)
 		return
 	}
 	defer resp.Body.Close()
@@ -754,40 +753,51 @@ func (h *httprunner) call(args callArgs) (res callResult) {
 // intra-cluster IPC, control plane: notify another node
 //
 
-func (h *httprunner) notify(snodes cluster.NodeMap, msgBody []byte) {
-	var (
-		path = cmn.URLPath(cmn.Version, cmn.Notifs)
-	)
-
+func (h *httprunner) notify(snodes cluster.NodeMap, msgBody []byte, kind string) {
+	path := cmn.JoinWords(cmn.Version, cmn.Notifs, kind)
 	args := bcastArgs{
-		req:     cmn.ReqArgs{Method: http.MethodPost, Path: path, Body: msgBody},
-		network: cmn.NetworkIntraControl,
-		timeout: cmn.DefaultTimeout,
-		nodes:   []cluster.NodeMap{snodes},
+		req:       cmn.ReqArgs{Method: http.MethodPost, Path: path, Body: msgBody},
+		network:   cmn.NetworkIntraControl,
+		timeout:   cmn.DefaultTimeout,
+		nodes:     []cluster.NodeMap{snodes},
+		nodeCount: len(snodes),
 	}
-	_ = h.bcastToNodes(args)
+	h.bcastToNodesAsync(&args)
 }
 
-func (h *httprunner) xactCallerNotify(n cmn.Notif, err error) {
-	var (
-		smap  = h.owner.smap.get()
-		msg   = notifMsg{Ty: int32(n.Category()), Snode: h.si}
-		notif = n.(*cmn.NotifXact)
-	)
+func (h *httprunner) callerNotifyFin(n cluster.Notif, err error) {
+	h.callerNotify(n, err, cmn.Finished)
+}
+
+func (h *httprunner) callerNotifyProgress(n cluster.Notif) {
+	h.callerNotify(n, nil, cmn.Progress)
+}
+
+func (h *httprunner) callerNotify(n cluster.Notif, err error, kind string) {
+	cmn.Assert(kind == cmn.Progress || kind == cmn.Finished)
+	msg := n.ToNotifMsg()
 	if err != nil {
 		msg.ErrMsg = err.Error()
 	}
-	msg.Data = cmn.MustMarshal(notif.Xact.Stats())
+	msg.NodeID = h.si.ID()
+	nodes := h.notifDst(n)
+	h.notify(nodes, cmn.MustMarshal(&msg), kind)
+}
 
-	nodes := make(cluster.NodeMap)
-	for _, dst := range notif.Dsts {
+// TODO: optimize avoid allocating a new NodeMap
+func (h *httprunner) notifDst(notif cluster.Notif) cluster.NodeMap {
+	var (
+		smap  = h.owner.smap.get()
+		nodes = make(cluster.NodeMap)
+	)
+	for _, dst := range notif.Subscribers() {
 		if dst == equalIC {
-			for si := range smap.IC {
-				if si != h.si.ID() {
-					nodes.Add(smap.GetProxy(si))
+			for pid, psi := range smap.Pmap {
+				if psi.IsIC() && pid != h.si.ID() {
+					nodes.Add(psi)
 				}
 			}
-			debug.Assert(len(notif.Dsts) == 1)
+			debug.Assert(len(notif.Subscribers()) == 1)
 			break
 		} else if si := smap.GetNode(dst); si != nil {
 			nodes.Add(si)
@@ -796,7 +806,7 @@ func (h *httprunner) xactCallerNotify(n cmn.Notif, err error) {
 			glog.Error(err)
 		}
 	}
-	h.notify(nodes, cmn.MustMarshal(&msg))
+	return nodes
 }
 
 ///////////////
@@ -848,64 +858,137 @@ func (h *httprunner) bcastToGroup(args bcastArgs) chan callResult {
 	switch args.to {
 	case cluster.Targets:
 		args.nodes = []cluster.NodeMap{args.smap.Tmap}
+		args.nodeCount = len(args.smap.Tmap)
 	case cluster.Proxies:
 		args.nodes = []cluster.NodeMap{args.smap.Pmap}
+		args.nodeCount = len(args.smap.Pmap)
 	case cluster.AllNodes:
 		args.nodes = []cluster.NodeMap{args.smap.Pmap, args.smap.Tmap}
+		args.nodeCount = len(args.smap.Pmap) + len(args.smap.Tmap)
 	default:
 		cmn.Assert(false)
 	}
 	if !cmn.NetworkIsKnown(args.network) {
-		cmn.AssertMsg(false, "unknown network '"+args.network+"'")
+		cmn.Assertf(false, "unknown network %q", args.network)
 	}
-	return h.bcastToNodes(args)
+	return h.bcastToNodes(&args)
 }
 
-// bcastToNodes broadcasts a message to specific nodes (`bargs.nodes`).
-func (h *httprunner) bcastToNodes(bargs bcastArgs) chan callResult {
-	cmn.Assert(bargs.nodes != nil)
-
-	nodeCount := 0
-	for _, nodeMap := range bargs.nodes {
-		nodeCount += len(nodeMap)
-	}
-	if nodeCount == 0 {
-		ch := make(chan callResult)
-		close(ch)
-		glog.Warningf("node count zero in [%+v] bcast", bargs.req)
-		return ch
-	}
-
+// bcastToNodes broadcasts a message to the specified destinations (`bargs.nodes`).
+// It then waits and collects all the responses. Note that when `bargs.req.BodyR`
+// is used it is expected to implement `cmn.ReadOpenCloser`.
+func (h *httprunner) bcastToNodes(bargs *bcastArgs) chan callResult {
 	var (
-		wg = &sync.WaitGroup{}
-		ch = make(chan callResult, nodeCount)
+		wg  = &sync.WaitGroup{}
+		ch  = make(chan callResult, bargs.nodeCount)
+		cnt int
 	)
 	for _, nodeMap := range bargs.nodes {
 		for sid, si := range nodeMap {
-			if sid == h.si.ID() {
+			if sid == h.si.ID() || bargs.skipNodes.Contains(sid) {
+				continue
+			}
+			if !bargs.ignoreMaintenance && si.InMaintenance() {
 				continue
 			}
 			wg.Add(1)
-			go func(si *cluster.Snode) {
-				cargs := callArgs{
-					si:      si,
-					req:     bargs.req,
-					timeout: bargs.timeout,
-				}
-				cargs.req.Base = si.URL(bargs.network)
-				if bargs.fv != nil {
-					cargs.v = bargs.fv()
-				}
-
-				ch <- h.call(cargs)
-				wg.Done()
-			}(si)
+			cnt++
+			go h.unicastToNode(si, bargs, wg, ch)
 		}
 	}
-
 	wg.Wait()
 	close(ch)
+	if cnt == 0 {
+		glog.Warningf("%s: node count is zero in [%s %s] broadcast", h.si, bargs.req.Method, bargs.req.Path)
+	}
 	return ch
+}
+
+func (h *httprunner) unicastToNode(si *cluster.Snode, bargs *bcastArgs, wg *sync.WaitGroup, ch chan callResult) {
+	cargs := callArgs{si: si, req: bargs.req, timeout: bargs.timeout}
+	cargs.req.Base = si.URL(bargs.network)
+	if bargs.req.BodyR != nil {
+		cargs.req.BodyR, _ = bargs.req.BodyR.(cmn.ReadOpenCloser).Open()
+	}
+	if bargs.fv != nil {
+		cargs.v = bargs.fv()
+	}
+	if wg != nil {
+		ch <- h.call(cargs)
+		wg.Done()
+	} else {
+		_ = h.call(cargs)
+	}
+}
+
+// asynchronous variation of the `bcastToNodes` (above)
+func (h *httprunner) bcastToNodesAsync(bargs *bcastArgs) {
+	var cnt int
+	for _, nodeMap := range bargs.nodes {
+		for sid, si := range nodeMap {
+			if sid == h.si.ID() || bargs.skipNodes.Contains(sid) {
+				continue
+			}
+			cnt++
+			go func(si *cluster.Snode) {
+				cargs := callArgs{si: si, req: bargs.req, timeout: bargs.timeout}
+				cargs.req.Base = si.URL(bargs.network)
+				_ = h.call(cargs)
+			}(si)
+		}
+		if cnt == 0 {
+			glog.Warningf("%s: node count is zero in [%s %s] broadcast",
+				h.si, bargs.req.Method, bargs.req.Path)
+		}
+	}
+}
+
+func (h *httprunner) bcastToIC(msg *aisMsg, wait bool) {
+	var (
+		smap  = h.owner.smap.get()
+		bargs = bcastArgs{
+			req: cmn.ReqArgs{
+				Method: http.MethodPost,
+				Path:   cmn.JoinWords(cmn.Version, cmn.IC),
+				Body:   cmn.MustMarshal(msg),
+			},
+			network: cmn.NetworkIntraControl,
+			timeout: cmn.GCO.Get().Timeout.MaxKeepalive,
+		}
+		ch  chan callResult
+		wg  *sync.WaitGroup
+		cnt int
+	)
+	if wait {
+		wg = &sync.WaitGroup{}
+		ch = make(chan callResult, smap.ICCount())
+	}
+	for pid, psi := range smap.Pmap {
+		if !psi.IsIC() || pid == h.si.ID() {
+			continue
+		}
+		if wait {
+			wg.Add(1)
+		}
+		cnt++
+		go h.unicastToNode(psi, &bargs, wg, ch)
+	}
+	if !wait {
+		return
+	}
+	wg.Wait()
+	close(ch)
+	if cnt == 0 {
+		glog.Errorf("%s: node count is zero in broadcast-to-IC, %s", h.si, smap.StrIC(h.si))
+	}
+	if !debug.Enabled {
+		return
+	}
+	for res := range ch {
+		if res.err != nil {
+			glog.Error(res.err)
+		}
+	}
 }
 
 //////////////////////////////////
@@ -939,8 +1022,8 @@ func (h *httprunner) writeMsgPack(w http.ResponseWriter, r *http.Request, v inte
 		err = mw.Flush()
 	}
 	if err != nil {
-		h.writeErrorStatus(w, r, tag, err)
-		return
+		h.handleWriteError(r, tag, err)
+		return false
 	}
 	return true
 }
@@ -951,47 +1034,29 @@ func (h *httprunner) writeJSON(w http.ResponseWriter, r *http.Request, v interfa
 
 	w.Header().Set(cmn.HeaderContentType, cmn.ContentJSON)
 	if err := jsoniter.NewEncoder(w).Encode(v); err != nil {
-		h.writeErrorStatus(w, r, tag, err)
-		return
-	}
-	return true
-}
-
-// NOTE: must be the last error-generating-and-handling call in the http handler
-//       writes http body and header
-//       calls invalmsghdlr() on err
-func (h *httprunner) writeBytes(w http.ResponseWriter, r *http.Request, bytes []byte, tag string) (ok bool) {
-	if _, err := w.Write(bytes); err != nil {
-		h.writeErrorStatus(w, r, tag, err)
-		return
+		h.handleWriteError(r, tag, err)
+		return false
 	}
 	return true
 }
 
 func (h *httprunner) writeJSONBytes(w http.ResponseWriter, r *http.Request, bytes []byte, tag string) (ok bool) {
 	w.Header().Set(cmn.HeaderContentType, cmn.ContentJSON)
-	return h.writeBytes(w, r, bytes, tag)
+	if _, err := w.Write(bytes); err != nil {
+		h.handleWriteError(r, tag, err)
+		return false
+	}
+	return true
 }
 
-func (h *httprunner) writeErrorStatus(w http.ResponseWriter, r *http.Request, tag string, err error) {
-	if isSyscallWriteError(err) {
-		// Apparently, cannot write to this w: broken-pipe and similar
-		glog.Errorf("isSyscallWriteError: %v", err)
-		s := "isSyscallWriteError: " + r.Method + " " + r.URL.Path
-		if _, file, line, ok2 := runtime.Caller(1); ok2 {
-			f := filepath.Base(file)
-			s += fmt.Sprintf("(%s, #%d)", f, line)
-		}
-		glog.Errorln(s)
-		h.statsT.AddErrorHTTP(r.Method, 1)
-		return
-	}
+func (h *httprunner) handleWriteError(r *http.Request, tag string, err error) {
 	msg := fmt.Sprintf("%s: failed to write bytes, err: %v", tag, err)
 	if _, file, line, ok := runtime.Caller(1); ok {
 		f := filepath.Base(file)
 		msg += fmt.Sprintf("(%s, #%d)", f, line)
 	}
-	h.invalmsghdlr(w, r, msg)
+	glog.Errorln(msg)
+	h.statsT.AddErrorHTTP(r.Method, 1)
 }
 
 func (h *httprunner) parseNCopies(value interface{}) (copies int64, err error) {
@@ -1034,7 +1099,7 @@ func (h *httprunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
 	case cmn.GetWhatBMD:
 		body = h.owner.bmd.get()
 	case cmn.GetWhatSmapVote:
-		xact := xaction.Registry.GetXactRunning(cmn.ActElection)
+		xact := registry.Registry.GetXactRunning(cmn.ActElection)
 		msg := SmapVoteMsg{VoteInProgress: xact != nil, Smap: h.owner.smap.get(), BucketMD: h.owner.bmd.get()}
 		body = msg
 	case cmn.GetWhatSnode:
@@ -1063,7 +1128,8 @@ func (h *httprunner) invalmsghdlrsilent(w http.ResponseWriter, r *http.Request, 
 	cmn.InvalidHandlerDetailedNoLog(w, r, msg, errCode...)
 }
 
-func (h *httprunner) invalmsghdlrstatusf(w http.ResponseWriter, r *http.Request, errCode int, format string, a ...interface{}) {
+func (h *httprunner) invalmsghdlrstatusf(w http.ResponseWriter, r *http.Request, errCode int,
+	format string, a ...interface{}) {
 	h.invalmsghdlr(w, r, fmt.Sprintf(format, a...), errCode)
 }
 
@@ -1077,7 +1143,7 @@ func (h *httprunner) invalmsghdlrf(w http.ResponseWriter, r *http.Request, forma
 
 func (h *httprunner) Health(si *cluster.Snode, timeout time.Duration, query url.Values) ([]byte, error, int) {
 	var (
-		path = cmn.URLPath(cmn.Version, cmn.Health)
+		path = cmn.JoinWords(cmn.Version, cmn.Health)
 		url  = si.URL(cmn.NetworkIntraControl)
 		args = callArgs{
 			si:      si,
@@ -1388,11 +1454,11 @@ func (h *httprunner) registerToURL(url string, psi *cluster.Snode, tout time.Dur
 		regReq.Smap = h.owner.smap.get()
 	}
 	info := cmn.MustMarshal(regReq)
-	path := cmn.URLPath(cmn.Version, cmn.Cluster)
+	path := cmn.JoinWords(cmn.Version, cmn.Cluster)
 	if keepalive {
-		path += cmn.URLPath(cmn.Keepalive)
+		path += cmn.JoinWords(cmn.Keepalive)
 	} else {
-		path += cmn.URLPath(cmn.AutoRegister)
+		path += cmn.JoinWords(cmn.AutoRegister)
 	}
 	callArgs := callArgs{
 		si:      psi,
@@ -1488,15 +1554,13 @@ func (h *httprunner) pollClusterStarted(timeout time.Duration) {
 
 func (h *httprunner) bucketPropsToHdr(bck *cluster.Bck, hdr http.Header) {
 	if bck.Props == nil {
-		bck.Props = cmn.CloudBucketProps(hdr)
+		bck.Props = cmn.DefaultCloudBckProps(hdr)
 	}
 	finalProps := bck.Props.Clone()
 	cmn.IterFields(finalProps, func(fieldName string, field cmn.IterField) (error, bool) {
 		if fieldName == cmn.HeaderBucketVerEnabled {
-			// For Cloud buckets, `versioning.enabled` is a combination of local
-			// and cloud settings and is true iff versioning is enabled on both sides.
-			verEnabled := field.Value().(bool)
-			if bck.IsAIS() || !verEnabled {
+			if hdr.Get(cmn.HeaderBucketVerEnabled) == "" {
+				verEnabled := field.Value().(bool)
 				hdr.Set(cmn.HeaderBucketVerEnabled, strconv.FormatBool(verEnabled))
 			}
 			return nil, false
@@ -1530,7 +1594,7 @@ func (h *httprunner) selectBMDBuckets(bmd *bucketMD, query cmn.QueryBcks) cmn.Bu
 
 func newBckFromQuery(bckName string, query url.Values) (*cluster.Bck, error) {
 	provider := query.Get(cmn.URLParamProvider)
-	if provider != "" && provider != cmn.AnyCloud && !cmn.IsValidProvider(provider) {
+	if provider != "" && !cmn.IsValidProvider(provider) {
 		return nil, fmt.Errorf("invalid provider %q", provider)
 	}
 	namespace := cmn.ParseNsUname(query.Get(cmn.URLParamNamespace))
@@ -1621,4 +1685,10 @@ rret:
 	config.Cloud.ProviderConf(cmn.ProviderAIS, aisConf)
 	cmn.GCO.CommitUpdate(config)
 	return nil
+}
+
+// Based on default error handler `defaultErrorHandler` in `httputil/reverseproxy.go`.
+func rpErrHandler(rw http.ResponseWriter, req *http.Request, err error) {
+	glog.Errorf("Reverse proxy error handler (req: %v) (err: %v)", req, err)
+	rw.WriteHeader(http.StatusBadGateway)
 }

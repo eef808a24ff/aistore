@@ -7,6 +7,7 @@ package ais
 import (
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
@@ -256,36 +257,42 @@ func (p *proxyrunner) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntar
 		smap = clone
 	}
 	// try to start with a fully staffed IC
-	if l := len(smap.IC); l < ICGroupSize {
+	if l := smap.ICCount(); l < smap.DefaultICSize() {
 		clone := smap.clone()
 		clone.staffIC()
-		if l != len(clone.IC) {
+		if l != clone.ICCount() {
 			clone.Version++
 			smap = clone
 			p.owner.smap.put(smap)
 		}
+		p.si = clone.GetNode(p.si.ID())
+		clone.Primary = p.si
 	}
 	if err := p.owner.smap.persist(smap); err != nil {
 		cmn.ExitLogf("FATAL: %s (primary), err: %v", p.si, err)
 	}
 	p.owner.smap.Unlock()
 
-	p.owner.bmd.Lock()
-	bmd := p.owner.bmd.get()
-	if bmd.Version == 0 {
-		clone := bmd.clone()
-		clone.Version = 1 // init BMD
-		clone.UUID = smap.UUID
-		p.owner.bmd.put(clone)
+	var (
+		wg  *sync.WaitGroup
+		bmd *bucketMD
+	)
+	_ = p.owner.bmd.modify(func(clone *bucketMD) (bool, error) {
+		if clone.Version == 0 {
+			clone.Version = 1 // init BMD
+			clone.UUID = smap.UUID
+		}
+		return true, nil
+	}, func(clone *bucketMD) {
+		msg := p.newAisMsgStr(metaction2, smap, clone)
+		wg = p.metasyncer.sync(revsPair{smap, msg}, revsPair{clone, msg})
 		bmd = clone
-	}
-	p.owner.bmd.Unlock()
-
-	msg := p.newAisMsgStr(metaction2, smap, bmd)
-	_ = p.metasyncer.sync(revsPair{smap, msg}, revsPair{bmd, msg})
+	})
 
 	// 6: started up as primary
-	glog.Infof("%s: primary & cluster startup complete, %s", p.si, smap.StringEx())
+	glog.Infof("%s: metasync %s, %s", p.si, smap.StringEx(), bmd.StringEx())
+	wg.Wait()
+	glog.Infof("%s: primary & cluster startup complete", p.si)
 	p.markClusterStarted()
 }
 
@@ -354,9 +361,7 @@ MainLoop:
 // the final major step in the primary startup sequence:
 // discover cluster-wide metadata and resolve remaining conflicts
 func (p *proxyrunner) discoverMeta(smap *smapX) {
-	var (
-		maxVerSmap, maxVerBMD = p.uncoverMeta(smap)
-	)
+	maxVerSmap, maxVerBMD := p.uncoverMeta(smap)
 	if maxVerBMD != nil {
 		p.owner.bmd.Lock()
 		bmd := p.owner.bmd.get()
@@ -469,7 +474,7 @@ func (p *proxyrunner) bcastMaxVer(bcastSmap *smapX, bmds map[*cluster.Snode]*buc
 
 		args = bcastArgs{
 			req: cmn.ReqArgs{
-				Path:  cmn.URLPath(cmn.Version, cmn.Daemon),
+				Path:  cmn.JoinWords(cmn.Version, cmn.Daemon),
 				Query: url.Values{cmn.URLParamWhat: []string{cmn.GetWhatSmapVote}},
 			},
 			smap: bcastSmap,

@@ -26,7 +26,6 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/dsort/extract"
 	"github.com/NVIDIA/aistore/dsort/filetype"
@@ -218,10 +217,10 @@ func (m *Manager) extractShard(name string, metrics *LocalExtraction) func() err
 
 		m.dsorter.postShardExtraction(expectedUncompressedSize) // schedule unreserving reserved memory on next memory update
 		if err != nil {
-			debug.AssertNoErr(f.Close())
+			cmn.Close(f)
 			return errors.Errorf("error in ExtractShard, file: %s, err: %v", f.Name(), err)
 		}
-		debug.AssertNoErr(f.Close())
+		cmn.Close(f)
 
 		metrics.Lock()
 		metrics.ExtractedRecordCnt += int64(extractedCount)
@@ -262,9 +261,7 @@ func (m *Manager) extractShard(name string, metrics *LocalExtraction) func() err
 // extractLocalShards iterates through files local to the current target and
 // calls ExtractShard on matching files based on the given ParsedRequestSpec.
 func (m *Manager) extractLocalShards() (err error) {
-	var (
-		phaseInfo = &m.extractionPhase
-	)
+	phaseInfo := &m.extractionPhase
 
 	phaseInfo.adjuster.start()
 	defer phaseInfo.adjuster.stop()
@@ -355,15 +352,15 @@ func (m *Manager) createShard(s *extract.Shard) (err error) {
 	go func() {
 		var err error
 		if !m.rs.DryRun {
-			err = m.ctx.t.PutObject(cluster.PutObjectParams{
-				LOM:          lom,
+			params := cluster.PutObjectParams{
 				Reader:       r,
 				WorkFQN:      workFQN,
 				RecvType:     cluster.WarmGet,
 				Cksum:        nil,
 				Started:      beforeCreation,
 				WithFinalize: true,
-			})
+			}
+			err = m.ctx.t.PutObject(lom, params)
 			n = lom.Size()
 		} else {
 			n, err = io.Copy(ioutil.Discard, r)
@@ -421,7 +418,7 @@ func (m *Manager) createShard(s *extract.Shard) (err error) {
 		}
 
 		cksumType, cksumValue := lom.Cksum().Get()
-		hdr := transport.Header{
+		hdr := transport.ObjHdr{
 			Bck:     lom.Bck().Bck,
 			ObjName: shardName,
 			ObjAttrs: transport.ObjectAttrs{
@@ -434,12 +431,12 @@ func (m *Manager) createShard(s *extract.Shard) (err error) {
 		// Make send synchronous
 		streamWg := &sync.WaitGroup{}
 		errCh := make(chan error, 1)
-		cb := func(_ transport.Header, _ io.ReadCloser, _ unsafe.Pointer, err error) {
+		cb := func(_ transport.ObjHdr, _ io.ReadCloser, _ unsafe.Pointer, err error) {
 			errCh <- err
 			streamWg.Done()
 		}
 		streamWg.Add(1)
-		err = m.streams.shards.Send(transport.Obj{Hdr: hdr, Callback: cb}, file, si)
+		err = m.streams.shards.Send(&transport.Obj{Hdr: hdr, Callback: cb}, file, si)
 		if err != nil {
 			return err
 		}
@@ -543,7 +540,7 @@ func (m *Manager) participateInRecordDistribution(targetOrder cluster.Nodes) (cu
 				reqArgs := &cmn.ReqArgs{
 					Method: http.MethodPost,
 					Base:   sendTo.URL(cmn.NetworkIntraData),
-					Path:   cmn.URLPath(cmn.Version, cmn.Sort, cmn.Records, m.ManagerUUID),
+					Path:   cmn.JoinWords(cmn.Version, cmn.Sort, cmn.Records, m.ManagerUUID),
 					Query:  query,
 					BodyR:  r,
 				}
@@ -665,20 +662,18 @@ func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*extract.Shar
 	if err != nil {
 		return nil, err
 	}
-	resp, err := m.client.Do(req)
+	resp, err := m.client.Do(req) // nolint:bodyclose // closed inside cmn.Close
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		debug.AssertNoErr(resp.Body.Close())
-	}()
+	defer cmn.Close(resp.Body)
 
 	// TODO: handle very large files > GB - in case the file is very big we
 	// need to save file to the disk and operate on the file directly rather
 	// than keeping everything in memory.
-	var (
-		lineReader = bufio.NewReader(resp.Body)
-	)
+
+	lineReader := bufio.NewReader(resp.Body)
+
 	for idx := 0; ; idx++ {
 		l, _, err := lineReader.ReadLine()
 		if err == io.EOF {
@@ -866,7 +861,7 @@ func (m *Manager) distributeShardRecords(maxSize int64) error {
 				reqArgs := &cmn.ReqArgs{
 					Method: http.MethodPost,
 					Base:   si.URL(cmn.NetworkIntraData),
-					Path:   cmn.URLPath(cmn.Version, cmn.Sort, cmn.Shards, m.ManagerUUID),
+					Path:   cmn.JoinWords(cmn.Version, cmn.Sort, cmn.Shards, m.ManagerUUID),
 					Query:  query,
 					BodyR:  r,
 				}
@@ -895,7 +890,7 @@ func (m *Manager) distributeShardRecords(maxSize int64) error {
 //  1) Locality of shard source files, and in a tie situation,
 //  2) Number of shard creation requests previously sent to the target.
 //
-// nolint:unused,deadcode // has TODO to fix it
+// nolint:deadcode,unused // has TODO to fix it
 func nodeForShardRequest(shardsToTarget map[string][]*extract.Shard, numLocalRecords map[string]int) string {
 	var max int
 	var id string

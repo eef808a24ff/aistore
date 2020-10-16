@@ -26,6 +26,7 @@ import (
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/transport/bundle"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -49,8 +50,8 @@ type (
 		mw *memoryWatcher
 
 		streams struct {
-			request  *transport.StreamBundle
-			response *transport.StreamBundle
+			request  *bundle.Streams
+			response *bundle.Streams
 		}
 
 		creationPhase struct {
@@ -77,9 +78,7 @@ type (
 	}
 )
 
-var (
-	_ dsorter = &dsorterGeneral{}
-)
+var _ dsorter = &dsorterGeneral{}
 
 func newDSorterGeneral(m *Manager) (*dsorterGeneral, error) {
 	// Memory watcher
@@ -143,13 +142,13 @@ func (ds *dsorterGeneral) start() error {
 
 	client := transport.NewIntraDataClient()
 
-	streamMultiplier := transport.IntraBundleMultiplier
+	streamMultiplier := bundle.Multiplier
 	if ds.m.rs.StreamMultiplier != 0 {
 		streamMultiplier = ds.m.rs.StreamMultiplier
 	}
 
 	trname := fmt.Sprintf(recvReqStreamNameFmt, ds.m.ManagerUUID)
-	reqSbArgs := transport.SBArgs{
+	reqSbArgs := bundle.Args{
 		Multiplier: 20,
 		Network:    reqNetwork,
 		Trname:     trname,
@@ -160,7 +159,7 @@ func (ds *dsorterGeneral) start() error {
 	}
 
 	trname = fmt.Sprintf(recvRespStreamNameFmt, ds.m.ManagerUUID)
-	respSbArgs := transport.SBArgs{
+	respSbArgs := bundle.Args{
 		Multiplier: streamMultiplier,
 		Network:    respNetwork,
 		Trname:     trname,
@@ -175,8 +174,8 @@ func (ds *dsorterGeneral) start() error {
 		return errors.WithStack(err)
 	}
 
-	ds.streams.request = transport.NewStreamBundle(ds.m.ctx.smapOwner, ds.m.ctx.node, client, reqSbArgs)
-	ds.streams.response = transport.NewStreamBundle(ds.m.ctx.smapOwner, ds.m.ctx.node, client, respSbArgs)
+	ds.streams.request = bundle.NewStreams(ds.m.ctx.smapOwner, ds.m.ctx.node, client, reqSbArgs)
+	ds.streams.response = bundle.NewStreams(ds.m.ctx.smapOwner, ds.m.ctx.node, client, respSbArgs)
 
 	// start watching memory
 	return ds.mw.watch()
@@ -209,7 +208,7 @@ func (ds *dsorterGeneral) cleanupStreams() error {
 		}
 	}
 
-	for _, streamBundle := range []*transport.StreamBundle{ds.streams.request, ds.streams.response} {
+	for _, streamBundle := range []*bundle.Streams{ds.streams.request, ds.streams.response} {
 		if streamBundle != nil {
 			streamBundle.Close(!ds.m.aborted())
 		}
@@ -236,9 +235,7 @@ func (ds *dsorterGeneral) postRecordDistribution() {
 // createShardsLocally waits until it's given the signal to start creating
 // shards, then creates shards in parallel.
 func (ds *dsorterGeneral) createShardsLocally() (err error) {
-	var (
-		phaseInfo = &ds.m.creationPhase
-	)
+	phaseInfo := &ds.m.creationPhase
 
 	ds.creationPhase.adjuster.start()
 	defer ds.creationPhase.adjuster.stop()
@@ -321,9 +318,7 @@ func (ds *dsorterGeneral) loadContent() extract.LoadContentFunc {
 				if err != nil {
 					return written, errors.WithMessage(err, "(offset) open local content failed")
 				}
-				defer func() {
-					debug.AssertNoErr(f.Close())
-				}()
+				defer cmn.Close(f)
 				_, err = f.Seek(obj.Offset-obj.MetadataSize, io.SeekStart)
 				if err != nil {
 					return written, errors.WithMessage(err, "(offset) seek local content failed")
@@ -345,9 +340,7 @@ func (ds *dsorterGeneral) loadContent() extract.LoadContentFunc {
 				if err != nil {
 					return written, errors.WithMessage(err, "(disk) open local content failed")
 				}
-				defer func() {
-					debug.AssertNoErr(f.Close())
-				}()
+				defer cmn.Close(f)
 				if n, err = io.CopyBuffer(w, f, buf); err != nil {
 					return written, errors.WithMessage(err, "(disk) copy local content failed")
 				}
@@ -383,7 +376,7 @@ func (ds *dsorterGeneral) loadContent() extract.LoadContentFunc {
 				RecordObj: obj,
 			}
 			opaque := cmn.MustMarshal(req)
-			hdr := transport.Header{
+			hdr := transport.ObjHdr{
 				Opaque: opaque,
 			}
 
@@ -391,7 +384,7 @@ func (ds *dsorterGeneral) loadContent() extract.LoadContentFunc {
 				beforeSend = mono.NanoTime()
 			}
 
-			cb := func(hdr transport.Header, r io.ReadCloser, _ unsafe.Pointer, err error) {
+			cb := func(hdr transport.ObjHdr, r io.ReadCloser, _ unsafe.Pointer, err error) {
 				if err != nil {
 					cbErr = err
 				}
@@ -410,7 +403,7 @@ func (ds *dsorterGeneral) loadContent() extract.LoadContentFunc {
 			}
 
 			wg.Add(1)
-			if err := ds.streams.request.Send(transport.Obj{Hdr: hdr, Callback: cb}, nil, toNode); err != nil {
+			if err := ds.streams.request.Send(&transport.Obj{Hdr: hdr, Callback: cb}, nil, toNode); err != nil {
 				return 0, errors.WithStack(err)
 			}
 
@@ -488,15 +481,15 @@ func (ds *dsorterGeneral) loadContent() extract.LoadContentFunc {
 }
 
 func (ds *dsorterGeneral) makeRecvRequestFunc() transport.Receive {
-	errHandler := func(err error, hdr transport.Header, node *cluster.Snode) {
+	errHandler := func(err error, hdr transport.ObjHdr, node *cluster.Snode) {
 		hdr.Opaque = []byte(err.Error())
 		hdr.ObjAttrs.Size = 0
-		if err = ds.streams.response.Send(transport.Obj{Hdr: hdr}, nil, node); err != nil {
+		if err = ds.streams.response.Send(&transport.Obj{Hdr: hdr}, nil, node); err != nil {
 			ds.m.abort(err)
 		}
 	}
 
-	return func(w http.ResponseWriter, hdr transport.Header, object io.Reader, err error) {
+	return func(w http.ResponseWriter, hdr transport.ObjHdr, object io.Reader, err error) {
 		req := remoteRequest{}
 		if err := jsoniter.Unmarshal(hdr.Opaque, &req); err != nil {
 			ds.m.abort(fmt.Errorf("received damaged request: %s", err))
@@ -514,7 +507,7 @@ func (ds *dsorterGeneral) makeRecvRequestFunc() transport.Receive {
 			return
 		}
 
-		respHdr := transport.Header{
+		respHdr := transport.ObjHdr{
 			ObjName: req.Record.MakeUniqueName(req.RecordObj),
 		}
 
@@ -533,7 +526,7 @@ func (ds *dsorterGeneral) makeRecvRequestFunc() transport.Receive {
 			lr := cmn.NopReader(req.RecordObj.MetadataSize + req.RecordObj.Size)
 			r := cmn.NopOpener(ioutil.NopCloser(lr))
 			respHdr.ObjAttrs.Size = req.RecordObj.MetadataSize + req.RecordObj.Size
-			o := transport.Obj{Hdr: respHdr, Callback: ds.responseCallback, CmplPtr: unsafe.Pointer(&beforeSend)}
+			o := &transport.Obj{Hdr: respHdr, Callback: ds.responseCallback, CmplPtr: unsafe.Pointer(&beforeSend)}
 			if err := ds.streams.response.Send(o, r, fromNode); err != nil {
 				ds.m.abort(err)
 			}
@@ -551,13 +544,13 @@ func (ds *dsorterGeneral) makeRecvRequestFunc() transport.Receive {
 			r, err := cmn.NewFileSectionHandle(f, req.RecordObj.Offset-req.RecordObj.MetadataSize,
 				respHdr.ObjAttrs.Size, 0)
 			if err != nil {
-				debug.AssertNoErr(f.Close())
+				cmn.Close(f)
 				errHandler(err, respHdr, fromNode)
 				return
 			}
-			o := transport.Obj{Hdr: respHdr, Callback: ds.responseCallback, CmplPtr: unsafe.Pointer(&beforeSend)}
+			o := &transport.Obj{Hdr: respHdr, Callback: ds.responseCallback, CmplPtr: unsafe.Pointer(&beforeSend)}
 			if err := ds.streams.response.Send(o, r, fromNode); err != nil {
-				debug.AssertNoErr(f.Close())
+				cmn.Close(f)
 				ds.m.abort(err)
 			}
 		case extract.SGLStoreType:
@@ -566,7 +559,7 @@ func (ds *dsorterGeneral) makeRecvRequestFunc() transport.Receive {
 			ds.m.recManager.RecordContents().Delete(fullContentPath)
 			sgl := v.(*memsys.SGL)
 			respHdr.ObjAttrs.Size = sgl.Size()
-			o := transport.Obj{Hdr: respHdr, Callback: ds.responseCallback, CmplPtr: unsafe.Pointer(&beforeSend)}
+			o := &transport.Obj{Hdr: respHdr, Callback: ds.responseCallback, CmplPtr: unsafe.Pointer(&beforeSend)}
 			if err := ds.streams.response.Send(o, sgl, fromNode); err != nil {
 				sgl.Free()
 				ds.m.abort(err)
@@ -579,14 +572,14 @@ func (ds *dsorterGeneral) makeRecvRequestFunc() transport.Receive {
 			}
 			fi, err := f.Stat()
 			if err != nil {
-				debug.AssertNoErr(f.Close())
+				cmn.Close(f)
 				errHandler(err, respHdr, fromNode)
 				return
 			}
 			respHdr.ObjAttrs.Size = fi.Size()
-			o := transport.Obj{Hdr: respHdr, Callback: ds.responseCallback, CmplPtr: unsafe.Pointer(&beforeSend)}
+			o := &transport.Obj{Hdr: respHdr, Callback: ds.responseCallback, CmplPtr: unsafe.Pointer(&beforeSend)}
 			if err := ds.streams.response.Send(o, f, fromNode); err != nil {
-				debug.AssertNoErr(f.Close())
+				cmn.Close(f)
 				ds.m.abort(err)
 			}
 		default:
@@ -595,7 +588,7 @@ func (ds *dsorterGeneral) makeRecvRequestFunc() transport.Receive {
 	}
 }
 
-func (ds *dsorterGeneral) responseCallback(hdr transport.Header, rc io.ReadCloser, x unsafe.Pointer, err error) {
+func (ds *dsorterGeneral) responseCallback(hdr transport.ObjHdr, rc io.ReadCloser, x unsafe.Pointer, err error) {
 	if ds.m.Metrics.extended {
 		dur := mono.Since(*(*int64)(x))
 		ds.m.Metrics.Creation.Lock()
@@ -619,7 +612,7 @@ func (ds *dsorterGeneral) postExtraction() {
 
 func (ds *dsorterGeneral) makeRecvResponseFunc() transport.Receive {
 	metrics := ds.m.Metrics.Creation
-	return func(w http.ResponseWriter, hdr transport.Header, object io.Reader, err error) {
+	return func(w http.ResponseWriter, hdr transport.ObjHdr, object io.Reader, err error) {
 		if err != nil {
 			ds.m.abort(err)
 			return

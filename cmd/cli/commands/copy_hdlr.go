@@ -14,7 +14,10 @@ import (
 
 var (
 	copyCmdsFlags = map[string][]cli.Flag{
-		subcmdCopyBucket: {},
+		subcmdCopyBucket: {
+			cpBckDryRunFlag,
+			cpBckPrefixFlag,
+		},
 	}
 
 	copyCmds = []cli.Command{
@@ -28,7 +31,7 @@ var (
 					ArgsUsage:    bucketOldNewArgument,
 					Flags:        copyCmdsFlags[subcmdCopyBucket],
 					Action:       copyBucketHandler,
-					BashComplete: oldAndNewBucketCompletions([]cli.BashCompleteFunc{}, false /* separator */, cmn.ProviderAIS),
+					BashComplete: oldAndNewBucketCompletions([]cli.BashCompleteFunc{}, false /* separator */),
 				},
 			},
 		},
@@ -40,28 +43,31 @@ func copyBucketHandler(c *cli.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	fromBck, objName, err := parseBckObjectURI(bucketName)
+	fromBck, err := parseBckURI(c, bucketName)
 	if err != nil {
 		return err
 	}
-	toBck, newObjName, err := parseBckObjectURI(newBucketName)
+	toBck, err := parseBckURI(c, newBucketName)
 	if err != nil {
 		return err
 	}
-	if fromBck.IsCloud(cmn.AnyCloud) || toBck.IsCloud(cmn.AnyCloud) {
-		return fmt.Errorf("copying of cloud buckets not supported")
-	}
-	if fromBck.IsRemoteAIS() || toBck.IsRemoteAIS() {
-		return fmt.Errorf("copying of remote ais buckets not supported")
-	}
-	if objName != "" {
-		return objectNameArgumentNotSupported(c, objName)
-	}
-	if newObjName != "" {
-		return objectNameArgumentNotSupported(c, objName)
+
+	if fromBck.Equal(toBck) {
+		return fmt.Errorf("cannot copy bucket %q onto itself", fromBck)
 	}
 
 	fromBck.Provider, toBck.Provider = cmn.ProviderAIS, cmn.ProviderAIS
+	msg := &cmn.CopyBckMsg{
+		Prefix: parseStrFlag(c, cpBckPrefixFlag),
+		DryRun: flagIsSet(c, cpBckDryRunFlag),
+	}
 
-	return copyBucket(c, fromBck, toBck)
+	if msg.DryRun {
+		// TODO: once IC is integrated with copy-bck stats, show something more relevant, like stream of object names
+		// with destination which they would have been copied to. Then additionally, make output consistent with etl
+		// dry-run output.
+		fmt.Fprintln(c.App.Writer, dryRunHeader+" "+dryRunExplanation)
+	}
+
+	return copyBucket(c, fromBck, toBck, msg)
 }

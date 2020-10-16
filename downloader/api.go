@@ -23,6 +23,8 @@ const (
 	DlTypeRange  DlType = "range"
 	DlTypeMulti  DlType = "multi"
 	DlTypeCloud  DlType = "cloud"
+
+	DownloadProgressInterval = 10 * time.Second
 )
 
 type (
@@ -171,11 +173,19 @@ func (d DlJobInfos) Swap(i, j int) {
 	d[i], d[j] = d[j], d[i]
 }
 
-func (d *DlStatusResp) Aggregate(rhs DlStatusResp) {
+func (d *DlStatusResp) Aggregate(rhs DlStatusResp) *DlStatusResp {
+	if d == nil {
+		r := DlStatusResp{}
+		err := cmn.MorphMarshal(rhs, &r)
+		cmn.AssertNoErr(err)
+		return &r
+	}
+
 	d.DlJobInfo.Aggregate(&rhs.DlJobInfo)
 	d.CurrentTasks = append(d.CurrentTasks, rhs.CurrentTasks...)
 	d.FinishedTasks = append(d.FinishedTasks, rhs.FinishedTasks...)
 	d.Errs = append(d.Errs, rhs.Errs...)
+	return d
 }
 
 type DlLimits struct {
@@ -184,10 +194,11 @@ type DlLimits struct {
 }
 
 type DlBase struct {
-	Description string   `json:"description"`
-	Bck         cmn.Bck  `json:"bucket"`
-	Timeout     string   `json:"timeout"`
-	Limits      DlLimits `json:"limits"`
+	Description      string   `json:"description"`
+	Bck              cmn.Bck  `json:"bucket"`
+	Timeout          string   `json:"timeout"`
+	ProgressInterval string   `json:"progress_interval"`
+	Limits           DlLimits `json:"limits"`
 }
 
 func (b *DlBase) Validate() error {
@@ -233,8 +244,9 @@ func (b *DlSingleObj) Validate() error {
 
 // Internal status/delete request body
 type DlAdminBody struct {
-	ID    string `json:"id"`
-	Regex string `json:"regex"`
+	ID              string `json:"id"`
+	Regex           string `json:"regex"`
+	OnlyActiveTasks bool   `json:"only_active_tasks"` // Skips detailed info about tasks finished/errored
 }
 
 func (b *DlAdminBody) Validate(requireID bool) error {

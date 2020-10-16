@@ -39,8 +39,10 @@ const (
 	mdCksumTyXXHash = 1 // the one and only currently supported checksum type == xxhash
 )
 
-const XattrLOM = "user.ais.lom" // on-disk xattr name
-const xattrMaxSize = memsys.MaxSmallSlabSize
+const (
+	XattrLOM     = "user.ais.lom" // on-disk xattr name
+	xattrMaxSize = memsys.MaxSmallSlabSize
+)
 
 // packing format internal attrs
 const (
@@ -68,11 +70,14 @@ const (
 	SourceAmazonObjMD = cmn.ProviderAmazon
 	SourceGoogleObjMD = cmn.ProviderGoogle
 	SourceAzureObjMD  = cmn.ProviderAzure
+	SourceHTTPObjMD   = cmn.ProviderHTTP
 	SourceWebObjMD    = "web"
 
 	VersionObjMD = "v"
 	CRC32CObjMD  = cmn.ChecksumCRC32C
 	MD5ObjMD     = cmn.ChecksumMD5
+
+	OrigURLObjMD = "orig_url"
 )
 
 func (lom *LOM) LoadMetaFromFS() error { _, err := lom.lmfs(true); return err }
@@ -84,7 +89,7 @@ func (lom *LOM) lmfs(populate bool) (md *lmeta, err error) {
 		size      int64
 		read      []byte
 		mdSize    = maxLmeta.Load()
-		mm        = lom.T.GetSmallMMSA()
+		mm        = lom.T.SmallMMSA()
 		buf, slab = mm.Alloc(mdSize)
 	)
 	read, err = fs.GetXattrBuf(lom.FQN, XattrLOM, buf)
@@ -137,7 +142,7 @@ func (lom *LOM) _persist() (buf []byte, mm *memsys.MMSA) {
 		size   int64
 		lmsize = maxLmeta.Load()
 	)
-	mm = lom.T.GetSmallMMSA()
+	mm = lom.T.SmallMMSA()
 	buf = lom.md.marshal(mm, lmsize)
 
 	size = int64(len(buf))

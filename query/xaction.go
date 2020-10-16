@@ -15,18 +15,19 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/objwalk/walkinfo"
+	"github.com/NVIDIA/aistore/xaction"
 )
 
 type (
 	ObjectsListingXact struct {
-		cmn.XactBase // ID() serves as well as a query handle
-		t            cluster.Target
-		ctx          context.Context
-		msg          *cmn.SelectMsg
-		timer        *time.Timer
-		mtx          sync.Mutex
-		buff         []*cmn.BucketEntry
-		fetchingDone bool
+		xaction.XactBase // ID() serves as well as a query handle
+		t                cluster.Target
+		ctx              context.Context
+		msg              *cmn.SelectMsg
+		timer            *time.Timer
+		mtx              sync.Mutex
+		buff             []*cmn.BucketEntry
+		fetchingDone     bool
 
 		query               *ObjectsQuery
 		resultCh            chan *Result
@@ -47,7 +48,7 @@ func NewObjectsListing(ctx context.Context, t cluster.Target, query *ObjectsQuer
 	cmn.Assert(query.BckSource.Bck != nil)
 	cmn.Assert(msg.UUID != "")
 	return &ObjectsListingXact{
-		XactBase: *cmn.NewXactBaseBck(msg.UUID, cmn.ActQueryObjects, query.BckSource.Bck.Bck),
+		XactBase: *xaction.NewXactBaseBck(msg.UUID, cmn.ActQueryObjects, query.BckSource.Bck.Bck),
 		t:        t,
 		ctx:      ctx,
 		msg:      msg,
@@ -64,7 +65,7 @@ func (r *ObjectsListingXact) stop() {
 
 func (r *ObjectsListingXact) IsMountpathXact() bool { return false } // TODO -- FIXME
 
-func (r *ObjectsListingXact) Start() {
+func (r *ObjectsListingXact) Run() error {
 	defer func() {
 		r.fetchingDone = true
 	}()
@@ -77,10 +78,11 @@ func (r *ObjectsListingXact) Start() {
 
 	if r.query.ObjectsSource.Pt != nil {
 		r.startFromTemplate()
-		return
+		return nil
 	}
 
 	r.startFromBck()
+	return nil
 }
 
 // TODO: make thread-safe
@@ -109,7 +111,7 @@ func (r *ObjectsListingXact) startFromTemplate() {
 		iter   = r.query.ObjectsSource.Pt.Iter()
 		bck    = r.query.BckSource.Bck
 		config = cmn.GCO.Get()
-		smap   = r.t.GetSowner().Get()
+		smap   = r.t.Sowner().Get()
 	)
 
 	cmn.Assert(bck.IsAIS())
@@ -160,13 +162,11 @@ func (r *ObjectsListingXact) startFromBck() {
 	cmn.Assert(r.msg != nil)
 	cmn.Assert(r.ctx != nil)
 
-	var (
-		bck = r.query.BckSource.Bck
-	)
+	bck := r.query.BckSource.Bck
 
 	// TODO: filtering for cloud buckets is not yet supported.
 	if bck.IsCloud() && !r.msg.IsFlagSet(cmn.SelectCached) {
-		si, err := cluster.HrwTargetTask(r.ID().String(), r.t.GetSowner().Get())
+		si, err := cluster.HrwTargetTask(r.ID().String(), r.t.Sowner().Get())
 		if err != nil {
 			// TODO: should we handle it somehow?
 			return

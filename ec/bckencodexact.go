@@ -13,17 +13,30 @@ import (
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 type (
+	// Implements `registry.BucketEntryProvider` and `registry.BucketEntry` interface.
+	xactBckEncodeProvider struct {
+		registry.BaseBckEntry
+		xact *XactBckEncode
+
+		t     cluster.Target
+		uuid  string
+		phase string
+	}
+
 	XactBckEncode struct {
-		cmn.XactBase
+		xaction.XactBase
 		doneCh   chan struct{}
 		mpathers map[string]*joggerBckEncode
 		t        cluster.Target
 		bck      cmn.Bck
 		wg       *sync.WaitGroup // to wait for EC finishes all objects
 	}
+
 	joggerBckEncode struct { // per mountpath
 		parent    *XactBckEncode
 		mpathInfo *fs.MountpathInfo
@@ -36,9 +49,36 @@ type (
 	}
 )
 
+func (*xactBckEncodeProvider) New(args registry.XactArgs) registry.BucketEntry {
+	return &xactBckEncodeProvider{
+		t:     args.T,
+		uuid:  args.UUID,
+		phase: args.Phase,
+	}
+}
+
+func (p *xactBckEncodeProvider) Start(bck cmn.Bck) error {
+	xec := NewXactBckEncode(bck, p.t, p.uuid)
+	p.xact = xec
+	return nil
+}
+func (*xactBckEncodeProvider) Kind() string        { return cmn.ActECEncode }
+func (p *xactBckEncodeProvider) Get() cluster.Xact { return p.xact }
+func (p *xactBckEncodeProvider) PreRenewHook(previousEntry registry.BucketEntry) (keep bool, err error) {
+	// TODO: add more checks?
+	prev := previousEntry.(*xactBckEncodeProvider)
+	if prev.phase == cmn.ActBegin && p.phase == cmn.ActCommit {
+		prev.phase = cmn.ActCommit // transition
+		keep = true
+		return
+	}
+	err = fmt.Errorf("%s(%s, phase %s): cannot %s", p.Kind(), prev.xact.Bck().Name, prev.phase, p.phase)
+	return
+}
+
 func NewXactBckEncode(bck cmn.Bck, t cluster.Target, uuid string) *XactBckEncode {
 	return &XactBckEncode{
-		XactBase: *cmn.NewXactBaseBck(uuid, cmn.ActECEncode, bck),
+		XactBase: *xaction.NewXactBaseBck(uuid, cmn.ActECEncode, bck),
 		t:        t,
 		bck:      bck,
 		wg:       &sync.WaitGroup{},
@@ -65,7 +105,7 @@ func (r *XactBckEncode) Run() (err error) {
 	var numjs int
 
 	bck := cluster.NewBckEmbed(r.bck)
-	if err := bck.Init(r.t.GetBowner(), r.t.Snode()); err != nil {
+	if err := bck.Init(r.t.Bowner(), r.t.Snode()); err != nil {
 		return err
 	}
 	if !bck.Props.EC.Enabled {
@@ -89,7 +129,7 @@ func (r *XactBckEncode) init() (int, error) {
 			parent:    r,
 			mpathInfo: mpathInfo,
 			config:    config,
-			smap:      r.t.GetSowner().Get(),
+			smap:      r.t.Sowner().Get(),
 			daemonID:  r.t.Snode().ID(),
 			stopCh:    cmn.NewStopCh(),
 		}

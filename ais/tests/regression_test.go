@@ -76,7 +76,7 @@ func TestLocalListObjectsGetTargetURL(t *testing.T) {
 		}
 		proxyURL   = tutils.RandomProxyURL(t)
 		baseParams = tutils.BaseAPIParams(proxyURL)
-		cksumType  = cmn.DefaultBucketProps().Cksum.Type
+		cksumType  = cmn.DefaultAISBckProps().Cksum.Type
 		subdir     = SmokeStr + "_" + cmn.GenTie()
 	)
 	smap := tutils.GetClusterMap(t, proxyURL)
@@ -94,6 +94,9 @@ func TestLocalListObjectsGetTargetURL(t *testing.T) {
 	msg := &cmn.SelectMsg{PageSize: pagesize, Props: cmn.GetTargetURL}
 	bl, err := api.ListObjects(baseParams, bck, msg, num)
 	tassert.CheckFatal(t, err)
+
+	tutils.SetClusterConfig(t, cmn.SimpleKVs{"client.features": strconv.FormatUint(cmn.FeatureDirectAccess, 10)})
+	defer tutils.SetClusterConfig(t, cmn.SimpleKVs{"client.features": "0"})
 
 	if len(bl.Entries) != num {
 		t.Errorf("Expected %d bucket list entries, found %d\n", num, len(bl.Entries))
@@ -144,10 +147,7 @@ func TestCloudListObjectsGetTargetURL(t *testing.T) {
 		fileNameCh = make(chan string, numberOfFiles)
 		errCh      = make(chan error, numberOfFiles)
 		targets    = make(map[string]struct{})
-		bck        = cmn.Bck{
-			Name:     clibucket,
-			Provider: cmn.AnyCloud,
-		}
+		bck        = cliBck
 		proxyURL   = tutils.RandomProxyURL(t)
 		baseParams = tutils.BaseAPIParams(proxyURL)
 		prefix     = tutils.GenRandomString(32)
@@ -176,14 +176,17 @@ func TestCloudListObjectsGetTargetURL(t *testing.T) {
 		if err != nil {
 			t.Errorf("Failed to delete objects from bucket %s, err: %v", bck, err)
 		}
-		xactArgs := api.XactReqArgs{ID: xactID, Timeout: rebalanceTimeout}
-		err = api.WaitForXaction(baseParams, xactArgs)
+		args := api.XactReqArgs{ID: xactID, Kind: cmn.ActDelete, Timeout: rebalanceTimeout}
+		_, err = api.WaitForXaction(baseParams, args)
 		tassert.CheckFatal(t, err)
 	}()
 
 	listObjectsMsg := &cmn.SelectMsg{Prefix: prefix, PageSize: pagesize, Props: cmn.GetTargetURL}
 	bucketList, err := api.ListObjects(baseParams, bck, listObjectsMsg, 0)
 	tassert.CheckFatal(t, err)
+
+	tutils.SetClusterConfig(t, cmn.SimpleKVs{"client.features": strconv.FormatUint(cmn.FeatureDirectAccess, 10)})
+	defer tutils.SetClusterConfig(t, cmn.SimpleKVs{"client.features": "0"})
 
 	if len(bucketList.Entries) != numberOfFiles {
 		t.Errorf("Number of entries in bucket list [%d] must be equal to [%d].\n",
@@ -242,7 +245,7 @@ func TestGetCorruptFileAfterPut(t *testing.T) {
 		}
 		proxyURL   = tutils.RandomProxyURL(t)
 		baseParams = tutils.BaseAPIParams(proxyURL)
-		cksumType  = cmn.DefaultBucketProps().Cksum.Type
+		cksumType  = cmn.DefaultAISBckProps().Cksum.Type
 		subdir     = SmokeStr + "_" + cmn.GenTie()
 	)
 	if containers.DockerRunning() {
@@ -263,7 +266,7 @@ func TestGetCorruptFileAfterPut(t *testing.T) {
 	objName := <-filenameCh
 	fqn := findObjOnDisk(bck, objName)
 	tutils.Logf("Corrupting file data[%s]: %s\n", objName, fqn)
-	err := ioutil.WriteFile(fqn, []byte("this file has been corrupted"), 0644)
+	err := ioutil.WriteFile(fqn, []byte("this file has been corrupted"), 0o644)
 	tassert.CheckFatal(t, err)
 	_, err = api.GetObjectWithValidation(baseParams, bck, path.Join(subdir, objName))
 	if err == nil {
@@ -278,7 +281,7 @@ func TestRegressionBuckets(t *testing.T) {
 			Provider: cmn.ProviderAIS,
 		}
 		proxyURL  = tutils.RandomProxyURL(t)
-		cksumType = cmn.DefaultBucketProps().Cksum.Type
+		cksumType = cmn.DefaultAISBckProps().Cksum.Type
 	)
 	tutils.CreateFreshBucket(t, proxyURL, bck)
 	defer tutils.DestroyBucket(t, proxyURL, bck)
@@ -299,7 +302,7 @@ func TestRenameBucket(t *testing.T) {
 			Name:     bck.Name + "_" + cmn.GenTie(),
 			Provider: cmn.ProviderAIS,
 		}
-		cksumType = cmn.DefaultBucketProps().Cksum.Type
+		cksumType = cmn.DefaultAISBckProps().Cksum.Type
 	)
 	for _, wait := range []bool{true, false} {
 		t.Run(fmt.Sprintf("wait=%v", wait), func(t *testing.T) {
@@ -311,8 +314,10 @@ func TestRenameBucket(t *testing.T) {
 			bcks, err := api.ListBuckets(baseParams, cmn.QueryBcks(bck))
 			tassert.CheckFatal(t, err)
 
-			regData := regressionTestData{bck: bck, renamedBck: renamedBck,
-				numBuckets: len(bcks), rename: true, wait: wait}
+			regData := regressionTestData{
+				bck: bck, renamedBck: renamedBck,
+				numBuckets: len(bcks), rename: true, wait: wait,
+			}
 			doBucketRegressionTest(t, proxyURL, regData, cksumType)
 		})
 	}
@@ -341,6 +346,9 @@ func doBucketRegressionTest(t *testing.T, proxyURL string, rtd regressionTestDat
 	}
 	tassert.SelectErr(t, errCh, "put", true)
 	if rtd.rename {
+		// Note: Rename bucket fails when rebalance or resilver is running.
+		// Ensure rebalance or resilver isn't running before performing a rename
+		tutils.WaitForRebalanceToComplete(t, baseParams, rebalanceTimeout)
 		_, err := api.RenameBucket(baseParams, rtd.bck, rtd.renamedBck)
 		tassert.CheckFatal(t, err)
 		tutils.Logf("Renamed %s(numobjs=%d) => %s\n", rtd.bck, numPuts, rtd.renamedBck)
@@ -375,7 +383,7 @@ func doBucketRegressionTest(t *testing.T, proxyURL string, rtd regressionTestDat
 
 func postRenameWaitAndCheck(t *testing.T, baseParams api.BaseParams, rtd regressionTestData, numPuts int, filesPutCh []string) {
 	xactArgs := api.XactReqArgs{Kind: cmn.ActRenameLB, Bck: rtd.renamedBck, Timeout: rebalanceTimeout}
-	err := api.WaitForXaction(baseParams, xactArgs)
+	_, err := api.WaitForXaction(baseParams, xactArgs)
 	tassert.CheckFatal(t, err)
 	tutils.Logf("xaction (rename %s=>%s) done\n", rtd.bck, rtd.renamedBck)
 
@@ -431,7 +439,7 @@ func TestRenameObjects(t *testing.T) {
 			Name:     t.Name(),
 			Provider: cmn.ProviderAIS,
 		}
-		cksumType = cmn.DefaultBucketProps().Cksum.Type
+		cksumType = cmn.DefaultAISBckProps().Cksum.Type
 	)
 
 	tutils.CreateFreshBucket(t, proxyURL, bck)
@@ -465,9 +473,7 @@ func TestRenameObjects(t *testing.T) {
 
 func TestObjectPrefix(t *testing.T) {
 	runProviderTests(t, func(t *testing.T, bck *cluster.Bck) {
-		var (
-			proxyURL = tutils.RandomProxyURL(t)
-		)
+		proxyURL := tutils.RandomProxyURL(t)
 
 		prefixFileNumber = numfiles
 		fileNames := prefixCreateFiles(t, proxyURL, bck.Bck, bck.Props.Cksum.Type)
@@ -669,11 +675,8 @@ func TestLRU(t *testing.T) {
 		baseParams = tutils.BaseAPIParams(proxyURL)
 
 		m = &ioContext{
-			t: t,
-			bck: cmn.Bck{
-				Name:     clibucket,
-				Provider: cmn.AnyCloud,
-			},
+			t:      t,
+			bck:    cliBck,
 			num:    100,
 			prefix: t.Name(),
 		}
@@ -738,12 +741,11 @@ func TestLRU(t *testing.T) {
 	})
 
 	tutils.Logln("starting LRU...")
-	// TODO: wait for returned ID
-	_, err := api.StartXaction(baseParams, api.XactReqArgs{Kind: cmn.ActLRU})
+	xactID, err := api.StartXaction(baseParams, api.XactReqArgs{Kind: cmn.ActLRU})
 	tassert.CheckFatal(t, err)
 
-	xactArgs := api.XactReqArgs{Kind: cmn.ActLRU, Timeout: rebalanceTimeout}
-	err = api.WaitForXaction(baseParams, xactArgs)
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActLRU, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// Check results
@@ -769,10 +771,7 @@ func TestPrefetchList(t *testing.T) {
 		toprefetch = make(chan string, numfiles)
 		proxyURL   = tutils.RandomProxyURL(t)
 		baseParams = tutils.BaseAPIParams(proxyURL)
-		bck        = cmn.Bck{
-			Name:     clibucket,
-			Provider: cmn.AnyCloud,
-		}
+		bck        = cliBck
 	)
 
 	tutils.CheckSkip(t, tutils.SkipTestArgs{Cloud: true, Bck: bck})
@@ -792,8 +791,8 @@ func TestPrefetchList(t *testing.T) {
 		t.Error(err)
 	}
 
-	xactArgs := api.XactReqArgs{ID: xactID, Timeout: rebalanceTimeout}
-	err = api.WaitForXaction(baseParams, xactArgs)
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActEvictObjects, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// 3. Prefetch evicted objects
@@ -802,12 +801,12 @@ func TestPrefetchList(t *testing.T) {
 		t.Error(err)
 	}
 
-	xactArgs.ID = xactID
-	err = api.WaitForXaction(baseParams, xactArgs)
+	args = api.XactReqArgs{ID: xactID, Kind: cmn.ActPrefetch, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// 4. Ensure that all the prefetches occurred.
-	xactArgs.Latest = true
+	xactArgs := api.XactReqArgs{ID: xactID, Timeout: rebalanceTimeout}
 	xactStats, err := api.QueryXactionStats(baseParams, xactArgs)
 	tassert.CheckFatal(t, err)
 	if xactStats.ObjCount() != n {
@@ -852,8 +851,8 @@ func TestDeleteList(t *testing.T) {
 		xactID, err := api.DeleteList(baseParams, bck.Bck, files)
 		tassert.CheckError(t, err)
 
-		xactArgs := api.XactReqArgs{ID: xactID, Timeout: rebalanceTimeout}
-		err = api.WaitForXaction(baseParams, xactArgs)
+		args := api.XactReqArgs{ID: xactID, Kind: cmn.ActDelete, Timeout: rebalanceTimeout}
+		_, err = api.WaitForXaction(baseParams, args)
 		tassert.CheckFatal(t, err)
 
 		// 3. Check to see that all the files have been deleted
@@ -873,10 +872,7 @@ func TestPrefetchRange(t *testing.T) {
 		proxyURL           = tutils.RandomProxyURL(t)
 		baseParams         = tutils.BaseAPIParams(proxyURL)
 		prefetchPrefix     = "regressionList/obj"
-		bck                = cmn.Bck{
-			Name:     clibucket,
-			Provider: cmn.AnyCloud,
-		}
+		bck                = cliBck
 	)
 
 	tutils.CheckSkip(t, tutils.SkipTestArgs{Cloud: true, Bck: bck})
@@ -911,18 +907,18 @@ func TestPrefetchRange(t *testing.T) {
 	rng := fmt.Sprintf("%s%s", prefetchPrefix, prefetchRange)
 	xactID, err := api.EvictRange(baseParams, bck, rng)
 	tassert.CheckError(t, err)
-	xactArgs := api.XactReqArgs{ID: xactID, Timeout: rebalanceTimeout}
-	err = api.WaitForXaction(baseParams, xactArgs)
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActEvictObjects, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
-	_, err = api.PrefetchRange(baseParams, bck, rng)
+	xactID, err = api.PrefetchRange(baseParams, bck, rng)
 	tassert.CheckError(t, err)
-	xactArgs = api.XactReqArgs{Kind: cmn.ActPrefetch, Bck: bck, Timeout: rebalanceTimeout}
-	err = api.WaitForXaction(baseParams, xactArgs)
+	args = api.XactReqArgs{ID: xactID, Kind: cmn.ActPrefetch, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// 4. Ensure that all the prefetches occurred
-	xactArgs.Latest = true
+	xactArgs := api.XactReqArgs{ID: xactID, Timeout: rebalanceTimeout}
 	xactStats, err := api.QueryXactionStats(baseParams, xactArgs)
 	tassert.CheckFatal(t, err)
 	if xactStats.ObjCount() != int64(len(files)) {
@@ -968,8 +964,8 @@ func TestDeleteRange(t *testing.T) {
 		tutils.Logf("Delete in range %s\n", smallrange)
 		xactID, err := api.DeleteRange(baseParams, bck.Bck, smallrange)
 		tassert.CheckError(t, err)
-		xactArgs := api.XactReqArgs{ID: xactID, Timeout: rebalanceTimeout}
-		err = api.WaitForXaction(baseParams, xactArgs)
+		args := api.XactReqArgs{ID: xactID, Kind: cmn.ActDelete, Timeout: rebalanceTimeout}
+		_, err = api.WaitForXaction(baseParams, args)
 		tassert.CheckFatal(t, err)
 
 		// 3. Check to see that the correct files have been deleted
@@ -997,8 +993,8 @@ func TestDeleteRange(t *testing.T) {
 		// 4. Delete the big range of objects
 		xactID, err = api.DeleteRange(baseParams, bck.Bck, bigrange)
 		tassert.CheckError(t, err)
-		xactArgs.ID = xactID
-		err = api.WaitForXaction(baseParams, xactArgs)
+		args = api.XactReqArgs{ID: xactID, Kind: cmn.ActDelete, Timeout: rebalanceTimeout}
+		_, err = api.WaitForXaction(baseParams, args)
 		tassert.CheckFatal(t, err)
 
 		// 5. Check to see that all the files have been deleted
@@ -1033,7 +1029,7 @@ func TestStressDeleteRange(t *testing.T) {
 			Name:     TestBucketName,
 			Provider: cmn.ProviderAIS,
 		}
-		cksumType = cmn.DefaultBucketProps().Cksum.Type
+		cksumType = cmn.DefaultAISBckProps().Cksum.Type
 	)
 
 	tutils.CreateFreshBucket(t, proxyURL, bck)
@@ -1075,8 +1071,8 @@ func TestStressDeleteRange(t *testing.T) {
 	tutils.Logf("Deleting objects in range: %s\n", partialRange)
 	xactID, err := api.DeleteRange(baseParams, bck, partialRange)
 	tassert.CheckError(t, err)
-	xactArgs := api.XactReqArgs{ID: xactID, Timeout: rebalanceTimeout}
-	err = api.WaitForXaction(baseParams, xactArgs)
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActDelete, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// 3. Check to see that correct objects have been deleted
@@ -1107,8 +1103,8 @@ func TestStressDeleteRange(t *testing.T) {
 	tutils.Logf("Deleting objects in range: %s\n", fullRange)
 	xactID, err = api.DeleteRange(baseParams, bck, fullRange)
 	tassert.CheckError(t, err)
-	xactArgs.ID = xactID
-	err = api.WaitForXaction(baseParams, xactArgs)
+	args = api.XactReqArgs{ID: xactID, Kind: cmn.ActDelete, Timeout: rebalanceTimeout}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 
 	// 5. Check to see that all files have been deleted

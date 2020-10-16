@@ -5,12 +5,9 @@
 package ais
 
 import (
-	"sync"
-
 	"github.com/NVIDIA/aistore/3rdparty/glog"
-	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 const (
@@ -21,34 +18,13 @@ const (
 )
 
 type (
-	// implements fs.PathRunGroup interface
 	fsprungroup struct {
-		sync.RWMutex
-		t       *targetrunner
-		runners map[string]fs.PathRunner // subgroup of the daemon.runners rungroup
+		t *targetrunner
 	}
 )
 
 func (g *fsprungroup) init(t *targetrunner) {
 	g.t = t
-	g.runners = make(map[string]fs.PathRunner, 8)
-}
-
-func (g *fsprungroup) Reg(r fs.PathRunner) {
-	cmn.Assert(r.Name() != "")
-	g.Lock()
-	_, ok := g.runners[r.Name()]
-	cmn.Assert(!ok)
-	g.runners[r.Name()] = r
-	g.Unlock()
-}
-
-func (g *fsprungroup) Unreg(r fs.PathRunner) {
-	g.Lock()
-	_, ok := g.runners[r.Name()]
-	cmn.Assert(ok)
-	delete(g.runners, r.Name())
-	g.Unlock()
 }
 
 // enableMountpath enables mountpath and notifies necessary runners about the
@@ -77,7 +53,7 @@ func (g *fsprungroup) disableMountpath(mpath string) (disabled bool, err error) 
 		return disabled, err
 	}
 
-	g.delMpathEvent(disableMpathAct, mpath)
+	g.delMpathEvent(disableMpathAct)
 	return true, nil
 }
 
@@ -107,52 +83,28 @@ func (g *fsprungroup) removeMountpath(mpath string) (err error) {
 		return
 	}
 
-	g.delMpathEvent(removeMpathAct, mpath)
+	g.delMpathEvent(removeMpathAct)
 	return
 }
 
 func (g *fsprungroup) addMpathEvent(action, mpath string) {
-	xaction.Registry.AbortAllMountpathsXactions()
-	g.RLock()
-	for _, r := range g.runners {
-		switch action {
-		case enableMpathAct:
-			r.ReqEnableMountpath(mpath)
-		case addMpathAct:
-			r.ReqAddMountpath(mpath)
-		default:
-			cmn.AssertMsg(false, action)
-		}
-	}
-	g.RUnlock()
+	registry.Registry.AbortAllMountpathsXactions()
 	go func() {
-		g.t.rebManager.RunResilver("", false /*skipGlobMisplaced*/)
-		xaction.Registry.MakeNCopiesOnMpathEvent(g.t, "add-mp")
+		g.t.runResilver("", false /*skipGlobMisplaced*/)
+		registry.Registry.RenewMakeNCopies(g.t, "add-mp")
 	}()
 	g.checkEnable(action, mpath)
 }
 
-func (g *fsprungroup) delMpathEvent(action, mpath string) {
-	xaction.Registry.AbortAllMountpathsXactions()
-	g.RLock()
-	for _, r := range g.runners {
-		switch action {
-		case disableMpathAct:
-			r.ReqDisableMountpath(mpath)
-		case removeMpathAct:
-			r.ReqRemoveMountpath(mpath)
-		default:
-			cmn.AssertMsg(false, action)
-		}
-	}
-	g.RUnlock()
+func (g *fsprungroup) delMpathEvent(action string) {
+	registry.Registry.AbortAllMountpathsXactions()
 	if g.checkZeroMountpaths(action) {
 		return
 	}
 
 	go func() {
-		g.t.rebManager.RunResilver("", false /*skipGlobMisplaced*/)
-		xaction.Registry.MakeNCopiesOnMpathEvent(g.t, "del-mp")
+		g.t.runResilver("", false /*skipGlobMisplaced*/)
+		registry.Registry.RenewMakeNCopies(g.t, "del-mp")
 	}()
 }
 

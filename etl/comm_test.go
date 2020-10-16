@@ -82,7 +82,6 @@ var _ = Describe("CommunicatorTest", func() {
 		proxyServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, targetServer.URL, http.StatusMovedPermanently)
 		}))
-
 	})
 
 	AfterEach(func() {
@@ -103,7 +102,12 @@ var _ = Describe("CommunicatorTest", func() {
 			pod := &corev1.Pod{}
 			pod.SetName("somename")
 
-			comm = makeCommunicator(tMock, pod, commType, transformerServer.URL, "", nil)
+			comm = makeCommunicator(commArgs{
+				t:              tMock,
+				pod:            pod,
+				commType:       commType,
+				transformerURL: transformerServer.URL,
+			})
 			resp, err := http.Get(proxyServer.URL)
 			Expect(err).NotTo(HaveOccurred())
 			defer resp.Body.Close()

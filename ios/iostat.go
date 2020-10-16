@@ -140,6 +140,39 @@ func (ctx *IostatContext) AddMpath(mpath, fs string) {
 	}
 }
 
+// For TestingEnv to avoid a case when removing a mountpath also empties
+// `disk` list, so a target stops generating disk stats.
+// If another mountpath containing the same disk is found, the disk2mpath map
+// is updated. Otherwise, the function removes disk from the disk2map map.
+func (ctx *IostatContext) removeMpathDiskTesting(mpath, disk string) {
+	if _, ok := ctx.disk2mpath[disk]; !ok {
+		return
+	}
+	for path, disks := range ctx.mpath2disks {
+		if path == mpath {
+			continue
+		}
+		for dsk := range disks {
+			if dsk == disk {
+				ctx.disk2mpath[disk] = path
+				return
+			}
+		}
+	}
+	delete(ctx.mpath2disks, disk)
+}
+
+func (ctx *IostatContext) removeMpathDisk(mpath, disk string) {
+	mp, ok := ctx.disk2mpath[disk]
+	if !ok {
+		return
+	}
+	if mp != mpath {
+		cmn.Assertf(false, "(mpath %s => disk %s => mpath %s) violation", mp, disk, mpath)
+	}
+	delete(ctx.disk2mpath, disk)
+}
+
 func (ctx *IostatContext) RemoveMpath(mpath string) {
 	ctx.mpathLock.Lock()
 	defer ctx.mpathLock.Unlock()
@@ -151,12 +184,10 @@ func (ctx *IostatContext) RemoveMpath(mpath string) {
 		return
 	}
 	for disk := range oldDisks {
-		if mp, ok := ctx.disk2mpath[disk]; ok {
-			if mp != mpath && !config.TestingEnv() {
-				s := fmt.Sprintf("(mpath %s => disk %s => mpath %s) violation", mp, disk, mpath)
-				cmn.AssertMsg(false, s)
-			}
-			delete(ctx.disk2mpath, disk)
+		if config.TestingEnv() {
+			ctx.removeMpathDiskTesting(mpath, disk)
+		} else {
+			ctx.removeMpathDisk(mpath, disk)
 		}
 	}
 	delete(ctx.mpath2disks, mpath)
@@ -166,13 +197,14 @@ func (ctx *IostatContext) GetMpathUtil(mpath string, nowTs int64) int64 {
 	cache := ctx.refreshIostatCache(nowTs)
 	return cache.mpathUtil[mpath]
 }
+
 func (ctx *IostatContext) GetAllMpathUtils(nowTs int64) (map[string]int64, map[string]*atomic.Int32) {
 	cache := ctx.refreshIostatCache(nowTs)
 	return cache.mpathUtil, cache.mpathRR
 }
 
 func (ctx *IostatContext) GetSelectedDiskStats() (m map[string]*SelectedDiskStats) {
-	var cache = ctx.refreshIostatCache()
+	cache := ctx.refreshIostatCache()
 	m = make(map[string]*SelectedDiskStats)
 	for disk := range cache.diskIOms {
 		m[disk] = &SelectedDiskStats{
@@ -185,7 +217,7 @@ func (ctx *IostatContext) GetSelectedDiskStats() (m map[string]*SelectedDiskStat
 }
 
 func (ctx *IostatContext) LogAppend(lines []string) []string {
-	var cache = ctx.refreshIostatCache()
+	cache := ctx.refreshIostatCache()
 	for _, disk := range ctx.sorted {
 		if _, ok := cache.diskIOms[disk]; !ok {
 			continue

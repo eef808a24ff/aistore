@@ -21,6 +21,7 @@ The ability to scale linearly with each added disk was, and remains, one of the 
 * easy-to-use CLI that supports [TAB auto-completions](cmd/cli/README.md);
 * automated cluster rebalancing upon: changes in cluster membership, drive failures and attachments, bucket renames;
 * N-way mirroring (RAID-1), Reed–Solomon erasure coding, end-to-end data protection.
+* [ETL offload](/etl/README.md): running user-defined extract-transform-load workloads on (and by) performance optimized storage cluster;
 
 Also, AIStore:
 
@@ -39,6 +40,7 @@ For AIStore **white paper** and design philosophy, for introduction to large-sca
 **Table of Contents**
 
 - [Prerequisites](#prerequisites)
+- [Local Playground](#local-playground)
 - [Build, Make, and Development Tools](#build-make-and-development-tools)
 - [Deployment](#deployment)
 - [Containerized Deployments: Host Resource Sharing](#containerized-deployments-host-resource-sharing)
@@ -76,9 +78,13 @@ MacOS/Darwin is also supported, albeit for development only. Certain capabilitie
 
 ## Local Playground
 
-For production deployments, please refer to [this folder](deploy/prod) and, in particular, its [Kubernetes](deploy/prod/k8s) subfolder.
+> For production deployments on Kubernetes, please refer to a separate dedicated [github repo](https://github.com/NVIDIA/ais-k8s).
 
-Assuming that [Go](https://golang.org/dl/) toolchain is already installed, the steps to deploy AIS locally on a single (development) machine:
+> For local production deployment, please refer to this [README](/deploy/prod/docker/single/README.md).
+
+> For easy steps to run local playground on [GCP](https://cloud.google.com), please refer to this [README](/deploy/dev/terraform/README.md).
+
+Assuming that [Go](https://golang.org/dl/) toolchain is already installed, the steps to deploy AIS locally on a single development machine are:
 
 ```console
 $ cd $GOPATH/src
@@ -101,18 +107,20 @@ Enter number of proxies (gateways):
 3
 Number of local cache directories (enter 0 to use preconfigured filesystems):
 2
-Select:
- 0: No 3rd party Cloud
- 1: Amazon S3
- 2: Google Cloud Storage
- 3: Azure Cloud
-0
+Select cloud providers:
+Amazon S3: (y/n) ?
+n
+Google Cloud Storage: (y/n) ?
+n
+Azure: (y/n) ?
+n
+Building aisnode: version=df24df77 providers=
 ```
 
-Or, you can run all the above non-interactively:
+Or, you can run all the above in one shot non-interactively:
 
 ```console
-$ make kill; make deploy <<< $'10\n3\n2\n0'
+$ make kill deploy <<< $'10\n3\n2\nn\nn\nn\n'
 ```
 
 > The example deploys 3 gateways and 10 targets, each with 2 local simulated filesystems.
@@ -129,17 +137,43 @@ Alternatively, if you happen to have Amazon and/or Google Cloud account, make su
 For example, the following will download objects from your (presumably) S3 bucket and distribute them across AIStore:
 
 ```console
-$ BUCKET=myS3bucket go test ./tests -v -run=download
+$ BUCKET=aws://myS3bucket go test ./tests -v -run=download
 ```
 
 Here's a minor variation of the above:
 
 ```console
-$ BUCKET=myS3bucket go test ./tests -v -run=download -args -numfiles=100 -match='a\d+'
+$ BUCKET=aws://myS3bucket go test ./tests -v -run=download -args -numfiles=100 -match='a\d+'
 ```
 
 This command runs a test that matches the specified string ("download").
 The test then downloads up to 100 objects from the bucket called myS3bucket, whereby the names of those objects match `a\d+` regex.
+
+### HTTPS
+
+In the end, all examples above run a bunch of local web servers that listen for plain HTTP requests. Following are quick steps for developers to engage HTTPS:
+
+1. Generate X.509 certificate:
+
+```console
+$ openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 1080 -nodes -subj '/CN=localhost'
+```
+
+2. Deploy cluster (4 targets, 1 gateway, 6 mountpaths, Google Cloud):
+
+```console
+$ AIS_USE_HTTPS=true AIS_SKIP_VERIFY_CRT=true make kill deploy <<< $'4\n1\n6\nn\ny\nn\n'
+```
+
+3. Run tests (both examples below list the names of buckets accessible for you in Google Cloud):
+
+```console
+$ AIS_ENDPOINT=https://localhost:8080 AIS_SKIP_VERIFY_CRT=true BUCKET=gs://myGCPbucket go test -v -p 1 -count 1 ./ais/tests -run=BucketNames
+
+$ AIS_ENDPOINT=https://localhost:8080 AIS_SKIP_VERIFY_CRT=true BUCKET=tmp go test -v -p 1 -count 1 ./ais/tests -run=BucketNames
+```
+
+> Notice environment variables above: **AIS_USE_HTTPS**, **AIS_ENDPOINT**, and **AIS_SKIP_VERIFY_CRT**.
 
 ## Build, Make and Development Tools
 
@@ -156,7 +190,7 @@ In particular, the `make` provides a growing number of developer-friendly comman
 
 ## Deployment
 
-AIStore can be deployed in a vast variety of [ways](deploy), ad-hoc, on any bare-metal or virtualized hardware. For production deployments on Kubernetes, please refer to:
+AIStore can be easily deployed on any bare-metal or virtualized hardware. This repository contains all the scripts needed to run AIS on your laptop or Linux workstation. For production deployments on Kubernetes, please refer to a separate dedicated github repo:
 
 * [Deploying AIS on k8s](https://github.com/NVIDIA/ais-k8s/blob/master/docs/README.md)
 
@@ -167,6 +201,10 @@ The rest of this section talks about a single Linux machine and, as such, is int
 [Local Playground](#local-playground) is probably the speediest option to run AIS clusters. However, to take advantage of containerization (which includes, for instance, multiple logically-isolated configurable networks), you can also run AIStore as described here:
 
 * [Getting started with Docker](docs/docker_main.md).
+
+<!-- videoStart
+{% include_relative docker_videos.md %}
+videoEnd -->
 
 ### Local Kubernetes
 

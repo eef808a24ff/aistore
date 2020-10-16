@@ -29,9 +29,7 @@ const (
 	downloadDescAllRegex  = "^" + downloadDescAllPrefix
 )
 
-var (
-	downloadDescCurPrefix = fmt.Sprintf("%s-%d-", downloadDescAllPrefix, os.Getpid())
-)
+var downloadDescCurPrefix = fmt.Sprintf("%s-%d-", downloadDescAllPrefix, os.Getpid())
 
 func generateDownloadDesc() string {
 	return downloadDescCurPrefix + time.Now().Format(time.RFC3339Nano)
@@ -48,7 +46,7 @@ func clearDownloadList(t *testing.T) {
 	for _, v := range listDownload {
 		if v.JobRunning() {
 			tutils.Logf("Canceling: %v...\n", v.ID)
-			err := api.DownloadAbort(tutils.BaseAPIParams(), v.ID)
+			err := api.AbortDownload(tutils.BaseAPIParams(), v.ID)
 			tassert.CheckFatal(t, err)
 		}
 	}
@@ -70,7 +68,7 @@ func clearDownloadList(t *testing.T) {
 
 	for _, v := range listDownload {
 		tutils.Logf("Removing: %v...\n", v.ID)
-		err := api.DownloadRemove(tutils.BaseAPIParams(), v.ID)
+		err := api.RemoveDownload(tutils.BaseAPIParams(), v.ID)
 		tassert.CheckFatal(t, err)
 	}
 }
@@ -102,7 +100,7 @@ func waitForDownload(t *testing.T, id string, timeout time.Duration) {
 		}
 
 		all := true
-		if resp, err := api.DownloadStatus(tutils.BaseAPIParams(), id); err == nil {
+		if resp, err := api.DownloadStatus(tutils.BaseAPIParams(), id, true); err == nil {
 			if !resp.JobFinished() {
 				all = false
 			}
@@ -145,7 +143,7 @@ func downloaderCompleted(t *testing.T, targetID string, targetsStats api.NodesXa
 		}
 	}
 
-	tassert.Fatalf(t, exists, "target %s not found in downloader stats", targetID)
+	tassert.Fatalf(t, exists, "Target %s not found in downloader stats", targetID)
 	return true
 }
 
@@ -156,7 +154,7 @@ func waitForDownloaderToFinish(t *testing.T, baseParams api.BaseParams, targetID
 		timeout = timeouts[0]
 	}
 
-	tutils.Logf("waiting %s for downloader to finish\n", timeout)
+	tutils.Logf("Waiting %s for downloader to finish\n", timeout)
 	time.Sleep(time.Second * 2)
 
 	xactArgs := api.XactReqArgs{Kind: cmn.ActDownload}
@@ -166,7 +164,7 @@ func waitForDownloaderToFinish(t *testing.T, baseParams api.BaseParams, targetID
 		tassert.CheckFatal(t, err)
 
 		if downloaderCompleted(t, targetID, downloaderStats) {
-			tutils.Logf("downloader has finished\n")
+			tutils.Logf("Downloader has finished\n")
 			return
 		}
 
@@ -187,9 +185,7 @@ func downloadObject(t *testing.T, bck cmn.Bck, objName, link string, shouldBeSki
 }
 
 func downloadObjectCloud(t *testing.T, body downloader.DlCloudBody, expectedFinished, expectedSkipped int) {
-	var (
-		baseParams = tutils.BaseAPIParams()
-	)
+	baseParams := tutils.BaseAPIParams()
 	body.Description = generateDownloadDesc()
 	id, err := api.DownloadWithParam(baseParams, downloader.DlTypeCloud, body)
 	tassert.CheckFatal(t, err)
@@ -205,7 +201,7 @@ func downloadObjectCloud(t *testing.T, body downloader.DlCloudBody, expectedFini
 func abortDownload(t *testing.T, id string) {
 	baseParams := tutils.BaseAPIParams()
 
-	err := api.DownloadAbort(baseParams, id)
+	err := api.AbortDownload(baseParams, id)
 	tassert.CheckFatal(t, err)
 
 	waitForDownload(t, id, 30*time.Second)
@@ -219,7 +215,7 @@ func abortDownload(t *testing.T, id string) {
 
 func verifyProps(t *testing.T, bck cmn.Bck, objName string, size int64, version string) *cmn.ObjectProps {
 	objProps, err := api.HeadObject(tutils.BaseAPIParams(), bck, objName)
-	tassert.CheckError(t, err)
+	tassert.CheckFatal(t, err)
 
 	tassert.Errorf(
 		t, objProps.Size == size,
@@ -243,9 +239,9 @@ func TestDownloadSingle(t *testing.T) {
 		objName       = "object"
 		objNameSecond = "object-second"
 
-		// links below don't contain protocols to test that no error occurs
+		// Links below don't contain protocols to test that no error occurs
 		// in case they are missing.
-		link      = "storage.googleapis.com/nvdata-openimages/imagenet/imagenet_train-000001.tgz"
+		linkLarge = "storage.googleapis.com/nvdata-openimages/openimages-train-000001.tar"
 		linkSmall = "storage.googleapis.com/minikube/iso/minikube-v0.23.0.iso.sha256"
 	)
 
@@ -254,38 +250,38 @@ func TestDownloadSingle(t *testing.T) {
 	tutils.CreateFreshBucket(t, proxyURL, bck)
 	defer tutils.DestroyBucket(t, proxyURL, bck)
 
-	id, err := api.DownloadSingle(baseParams, generateDownloadDesc(), bck, objName, link)
+	id, err := api.DownloadSingle(baseParams, generateDownloadDesc(), bck, objName, linkLarge)
 	tassert.CheckError(t, err)
 
 	time.Sleep(time.Second)
 
-	// Schedule second object
-	idSecond, err := api.DownloadSingle(baseParams, generateDownloadDesc(), bck, objNameSecond, link)
+	// Schedule second object.
+	idSecond, err := api.DownloadSingle(baseParams, generateDownloadDesc(), bck, objNameSecond, linkLarge)
 	tassert.CheckError(t, err)
 
-	// Cancel second object
-	err = api.DownloadAbort(baseParams, idSecond)
+	// Cancel second object.
+	err = api.AbortDownload(baseParams, idSecond)
 	tassert.CheckError(t, err)
 
-	// Cancel first object
+	// Cancel first object.
 	abortDownload(t, id)
 
 	time.Sleep(time.Second)
 
-	// Check if the status is still available after some time
+	// Check if the status is still available after some time.
 	if resp, err := api.DownloadStatus(baseParams, id); err != nil {
 		t.Errorf("got error when getting status for link that is not being downloaded: %v", err)
 	} else if !resp.Aborted {
 		t.Errorf("canceled link not marked: %v", resp)
 	}
 
-	err = api.DownloadAbort(baseParams, id)
+	err = api.AbortDownload(baseParams, id)
 	tassert.CheckError(t, err)
 
-	err = api.DownloadRemove(baseParams, id)
+	err = api.RemoveDownload(baseParams, id)
 	tassert.CheckError(t, err)
 
-	err = api.DownloadRemove(baseParams, id)
+	err = api.RemoveDownload(baseParams, id)
 	tassert.Errorf(t, err != nil, "expected error when removing non-existent task")
 
 	id, err = api.DownloadSingle(baseParams, generateDownloadDesc(), bck, objName, linkSmall)
@@ -428,7 +424,7 @@ func TestDownloadTimeout(t *testing.T) {
 			Provider: cmn.ProviderAIS,
 		}
 		objName    = "object"
-		link       = "https://storage.googleapis.com/nvdata-openimages/imagenet/imagenet_train-000001.tgz"
+		link       = "https://storage.googleapis.com/nvdata-openimages/openimages-train-000001.tar"
 		proxyURL   = tutils.RandomProxyURL(t)
 		baseParams = tutils.BaseAPIParams(proxyURL)
 	)
@@ -488,22 +484,13 @@ func TestDownloadCloud(t *testing.T) {
 		dstBck cmn.Bck
 	}{
 		{
-			name: "src==dst",
-			srcBck: cmn.Bck{
-				Name:     clibucket,
-				Provider: cmn.AnyCloud,
-			},
-			dstBck: cmn.Bck{
-				Name:     clibucket,
-				Provider: cmn.AnyCloud,
-			},
+			name:   "src==dst",
+			srcBck: cliBck,
+			dstBck: cliBck,
 		},
 		{
-			name: "src!=dst",
-			srcBck: cmn.Bck{
-				Name:     clibucket,
-				Provider: cmn.AnyCloud,
-			},
+			name:   "src!=dst",
+			srcBck: cliBck,
 			dstBck: cmn.Bck{
 				Name:     cmn.RandString(5),
 				Provider: cmn.ProviderAIS,
@@ -521,8 +508,8 @@ func TestDownloadCloud(t *testing.T) {
 				defer tutils.DestroyBucket(t, proxyURL, test.dstBck)
 			}
 
-			tutils.CleanCloudBucket(t, proxyURL, test.srcBck, prefix)
-			defer tutils.CleanCloudBucket(t, proxyURL, test.srcBck, prefix)
+			tutils.CleanupCloudBucket(t, proxyURL, test.srcBck, prefix)
+			defer tutils.CleanupCloudBucket(t, proxyURL, test.srcBck, prefix)
 
 			tutils.Logln("putting objects into cloud bucket...")
 
@@ -546,8 +533,8 @@ func TestDownloadCloud(t *testing.T) {
 			tutils.Logln("evicting cloud bucket...")
 			xactID, err := api.EvictList(baseParams, test.srcBck, expectedObjs)
 			tassert.CheckFatal(t, err)
-			xactArgs := api.XactReqArgs{ID: xactID, Timeout: rebalanceTimeout}
-			err = api.WaitForXaction(baseParams, xactArgs)
+			args := api.XactReqArgs{ID: xactID, Kind: cmn.ActEvictObjects, Timeout: rebalanceTimeout}
+			_, err = api.WaitForXaction(baseParams, args)
 			tassert.CheckFatal(t, err)
 
 			if test.dstBck.IsAIS() {
@@ -576,8 +563,8 @@ func TestDownloadCloud(t *testing.T) {
 			tutils.Logln("evicting cloud bucket...")
 			xactID, err = api.EvictList(baseParams, test.srcBck, expectedObjs)
 			tassert.CheckFatal(t, err)
-			xactArgs.ID = xactID
-			err = api.WaitForXaction(baseParams, xactArgs)
+			args = api.XactReqArgs{ID: xactID, Kind: cmn.ActEvictObjects, Timeout: rebalanceTimeout}
+			_, err = api.WaitForXaction(baseParams, args)
 			tassert.CheckFatal(t, err)
 
 			tutils.Logln("starting cloud download...")
@@ -594,7 +581,7 @@ func TestDownloadCloud(t *testing.T) {
 			time.Sleep(500 * time.Millisecond)
 
 			tutils.Logln("aborting cloud download...")
-			err = api.DownloadAbort(baseParams, id)
+			err = api.AbortDownload(baseParams, id)
 			tassert.CheckFatal(t, err)
 
 			resp, err := api.DownloadStatus(baseParams, id)
@@ -614,9 +601,8 @@ func TestDownloadStatus(t *testing.T) {
 			Name:     TestBucketName,
 			Provider: cmn.ProviderAIS,
 		}
-		baseParams    = tutils.BaseAPIParams()
-		shortFileName = "shortFile"
-		m             = ioContext{t: t}
+		baseParams = tutils.BaseAPIParams()
+		m          = ioContext{t: t}
 	)
 
 	m.saveClusterState()
@@ -625,11 +611,14 @@ func TestDownloadStatus(t *testing.T) {
 		return
 	}
 
-	longFileName := tutils.GenerateNotConflictingObjectName(shortFileName, "longFile", bck, m.smap)
+	var (
+		shortFileName = "shortFile"
+		longFileName  = tutils.GenerateNotConflictingObjectName(shortFileName, "longFile", bck, m.smap)
+	)
 
 	files := map[string]string{
 		shortFileName: "https://raw.githubusercontent.com/NVIDIA/aistore/master/README.md",
-		longFileName:  "https://storage.googleapis.com/nvdata-openimages/imagenet/imagenet_train-000001.tgz",
+		longFileName:  "https://storage.googleapis.com/nvdata-openimages/openimages-train-000001.tar",
 	}
 
 	clearDownloadList(t)
@@ -711,8 +700,6 @@ func TestDownloadStatusError(t *testing.T) {
 }
 
 func TestDownloadSingleValidExternalAndInternalChecksum(t *testing.T) {
-	tutils.CheckSkip(t, tutils.SkipTestArgs{Long: true})
-
 	var (
 		proxyURL   = tutils.RandomProxyURL(t)
 		baseParams = tutils.BaseAPIParams(proxyURL)
@@ -725,7 +712,7 @@ func TestDownloadSingleValidExternalAndInternalChecksum(t *testing.T) {
 		objNameSecond = "object-second"
 
 		linkFirst  = "https://storage.googleapis.com/minikube/iso/minikube-v0.23.2.iso.sha256"
-		linkSecond = "github.com/NVIDIA/aistore"
+		linkSecond = "https://raw.githubusercontent.com/NVIDIA/aistore/master/README.md"
 
 		expectedObjects = []string{objNameFirst, objNameSecond}
 	)
@@ -743,8 +730,8 @@ func TestDownloadSingleValidExternalAndInternalChecksum(t *testing.T) {
 	id2, err := api.DownloadSingle(baseParams, generateDownloadDesc(), bck, objNameSecond, linkSecond)
 	tassert.CheckError(t, err)
 
-	waitForDownload(t, id, 5*time.Second)
-	waitForDownload(t, id2, 5*time.Second)
+	waitForDownload(t, id, 10*time.Second)
+	waitForDownload(t, id2, 10*time.Second)
 
 	// If the file was successfully downloaded, it means that the external checksum was correct. Also because of the
 	// ValidateWarmGet property being set to True, if it was downloaded without errors then the internal checksum was
@@ -753,8 +740,6 @@ func TestDownloadSingleValidExternalAndInternalChecksum(t *testing.T) {
 }
 
 func TestDownloadMultiValidExternalAndInternalChecksum(t *testing.T) {
-	tutils.CheckSkip(t, tutils.SkipTestArgs{Long: true})
-
 	var (
 		proxyURL   = tutils.RandomProxyURL(t)
 		baseParams = tutils.BaseAPIParams(proxyURL)
@@ -768,7 +753,7 @@ func TestDownloadMultiValidExternalAndInternalChecksum(t *testing.T) {
 
 		m = map[string]string{
 			"linkFirst":  "https://storage.googleapis.com/minikube/iso/minikube-v0.23.2.iso.sha256",
-			"linkSecond": "github.com/NVIDIA/aistore",
+			"linkSecond": "https://raw.githubusercontent.com/NVIDIA/aistore/master/README.md",
 		}
 
 		expectedObjects = []string{objNameFirst, objNameSecond}
@@ -832,7 +817,7 @@ func TestDownloadIntoNonexistentBucket(t *testing.T) {
 	var (
 		baseParams = tutils.BaseAPIParams()
 		objName    = "object"
-		obj        = "storage.googleapis.com/nvdata-openimages/imagenet/imagenet_train-000001.tgz"
+		obj        = "storage.googleapis.com/nvdata-openimages/openimages-train-000001.tar"
 	)
 
 	bucket, err := tutils.GenerateNonexistentBucketName("download", baseParams)
@@ -858,12 +843,14 @@ func TestDownloadMpathEvents(t *testing.T) {
 		}
 		objsCnt = 100
 
-		template = "storage.googleapis.com/nvdata-openimages/imagenet/imagenet_train-{000000..000050}.tgz"
+		template = "storage.googleapis.com/nvdata-openimages/openimages-train-{000000..000050}.tar"
 		m        = make(map[string]string, objsCnt)
 	)
 
-	// prepare objects to be downloaded to targets. Multiple objects to make sure that at least
-	// one of them gets into target with disabled mountpath
+	clearDownloadList(t)
+
+	// Prepare objects to be downloaded to targets. Multiple objects to make
+	// sure that at least one of them gets into target with disabled mountpath.
 	for i := 0; i < objsCnt; i++ {
 		m[strconv.FormatInt(int64(i), 10)] = "https://raw.githubusercontent.com/NVIDIA/aistore/master/README.md"
 	}
@@ -871,9 +858,12 @@ func TestDownloadMpathEvents(t *testing.T) {
 	tutils.CreateFreshBucket(t, proxyURL, bck)
 	defer tutils.DestroyBucket(t, proxyURL, bck)
 
-	id, err := api.DownloadRange(baseParams, generateDownloadDesc(), bck, template)
+	id1, err := api.DownloadRange(baseParams, generateDownloadDesc(), bck, template)
 	tassert.CheckFatal(t, err)
-	tutils.Logf("Started large download job %s, meant to be aborted\n", id)
+	tutils.Logf("Started large download job %s, meant to be aborted\n", id1)
+
+	// Abort just in case something goes wrong.
+	defer abortDownload(t, id1)
 
 	smap := tutils.GetClusterMap(t, proxyURL)
 	removeTarget := tutils.ExtractTargetNodes(smap)[0]
@@ -889,31 +879,30 @@ func TestDownloadMpathEvents(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	defer func() {
-		// Enable mountpah
 		tutils.Logf("Enabling mountpath %s at target %s...\n", removeMpath, removeTarget.ID())
 		err = api.EnableMountpath(baseParams, removeTarget, removeMpath)
 		tassert.CheckFatal(t, err)
 	}()
 
-	// wait until downloader is aborted
+	// Wait until downloader is aborted.
 	waitForDownloaderToFinish(t, baseParams, removeTarget.ID(), time.Second*30)
-	// downloader finished on required target, safe to abort the rest
-	tutils.Logf("Aborting download job %s\n", id)
-	err = api.DownloadAbort(baseParams, id)
-	tassert.CheckFatal(t, err)
+
+	// Downloader finished on required target, safe to abort the rest.
+	tutils.Logf("Aborting download job %s\n", id1)
+	abortDownload(t, id1)
 
 	objs, err := tutils.ListObjectNames(proxyURL, bck, "", 0)
 	tassert.CheckError(t, err)
 	tassert.Fatalf(t, len(objs) == 0, "objects should not have been downloaded, download should have been aborted\n")
 
-	id, err = api.DownloadMulti(baseParams, generateDownloadDesc(), bck, m)
+	id2, err := api.DownloadMulti(baseParams, generateDownloadDesc(), bck, m)
 	tassert.CheckFatal(t, err)
-	tutils.Logf("Started download job %s, waiting for it to finish\n", id)
+	tutils.Logf("Started download job %s, waiting for it to finish\n", id2)
 
-	waitForDownload(t, id, 2*time.Minute)
+	waitForDownload(t, id2, 2*time.Minute)
 	objs, err = tutils.ListObjectNames(proxyURL, bck, "", 0)
 	tassert.CheckError(t, err)
-	tassert.Fatalf(t, len(objs) == objsCnt, "Expected %d objects to be present, got: %d", objsCnt, len(objs)) // 21: from cifar10.tgz to cifar30.tgz
+	tassert.Fatalf(t, len(objs) == objsCnt, "Expected %d objects to be present, got: %d", objsCnt, len(objs))
 }
 
 func TestDownloadOverrideObject(t *testing.T) {
@@ -924,13 +913,15 @@ func TestDownloadOverrideObject(t *testing.T) {
 			Name:     cmn.RandString(10),
 			Provider: cmn.ProviderAIS,
 		}
-		p = cmn.DefaultBucketProps()
+		p = cmn.DefaultAISBckProps()
 
 		objName = cmn.RandString(10)
 		link    = "https://storage.googleapis.com/minikube/iso/minikube-v0.23.2.iso.sha256"
 
 		expectedSize int64 = 65
 	)
+
+	clearDownloadList(t)
 
 	tutils.CreateFreshBucket(t, proxyURL, bck)
 	defer tutils.DestroyBucket(t, proxyURL, bck)
@@ -966,7 +957,7 @@ func TestDownloadOverrideObjectWeb(t *testing.T) {
 			Name:     cmn.RandString(10),
 			Provider: cmn.ProviderAIS,
 		}
-		p = cmn.DefaultBucketProps()
+		p = cmn.DefaultAISBckProps()
 
 		objName = cmn.RandString(10)
 		link    = "https://raw.githubusercontent.com/NVIDIA/aistore/master/LICENSE"
@@ -974,6 +965,8 @@ func TestDownloadOverrideObjectWeb(t *testing.T) {
 		expectedSize int64 = 1075
 		newSize      int64 = 10
 	)
+
+	clearDownloadList(t)
 
 	tutils.CreateFreshBucket(t, proxyURL, bck)
 	defer tutils.DestroyBucket(t, proxyURL, bck)
@@ -1015,10 +1008,7 @@ func TestDownloadOverrideObjectCloud(t *testing.T) {
 		m = &ioContext{
 			t:   t,
 			num: 10,
-			bck: cmn.Bck{
-				Name:     clibucket,
-				Provider: cmn.AnyCloud,
-			},
+			bck: cliBck,
 		}
 	)
 
@@ -1081,10 +1071,7 @@ func TestDownloadSkipObjectCloud(t *testing.T) {
 		m = &ioContext{
 			t:   t,
 			num: 10,
-			bck: cmn.Bck{
-				Name:     clibucket,
-				Provider: cmn.AnyCloud,
-			},
+			bck: cliBck,
 		}
 	)
 
@@ -1123,10 +1110,7 @@ func TestDownloadSync(t *testing.T) {
 		m = &ioContext{
 			t:   t,
 			num: 10,
-			bck: cmn.Bck{
-				Name:     clibucket,
-				Provider: cmn.AnyCloud,
-			},
+			bck: cliBck,
 		}
 		objsToDelete = 4
 	)

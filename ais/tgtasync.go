@@ -10,11 +10,13 @@ import (
 	"net/http"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
-	"github.com/NVIDIA/aistore/bcklist"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/nl"
+	"github.com/NVIDIA/aistore/objlist"
 	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 // listObjects returns a list of objects in a bucket (with optional prefix).
@@ -42,11 +44,11 @@ func (t *targetrunner) listObjects(w http.ResponseWriter, r *http.Request, bck *
 	}
 	cmn.Assert(msg.PageSize != 0)
 
-	xact, isNew, err := xaction.Registry.RenewBckListNewXact(t, bck, msg.UUID, msg)
+	xact, isNew, err := registry.Registry.RenewObjList(t, bck, msg.UUID, msg)
 	// Double check that xaction has not gone before starting page read.
 	// Restart xaction if needed.
-	if err == bcklist.ErrGone {
-		xact, isNew, err = xaction.Registry.RenewBckListNewXact(t, bck, msg.UUID, msg)
+	if err == objlist.ErrGone {
+		xact, isNew, err = registry.Registry.RenewObjList(t, bck, msg.UUID, msg)
 	}
 	if err != nil {
 		t.invalmsghdlr(w, r, err.Error())
@@ -54,24 +56,30 @@ func (t *targetrunner) listObjects(w http.ResponseWriter, r *http.Request, bck *
 	}
 
 	if isNew {
-		smap := t.owner.smap.get()
-		xact.AddNotif(&cmn.NotifXact{
-			NotifBase: cmn.NotifBase{When: cmn.UponTerm, Ty: notifCache, Dsts: smap.IC.Keys(), F: t.xactCallerNotify},
-		})
+		if false {
+			// TODO -- FIXME - enable after fixing #922
+			xact.AddNotif(&xaction.NotifXact{
+				NotifBase: nl.NotifBase{
+					When: cluster.UponTerm,
+					Dsts: []string{equalIC},
+					F:    t.callerNotifyFin,
+				},
+			})
+		}
 
 		go xact.Run()
 	}
 
-	bckList, status, err := t.waitBckListResp(xact, msg)
-	if err != nil {
-		t.invalmsghdlr(w, r, err.Error(), status)
+	resp := xact.(*objlist.Xact).Do(msg)
+	if resp.Err != nil {
+		t.invalmsghdlr(w, r, resp.Err.Error(), resp.Status)
 		return false
 	}
 
-	debug.Assert(status == http.StatusOK)
-	debug.Assert(bckList.UUID != "")
+	debug.Assert(resp.Status == http.StatusOK)
+	debug.Assert(resp.BckList.UUID != "")
 
-	return t.writeMsgPack(w, r, bckList, "list_objects")
+	return t.writeMsgPack(w, r, resp.BckList, "list_objects")
 }
 
 func (t *targetrunner) bucketSummary(w http.ResponseWriter, r *http.Request, bck *cluster.Bck, actionMsg *aisMsg) (ok bool) {
@@ -89,13 +97,6 @@ func (t *targetrunner) bucketSummary(w http.ResponseWriter, r *http.Request, bck
 	}
 	ok = t.doAsync(w, r, actionMsg.Action, bck, &msg)
 	return
-}
-
-func (t *targetrunner) waitBckListResp(xact *bcklist.BckListTask, msg *cmn.SelectMsg) (*cmn.BucketList, int, error) {
-	ch := make(chan *bcklist.BckListResp) // unbuffered
-	xact.Do(msg, ch)
-	resp := <-ch
-	return resp.BckList, resp.Status, resp.Err
 }
 
 // asynchronous bucket request
@@ -118,7 +119,7 @@ func (t *targetrunner) doAsync(w http.ResponseWriter, r *http.Request, action st
 
 		switch action {
 		case cmn.ActSummaryBucket:
-			_, err = xaction.Registry.RenewBckSummaryXact(ctx, t, bck, msg)
+			_, err = registry.Registry.RenewBckSummary(ctx, t, bck, msg)
 		default:
 			t.invalmsghdlrf(w, r, "invalid action: %s", action)
 			return false
@@ -133,7 +134,7 @@ func (t *targetrunner) doAsync(w http.ResponseWriter, r *http.Request, action st
 		return true
 	}
 
-	xact := xaction.Registry.GetXact(msg.UUID)
+	xact := registry.Registry.GetXact(msg.UUID)
 	// task never started
 	if xact == nil {
 		s := fmt.Sprintf("Task %s not found", msg.UUID)

@@ -14,13 +14,22 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/xaction/demand"
+	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 type (
+	putMirrorProvider struct {
+		registry.BaseBckEntry
+		xact *XactPut
+
+		t    cluster.Target
+		uuid string
+		lom  *cluster.LOM
+	}
 	XactPut struct {
-		// implements cmn.Xact a cmn.Runner interfaces
-		demand.XactDemandBase
+		// implements cluster.Xact and cmn.Runner interfaces
+		xaction.XactDemandBase
 		// runtime
 		workCh   chan *cluster.LOM
 		mpathers map[string]mpather
@@ -38,6 +47,24 @@ type (
 	}
 )
 
+func (*putMirrorProvider) New(args registry.XactArgs) registry.BucketEntry {
+	return &putMirrorProvider{t: args.T, uuid: args.UUID, lom: args.Custom.(*cluster.LOM)}
+}
+
+func (p *putMirrorProvider) Start(_ cmn.Bck) error {
+	slab, err := p.t.MMSA().GetSlab(memsys.MaxPageSlabSize) // TODO: estimate
+	cmn.AssertNoErr(err)
+	xact, err := RunXactPut(p.lom, slab)
+	if err != nil {
+		glog.Error(err)
+		return err
+	}
+	p.xact = xact
+	return nil
+}
+func (*putMirrorProvider) Kind() string        { return cmn.ActPutCopies }
+func (p *putMirrorProvider) Get() cluster.Xact { return p.xact }
+
 //
 // public methods
 //
@@ -48,7 +75,7 @@ func RunXactPut(lom *cluster.LOM, slab *memsys.Slab) (r *XactPut, err error) {
 		mpathCount        = len(availablePaths)
 	)
 	r = &XactPut{
-		XactDemandBase: *demand.NewXactDemandBaseBck(cmn.ActPutCopies, lom.Bck().Bck),
+		XactDemandBase: *xaction.NewXactDemandBaseBck(cmn.ActPutCopies, lom.Bck().Bck),
 		slab:           slab,
 		mirror:         *lom.MirrorConf(),
 	}
@@ -108,7 +135,7 @@ func (r *XactPut) Run() error {
 // main method: replicate a given locally stored object
 func (r *XactPut) Repl(lom *cluster.LOM) (err error) {
 	if r.Finished() {
-		err = cmn.NewErrXactExpired("Cannot replicate: " + r.String())
+		err = xaction.NewErrXactExpired("Cannot replicate: " + r.String())
 		return
 	}
 	r.total.Inc()

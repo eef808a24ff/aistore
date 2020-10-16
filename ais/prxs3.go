@@ -17,7 +17,6 @@ import (
 	"github.com/NVIDIA/aistore/ais/s3compat"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -138,7 +137,7 @@ func (p *proxyrunner) putBckS3(w http.ResponseWriter, r *http.Request, bucket st
 		return
 	}
 	msg := cmn.ActionMsg{Action: cmn.ActCreateLB}
-	if p.forwardCP(w, r, &msg, bucket, nil) {
+	if p.forwardCP(w, r, &msg, bucket) {
 		return
 	}
 	if err := p.createBucket(&msg, bck); err != nil {
@@ -163,7 +162,7 @@ func (p *proxyrunner) delBckS3(w http.ResponseWriter, r *http.Request, bucket st
 		p.invalmsghdlr(w, r, err.Error(), http.StatusForbidden)
 		return
 	}
-	if p.forwardCP(w, r, &msg, bucket, nil) {
+	if p.forwardCP(w, r, &msg, bucket) {
 		return
 	}
 	if err := p.destroyBucket(&msg, bck); err != nil {
@@ -179,9 +178,7 @@ func (p *proxyrunner) delBckS3(w http.ResponseWriter, r *http.Request, bucket st
 // DEL s3/bck-name?delete
 // Delete list of objects
 func (p *proxyrunner) delMultipleObjs(w http.ResponseWriter, r *http.Request, bucket string) {
-	defer func() {
-		debug.AssertNoErr(r.Body.Close())
-	}()
+	defer cmn.Close(r.Body)
 	bck := cluster.NewBck(bucket, cmn.ProviderAIS, cmn.NsGlobal)
 	if err := bck.Init(p.owner.bmd, p.si); err != nil {
 		p.invalmsghdlr(w, r, err.Error(), http.StatusNotFound)
@@ -474,12 +471,7 @@ func (p *proxyrunner) getBckVersioningS3(w http.ResponseWriter, r *http.Request,
 		p.invalmsghdlr(w, r, err.Error())
 		return
 	}
-	props, exists := p.owner.bmd.get().Get(bck)
-	if !exists {
-		p.invalmsghdlr(w, r, "bucket does not exists", http.StatusNotFound)
-		return
-	}
-	resp := s3compat.NewVersioningConfiguration(props.Versioning.Enabled)
+	resp := s3compat.NewVersioningConfiguration(bck.Props.Versioning.Enabled)
 	b := resp.MustMarshal()
 	w.Header().Set(cmn.HeaderContentType, cmn.ContentXML)
 	w.Write(b)
@@ -488,7 +480,7 @@ func (p *proxyrunner) getBckVersioningS3(w http.ResponseWriter, r *http.Request,
 // PUT s3/bk-name?versioning
 func (p *proxyrunner) putBckVersioningS3(w http.ResponseWriter, r *http.Request, bucket string) {
 	msg := &cmn.ActionMsg{Action: cmn.ActSetBprops}
-	if p.forwardCP(w, r, msg, bucket, nil) {
+	if p.forwardCP(w, r, msg, bucket) {
 		return
 	}
 	bck := cluster.NewBck(bucket, cmn.ProviderAIS, cmn.NsGlobal)
@@ -502,9 +494,7 @@ func (p *proxyrunner) putBckVersioningS3(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	decoder := xml.NewDecoder(r.Body)
-	defer func() {
-		debug.AssertNoErr(r.Body.Close())
-	}()
+	defer cmn.Close(r.Body)
 	vconf := &s3compat.VersioningConfiguration{}
 	if err := decoder.Decode(vconf); err != nil {
 		p.invalmsghdlr(w, r, err.Error())
@@ -514,7 +504,7 @@ func (p *proxyrunner) putBckVersioningS3(w http.ResponseWriter, r *http.Request,
 	propsToUpdate := cmn.BucketPropsToUpdate{
 		Versioning: &cmn.VersionConfToUpdate{Enabled: &enabled},
 	}
-	if _, err := p.setBucketProps(msg, bck, propsToUpdate); err != nil {
+	if _, err := p.setBucketProps(w, r, msg, bck, propsToUpdate); err != nil {
 		p.invalmsghdlr(w, r, err.Error())
 	}
 }

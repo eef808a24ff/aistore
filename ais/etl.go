@@ -7,11 +7,13 @@ package ais
 import (
 	"io/ioutil"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/etl"
 )
 
@@ -21,15 +23,41 @@ import (
 
 // [METHOD] /v1/etl
 func (t *targetrunner) etlHandler(w http.ResponseWriter, r *http.Request) {
-	if err := t.checkK8s(); err != nil {
+	if err := k8s.Detect(); err != nil {
 		t.invalmsghdlr(w, r, err.Error())
 		return
 	}
 	switch {
 	case r.Method == http.MethodPost:
-		t.initETL(w, r)
+		apiItems, err := t.checkRESTItems(w, r, 1, false, cmn.Version, cmn.ETL)
+		if err != nil {
+			return
+		}
+
+		switch apiItems[0] {
+		case cmn.ETLInit:
+			t.initETL(w, r)
+		case cmn.ETLBuild:
+			t.buildETL(w, r)
+		default:
+			t.invalmsghdlrf(w, r, "invalid POST path: %s", apiItems[0])
+		}
 	case r.Method == http.MethodGet:
-		t.listETLs(w, r)
+		apiItems, err := t.checkRESTItems(w, r, 1, true, cmn.Version, cmn.ETL)
+		if err != nil {
+			return
+		}
+
+		switch apiItems[0] {
+		case cmn.ETLList:
+			t.listETL(w, r)
+		case cmn.ETLLogs:
+			t.logsETL(w, r)
+		case cmn.ETLObject: // TODO: maybe it should be just a default
+			t.getObjectETL(w, r)
+		}
+	case r.Method == http.MethodHead:
+		t.headObjectETL(w, r)
 	case r.Method == http.MethodDelete:
 		t.stopETL(w, r)
 	default:
@@ -38,8 +66,8 @@ func (t *targetrunner) etlHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *targetrunner) initETL(w http.ResponseWriter, r *http.Request) {
-	var msg etl.Msg
-	if _, err := t.checkRESTItems(w, r, 0, false, cmn.Version, cmn.ETL, cmn.EtlInit); err != nil {
+	var msg etl.InitMsg
+	if _, err := t.checkRESTItems(w, r, 0, false, cmn.Version, cmn.ETL, cmn.ETLInit); err != nil {
 		return
 	}
 	if err := cmn.ReadJSON(w, r, &msg); err != nil {
@@ -50,8 +78,21 @@ func (t *targetrunner) initETL(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (t *targetrunner) buildETL(w http.ResponseWriter, r *http.Request) {
+	var msg etl.BuildMsg
+	if _, err := t.checkRESTItems(w, r, 0, false, cmn.Version, cmn.ETL, cmn.ETLBuild); err != nil {
+		return
+	}
+	if err := cmn.ReadJSON(w, r, &msg); err != nil {
+		return
+	}
+	if err := etl.Build(t, msg); err != nil {
+		t.invalmsghdlr(w, r, err.Error())
+	}
+}
+
 func (t *targetrunner) stopETL(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := t.checkRESTItems(w, r, 1, false, cmn.Version, cmn.ETL, cmn.EtlStop)
+	apiItems, err := t.checkRESTItems(w, r, 1, false, cmn.Version, cmn.ETL, cmn.ETLStop)
 	if err != nil {
 		return
 	}
@@ -73,14 +114,16 @@ func (t *targetrunner) doETL(w http.ResponseWriter, r *http.Request, uuid string
 	comm, err = etl.GetCommunicator(uuid)
 	if err != nil {
 		if _, ok := err.(*cmn.NotFoundError); ok {
-			t.invalmsghdlrstatusf(w, r, http.StatusNotFound, "%s. Try starting new ETL with \"%s/v1/etl/init\" endpoint",
-				err.Error(), t.owner.smap.Get().Primary.URL(cmn.NetworkPublic))
+			smap := t.owner.smap.Get()
+			t.invalmsghdlrstatusf(w, r,
+				http.StatusNotFound,
+				"%v - try starting new ETL with \"%s/v1/etl/init\" endpoint",
+				err.Error(), smap.Primary.URL(cmn.NetworkPublic))
 			return
 		}
 		t.invalmsghdlr(w, r, err.Error())
 		return
 	}
-
 	if err := comm.Do(w, r, bck, objName); err != nil {
 		t.invalmsghdlr(w, r, cmn.NewETLError(&cmn.ETLErrorContext{
 			UUID:    uuid,
@@ -90,11 +133,74 @@ func (t *targetrunner) doETL(w http.ResponseWriter, r *http.Request, uuid string
 	}
 }
 
-func (t *targetrunner) listETLs(w http.ResponseWriter, r *http.Request) {
-	if _, err := t.checkRESTItems(w, r, 0, false, cmn.Version, cmn.ETL, cmn.EtlList); err != nil {
+func (t *targetrunner) listETL(w http.ResponseWriter, r *http.Request) {
+	if _, err := t.checkRESTItems(w, r, 0, false, cmn.Version, cmn.ETL, cmn.ETLList); err != nil {
 		return
 	}
 	t.writeJSON(w, r, etl.List(), "list-ETL")
+}
+
+func (t *targetrunner) logsETL(w http.ResponseWriter, r *http.Request) {
+	apiItems, err := t.checkRESTItems(w, r, 1, false, cmn.Version, cmn.ETL, cmn.ETLLogs)
+	if err != nil {
+		return
+	}
+
+	uuid := apiItems[0]
+	logs, err := etl.PodLogs(t, uuid)
+	if err != nil {
+		t.invalmsghdlr(w, r, err.Error())
+		return
+	}
+	t.writeJSON(w, r, logs, "logs-ETL")
+}
+
+// GET /v1/etl/objects/<secret>/<bucket-name>/<object-name>
+//
+// getObjectETL handles GET requests from ETL containers (K8s Pods).
+// getObjectETL validates the secret that was injected into a Pod during its initialization.
+func (t *targetrunner) getObjectETL(w http.ResponseWriter, r *http.Request) {
+	apiItems, err := t.checkRESTItems(w, r, 3, false, cmn.Version, cmn.ETL, cmn.ETLObject)
+	if err != nil {
+		return
+	}
+
+	var (
+		secret  = apiItems[0]
+		bucket  = apiItems[1]
+		objName = apiItems[2]
+	)
+
+	if err := etl.CheckSecret(secret); err != nil {
+		t.invalmsghdlr(w, r, err.Error())
+		return
+	}
+
+	t.getObject(w, r, r.URL.Query(), bucket, objName)
+}
+
+// HEAD /v1/etl/objects/<secret>/<bucket-name>/<object-name>
+//
+// headObjectETL handles HEAD requests from ETL containers (K8s Pods).
+// headObjectETL validates the secret that was injected into a Pod during its initialization.
+func (t *targetrunner) headObjectETL(w http.ResponseWriter, r *http.Request) {
+	apiItems, err := t.checkRESTItems(w, r, 3, false, cmn.Version, cmn.ETL, cmn.ETLObject)
+	if err != nil {
+		return
+	}
+
+	var (
+		secret  = apiItems[0]
+		bucket  = apiItems[1]
+		objName = apiItems[2]
+	)
+
+	if err := etl.CheckSecret(secret); err != nil {
+		t.invalmsghdlr(w, r, err.Error())
+		return
+	}
+
+	t.headObject(w, r, r.URL.Query(), bucket, objName)
 }
 
 ////////////////
@@ -105,9 +211,32 @@ func (t *targetrunner) listETLs(w http.ResponseWriter, r *http.Request) {
 func (p *proxyrunner) etlHandler(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodPost:
-		p.initETL(w, r)
+		apiItems, err := p.checkRESTItems(w, r, 1, false, cmn.Version, cmn.ETL)
+		if err != nil {
+			return
+		}
+		switch apiItems[0] {
+		case cmn.ETLInit:
+			p.initETL(w, r)
+		case cmn.ETLBuild:
+			p.buildETL(w, r)
+		default:
+			p.invalmsghdlrf(w, r, "invalid POST path: %s", apiItems[0])
+		}
 	case r.Method == http.MethodGet:
-		p.listETL(w, r)
+		apiItems, err := p.checkRESTItems(w, r, 1, true, cmn.Version, cmn.ETL)
+		if err != nil {
+			return
+		}
+
+		switch apiItems[0] {
+		case cmn.ETLList:
+			p.listETL(w, r)
+		case cmn.ETLLogs:
+			p.logsETL(w, r)
+		default:
+			p.invalmsghdlrf(w, r, "invalid GET path: %s", apiItems[0])
+		}
 	case r.Method == http.MethodDelete:
 		p.stopETL(w, r)
 	default:
@@ -117,14 +246,14 @@ func (p *proxyrunner) etlHandler(w http.ResponseWriter, r *http.Request) {
 
 // POST /v1/etl/init
 //
-// initETL creates new ETL following steps:
-//  * Validate user provided pod specification.
-//  * Generate UUID of an ETL.
-//  * Broadcast initETL message to all targets.
-//  * If any of targets failed starting an ETL, stop the ETL on all targets.
-//  * Return UUID to the user if all above steps succeeded.
+// initETL creates a new ETL (instance) as follows:
+//  1. Validate user-provided pod specification.
+//  2. Generate UUID.
+//  3. Broadcast initETL message to all targets.
+//  4. If any target fails to start ETL stop it on all (targets).
+//  5. In the event of success return ETL's UUID to the user.
 func (p *proxyrunner) initETL(w http.ResponseWriter, r *http.Request) {
-	_, err := p.checkRESTItems(w, r, 0, false, cmn.Version, cmn.ETL, cmn.EtlInit)
+	_, err := p.checkRESTItems(w, r, 0, false, cmn.Version, cmn.ETL, cmn.ETLInit)
 	if err != nil {
 		return
 	}
@@ -159,13 +288,60 @@ func (p *proxyrunner) initETL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// At least one init call has failed. Terminate all started ETL pods.
-	// Discard the stop results. Calls may succeed (for targets that successfully started a pod),
-	// or fail (for targets that didn't start successfully a pod).
+	// At least one `init` call has failed. Terminate all started ETL pods.
+	// (Termination calls may succeed for the targets that already succeeded in starting ETL,
+	//  or fail otherwise - ignore the failures).
 	p.bcastToGroup(bcastArgs{
 		req: cmn.ReqArgs{
 			Method: http.MethodDelete,
-			Path:   cmn.URLPath(cmn.Version, cmn.ETL, cmn.EtlStop, msg.ID),
+			Path:   cmn.JoinWords(cmn.Version, cmn.ETL, cmn.ETLStop, msg.ID),
+		},
+		timeout: cmn.LongTimeout,
+	})
+	p.invalmsghdlr(w, r, err.Error())
+}
+
+// POST /v1/etl/build
+func (p *proxyrunner) buildETL(w http.ResponseWriter, r *http.Request) {
+	_, err := p.checkRESTItems(w, r, 0, false, cmn.Version, cmn.ETL, cmn.ETLBuild)
+	if err != nil {
+		return
+	}
+
+	var msg etl.BuildMsg
+	if err := cmn.ReadJSON(w, r, &msg); err != nil {
+		return
+	}
+
+	msg.ID = cmn.GenUUID()
+	if err := msg.Validate(); err != nil {
+		p.invalmsghdlr(w, r, err.Error())
+		return
+	}
+
+	results := p.bcastToGroup(bcastArgs{
+		req:     cmn.ReqArgs{Method: http.MethodPost, Path: r.URL.Path, Body: cmn.MustMarshal(msg)},
+		timeout: cmn.LongTimeout,
+	})
+	for res := range results {
+		if res.err != nil {
+			err = res.err
+			glog.Error(err)
+		}
+	}
+	if err == nil {
+		// All init calls have succeeded, return UUID.
+		w.Write([]byte(msg.ID))
+		return
+	}
+
+	// At least one `build` call has failed. Terminate all `build`s.
+	// (Termination calls may succeed for the targets that already succeeded in starting ETL,
+	//  or fail otherwise - ignore the failures).
+	p.bcastToGroup(bcastArgs{
+		req: cmn.ReqArgs{
+			Method: http.MethodDelete,
+			Path:   cmn.JoinWords(cmn.Version, cmn.ETL, cmn.ETLStop, msg.ID),
 		},
 		timeout: cmn.LongTimeout,
 	})
@@ -174,10 +350,10 @@ func (p *proxyrunner) initETL(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/etl/list
 func (p *proxyrunner) listETL(w http.ResponseWriter, r *http.Request) {
-	if _, err := p.checkRESTItems(w, r, 0, false, cmn.Version, cmn.ETL, cmn.EtlList); err != nil {
+	if _, err := p.checkRESTItems(w, r, 0, false, cmn.Version, cmn.ETL, cmn.ETLList); err != nil {
 		return
 	}
-	si, err := p.GetSowner().Get().GetRandTarget()
+	si, err := p.Sowner().Get().GetRandTarget()
 	if err != nil {
 		p.invalmsghdlrf(w, r, "failed to pick random target, err: %v", err)
 		return
@@ -186,9 +362,62 @@ func (p *proxyrunner) listETL(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 }
 
-// DELETE /v1/etl/stop/uuid
+// GET /v1/etl/logs/<uuid>[/<target_id>]
+func (p *proxyrunner) logsETL(w http.ResponseWriter, r *http.Request) {
+	apiItems, err := p.checkRESTItems(w, r, 1, true, cmn.Version, cmn.ETL, cmn.ETLLogs)
+	if err != nil {
+		return
+	}
+	uuid := apiItems[0]
+	if uuid == "" {
+		p.invalmsghdlr(w, r, "ETL ID cannot be empty")
+		return
+	}
+	var results chan callResult
+	if len(apiItems) > 1 {
+		// specific target
+		var (
+			tid = apiItems[1]
+			si  = p.owner.smap.get().GetTarget(tid)
+		)
+		if si == nil {
+			p.invalmsghdlrf(w, r, "unknown target %q", tid)
+			return
+		}
+		results = make(chan callResult, 1)
+		results <- p.call(callArgs{
+			req: cmn.ReqArgs{
+				Method: http.MethodGet,
+				Path:   cmn.JoinWords(cmn.Version, cmn.ETL, cmn.ETLLogs, uuid),
+			},
+			si:      si,
+			timeout: cmn.DefaultTimeout,
+			v:       &etl.PodLogsMsg{},
+		})
+		close(results)
+	} else {
+		// all targets
+		results = p.bcastToGroup(bcastArgs{
+			req:     cmn.ReqArgs{Method: http.MethodGet, Path: r.URL.Path},
+			timeout: cmn.DefaultTimeout,
+			fv:      func() interface{} { return &etl.PodLogsMsg{} },
+		})
+	}
+	logs := make(etl.PodsLogsMsg, 0, len(results))
+	for res := range results {
+		if res.err != nil {
+			p.invalmsghdlr(w, r, res.err.Error())
+			return
+		}
+		logs = append(logs, *res.v.(*etl.PodLogsMsg))
+	}
+	sort.Sort(logs)
+	p.writeJSON(w, r, logs, "logs-ETL")
+}
+
+// DELETE /v1/etl/stop/<uuid>
 func (p *proxyrunner) stopETL(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := p.checkRESTItems(w, r, 1, false, cmn.Version, cmn.ETL, cmn.EtlStop)
+	apiItems, err := p.checkRESTItems(w, r, 1, false, cmn.Version, cmn.ETL, cmn.ETLStop)
 	if err != nil {
 		return
 	}

@@ -2,11 +2,12 @@
 
 - [Bucket](#bucket)
   - [Cloud Provider](#cloud-provider)
-    - [Public Cloud buckets](#public-cloud-buckets)
 - [AIS Bucket](#ais-bucket)
   - [CLI examples: create, rename and, destroy ais bucket](#cli-examples-create-rename-and-destroy-ais-bucket)
   - [CLI example: working with remote AIS bucket](#cli-example-working-with-remote-ais-bucket)
 - [Cloud Bucket](#cloud-bucket)
+  - [Public Cloud Buckets](#public-cloud-buckets)
+  - [Public HTTP(S) Datasets](#public-https-dataset)
   - [Prefetch/Evict Objects](#prefetchevict-objects)
   - [Evict Cloud Bucket](#evict-cloud-bucket)
 - [Backend Bucket](#backend-bucket)
@@ -20,21 +21,23 @@
 
 ## Bucket
 
-AIS uses the popular-and-well-known bucket abstraction. In a flat storage hierarchy, bucket is a named container of user dataset(s) (represented as objects) and, simultaneously, a point of applying storage management policies: erasure coding, mirroring, etc.
+AIStore uses the popular-and-well-known bucket abstraction.
+In a flat storage hierarchy, bucket is a named container of user dataset(s) (represented as objects) and, simultaneously, a point of applying storage management policies: erasure coding, mirroring, etc.
 
-Each object is assigned to (and stored in) a basic container called *bucket*. AIS buckets *contain* user data; in that sense they are very similar to:
+Each object is assigned to (and stored in) a basic container called *bucket*.
+AIS buckets *contain* user data; in that sense they are very similar to:
 
 * [Amazon S3 buckets](https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingBucket.html)
 * [Google Cloud (GCP) buckets](https://cloud.google.com/storage/docs/key-terms#buckets)
 * [Microsoft Azure Blob containers](https://docs.microsoft.com/en-us/azure/storage/blobs/storage-blobs-introduction)
 
-AIS supports two kinds of buckets: **ais buckets** and **3rd party Cloud-based buckets** (or simply **cloud buckets**).
+AIS supports two kinds of buckets: **AIS buckets** and **3rd party Cloud-based buckets** (or simply **cloud buckets**).
 
 All the [supported storage services](storage_svcs.md) equally apply to both kinds of buckets, with only a few exceptions. The following table summarizes them.
 
 | Kind | Description | Supported Storage Services |
 | --- | --- | --- |
-| ais buckets | buckets that are **not** 3rd party Cloud-based. AIS buckets store user objects and support user-specified bucket properties (e.g., 3 copies). Unlike cloud buckets, ais buckets can be created through the [RESTful API](http_api.md). Similar to cloud buckets, ais buckets are distributed and balanced, content-wise, across the entire AIS cluster. | [Checksumming](storage_svcs.md#checksumming), [LRU (advanced usage)](storage_svcs.md#lru-for-local-buckets), [Erasure Coding](storage_svcs.md#erasure-coding), [Local Mirroring and Load Balancing](storage_svcs.md#local-mirroring-and-load-balancing) |
+| AIS buckets | buckets that are **not** 3rd party Cloud-based. AIS buckets store user objects and support user-specified bucket properties (e.g., 3 copies). Unlike cloud buckets, ais buckets can be created through the [RESTful API](http_api.md). Similar to cloud buckets, ais buckets are distributed and balanced, content-wise, across the entire AIS cluster. | [Checksumming](storage_svcs.md#checksumming), [LRU (advanced usage)](storage_svcs.md#lru-for-local-buckets), [Erasure Coding](storage_svcs.md#erasure-coding), [Local Mirroring and Load Balancing](storage_svcs.md#local-mirroring-and-load-balancing) |
 | cloud buckets | When AIS is deployed as [fast tier](/docs/overview.md#fast-tier), buckets in the cloud storage can be viewed and accessed through the [RESTful API](http_api.md) in AIS, in the exact same way as ais buckets. When this happens, AIS creates local instances of said buckets which then serves as a cache. These are referred to as **Cloud-based buckets** (or **cloud buckets** for short). | [Checksumming](storage_svcs.md#checksumming), [LRU](storage_svcs.md#lru), [Erasure Coding](storage_svcs.md#erasure-coding), [Local mirroring and load balancing](storage_svcs.md#local-mirroring-and-load-balancing) |
 
 Cloud-based and ais buckets support the same API with minor exceptions. Cloud buckets can be *evicted* from AIS. AIS buckets are the only buckets that can be created, renamed, and deleted via the [RESTful API](http_api.md).
@@ -45,57 +48,16 @@ Cloud-based and ais buckets support the same API with minor exceptions. Cloud bu
 
 Cloud provider is realized as an optional parameter in the GET, PUT, APPEND, DELETE and [Range/List](batch.md) operations with supported enumerated values that include:
 
-* `ais` for ais buckets
+* `ais` - for AIS buckets
 * `aws` or `s3` - for Amazon S3 buckets
-* `gcp` or `gs` - for Google Cloud
-* `azure` - for Microsoft Blob Storage
+* `gcp` or `gs` - for Google Cloud Storage buckets
+* `azure` - for Microsoft Azure Blob Storage buckets
+* `ht` - for HTTP(S) based datasets
 
-* and finally, you can simple say `cloud` to designate any one of the 3 (three) Cloud providers listed above.
+* and finally, you can simple say `cloud` to designate any one of the 5 Cloud providers listed above.
 
-For API reference, please refer [to the RESTful API and examples](http_api.md). The rest of this document serves to further explain features and concepts specific to storage buckets.
-
-#### Public Cloud buckets
-
-Public Google storage supports limited access to its data.
-If AIS cluster is deployed with Google Cloud enabled(Google storage is selected as 3rd party Cloud provider when [deploying an AIS cluster](/README.md#local-playground)),
-it allows a few operations without providing credentials:
-HEAD a bucket, list bucket objects, GET an object, and HEAD an object.
-The example shows accessing a private GCP bucket and a public GCP one without user authorization.
-
-```console
-# Listing objects of a private bucket
-$ ais ls gs://ais-ic
-Failed to HEAD bucket "gcp://ais-ic": {"status":400,"message":"","method":"HEAD","url_path":"/v1/buckets/ais-ic","remote_addr":"","trace":""}
-
-# Listing a public bucket
-$ ais ls gs://pub-images --limit 3
-NAME                         SIZE
-images-shard.ipynb           101.94KiB
-images-train-000000.tar      964.77MiB
-images-train-000001.tar      964.74MiB
-```
-
-Even if an AIS cluster is deployed without Cloud support, it is still possible to access public GCP and AWS buckets.
-Run downloader to copy data from a public Cloud bucket to an AIS bucket and then use the AIS bucket.
-Example shows how to download data from public Google storage:
-
-```console
-$ ais create bucket ais://images
-"ais://images" bucket created
-$ ais start download "gs://pub-images/images-train-{000000..000001}.tar" ais://images/
-Z8WkHxwIrr
-Run `ais show download Z8WkHxwIrr` to monitor the progress of downloading.
-
-$ ais show download Z8WkHxwIrr --progress
-Files downloaded:                         2/2 [==============================================================] 100 %
-images-train-000001.tar 964.7MiB/964.7MiB [==============================================================| 00:00:00 ]    0.0 b/s
-All files successfully downloaded.
-
-$ ais ls ais://images
-NAME                             SIZE
-images-train-000000.tar      964.77MiB
-images-train-000001.tar      964.74MiB
-```
+For API reference, please refer [to the RESTful API and examples](http_api.md).
+The rest of this document serves to further explain features and concepts specific to storage buckets.
 
 ## AIS Bucket
 
@@ -184,11 +146,112 @@ Cloud buckets are existing buckets in the 3rd party Cloud storage when AIS is de
 
 > By default, AIS does not keep track of the cloud buckets in its configuration map. However, if users modify the properties of the cloud bucket, AIS will then keep track.
 
+### Public Cloud Buckets
+
+Public Google Storage supports limited access to its data.
+If AIS cluster is deployed with Google Cloud enabled (Google Storage is selected as 3rd party Cloud provider when [deploying an AIS cluster](/README.md#local-playground)), it allows a few operations without providing credentials:
+HEAD a bucket, list bucket objects, GET an object, and HEAD an object.
+The example shows accessing a private GCP bucket and a public GCP one without user authorization.
+
+```console
+# Listing objects of a private bucket
+$ ais ls gs://ais-ic
+Failed to HEAD bucket "gcp://ais-ic": {"status":400,"message":"","method":"HEAD","url_path":"/v1/buckets/ais-ic","remote_addr":"","trace":""}
+
+# Listing a public bucket
+$ ais ls gs://pub-images --limit 3
+NAME                         SIZE
+images-shard.ipynb           101.94KiB
+images-train-000000.tar      964.77MiB
+images-train-000001.tar      964.74MiB
+```
+
+Even if an AIS cluster is deployed without Cloud support, it is still possible to access public GCP and AWS buckets.
+Run downloader to copy data from a public Cloud bucket to an AIS bucket and then use the AIS bucket.
+Example shows how to download data from public Google storage:
+
+```console
+$ ais create bucket ais://images
+"ais://images" bucket created
+$ ais start download "gs://pub-images/images-train-{000000..000001}.tar" ais://images/
+Z8WkHxwIrr
+Run `ais show download Z8WkHxwIrr` to monitor the progress of downloading.
+$ ais wait download Z8WkHxwIrr
+$ ais ls ais://images
+NAME                         SIZE
+images-train-000000.tar      964.77MiB
+images-train-000001.tar      964.74MiB
+```
+
+### Public HTTP(S) Dataset
+
+It is standard in machine learning community to publish datasets in public domains, so they can be accessed by everyone.
+AIStore has integrated tools like [downloader](/downloader/README.md) which can help in downloading those large datasets straight into provided AIS bucket.
+However, sometimes using such tools is not a feasible solution.
+
+For other cases AIStore has ability to act as a reverese-proxy when accessing **any** URL.
+This enables downloading any HTTP(S) based content into AIStore cluster.
+Assuming that proxy is listening on `localhost:8080`, one can use it as reverse-proxy to download `http://storage.googleapis.com/pub-images/images-train-000000.tar` shard into AIS cluster:
+
+```console
+$ curl -sL --max-redirs 3 -x localhost:8080 --noproxy "$(curl -s localhost:8080/v1/cluster?what=target_ips)" \
+  -X GET "http://storage.googleapis.com/minikube/minikube-0.6.iso.sha256" \
+  > /dev/null
+```
+
+Alternatively, an object can also be downloaded using the `get` and `cat` CLI commands. 
+```console
+$ ais get -f http://storage.googleapis.com/minikube/minikube-0.7.iso.sha256 minikube-0.7.iso.sha256
+```
+
+The `--force`(`-f`) option skips bucket validation and automatically creates a new `ht://` bucket for the object if it doesn't exist.
+
+This will cache shard object inside the AIStore cluster.
+We can confirm this by listing available buckets and checking the content:
+
+```console
+$ ais ls
+AIS Buckets (1)
+  ais://local-bck
+AWS Buckets (1)
+  aws://ais-test
+HTTP(S) Buckets (1)
+  ht://ZDdhNTYxZTkyMzhkNjk3NA (http://storage.googleapis.com/minikube/)
+
+$ ais ls ht://ZDdhNTYxZTkyMzhkNjk3NA
+NAME                                 SIZE
+minikube-0.6.iso.sha256	              65B
+```
+
+Now, when the object is accessed again, it will be served from AIStore cluster and will **not** be re-downloaded from HTTP(S) source.
+
+Under the hood, AIStore remembers the object's source URL and associates the bucket with this URL.
+In our example, bucket `ht://ZDdhNTYxZTkyMzhkNjk3NA` will be associated with `http://storage.googleapis.com/minikube/` URL.
+Therefore, we can interchangeably use the associated URL for listing the bucket as show below.
+
+```console
+$ ais ls http://storage.googleapis.com/minikube
+NAME                                  SIZE
+minikube-0.6.iso.sha256	              65B
+```
+
+> Note that only the last part (`minikube-0.6.iso.sha256`) of the URL is treated as the object name.
+
+Such connection between bucket and URL allows downloading content without providing URL again:
+
+```console
+$ ais cat ht://ZDdhNTYxZTkyMzhkNjk3NA/minikube-0.7.iso.sha256 > /dev/null # cache another object
+$ ais ls ht://ZDdhNTYxZTkyMzhkNjk3NA
+NAME                     SIZE
+minikube-0.6.iso.sha256  65B
+minikube-0.7.iso.sha256  65B
+```
+
 ### Prefetch/Evict Objects
 
 Objects within cloud buckets are automatically fetched into storage targets when accessed through AIS and are evicted based on the monitored capacity and configurable high/low watermarks when [LRU](storage_svcs.md#lru) is enabled.
 
-The [RESTful API](docs/http_api.md) can be used to manually fetch a group of objects from the cloud bucket (called prefetch) into storage targets or to remove them from AIS (called evict).
+The [RESTful API](http_api.md) can be used to manually fetch a group of objects from the cloud bucket (called prefetch) into storage targets or to remove them from AIS (called evict).
 
 Objects are prefetched or evicted using [List/Range Operations](batch.md#listrange-operations).
 
@@ -379,8 +442,15 @@ SelectMsg extended flags:
 
 | Name | Value | Description |
 | --- | --- | --- |
-| `SelectCached` | `1` | For Cloud buckets only: return only objects that are cached on local drives, i.e. objects that can be read without accessing to the Cloud |
+| `SelectCached` | `1` | For Cloud buckets only: return only objects that are cached on AIS drives, i.e. objects that can be read without accessing to the Cloud |
 | `SelectMisplaced` | `2` | Include objects that are on incorrect target or mountpath |
+
+We say that "an object is cached" to indicate two separate things:
+
+* The object was originally downloaded from a Cloud bucket, bucket in a remote AIS cluster, or an HTTP(s) based dataset;
+* The object is stored in the AIS cluster.
+
+In other words, the term "cached" is simply a **shortcut** to indicate the object's immediate availability without the need to go and check the object's original location. Being "cached" does not have any implications on object's persistence: "cached" objects, similar to those objects that originated in a given AIS cluster, are stored with arbitrary (per bucket configurable) levels of redundancy, etc. In short, the same storage policies apply to "cached" and "non-cached".
 
 Note that the list generated with `SelectMisplaced` option may have duplicated entries.
 E.g, after rebalance the list can contain two entries for the same object:

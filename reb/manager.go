@@ -10,7 +10,6 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"runtime"
 	"sync"
 	"time"
 	"unsafe"
@@ -23,13 +22,14 @@ import (
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/transport"
-	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/transport/bundle"
+	"github.com/NVIDIA/aistore/xaction/registry"
+	"github.com/NVIDIA/aistore/xaction/runners"
 )
 
 const (
-	RebalanceStreamName = "rebalance"
-	RebalanceAcksName   = "remwack" // NOTE: can become generic remote-write-acknowledgment
-	RebalancePushName   = "rebpush" // push notifications stream
+	rebTrname     = "rebalance"
+	rebPushTrname = "rebpush" // broadcast push notifications
 )
 
 // rebalance stage enum
@@ -53,20 +53,17 @@ type (
 	syncCallback func(tsi *cluster.Snode, md *rebArgs) (ok bool)
 	joggerBase   struct {
 		m    *Manager
-		xreb *xaction.RebBase
+		xreb *runners.RebBase
 		wg   *sync.WaitGroup
 	}
 
 	Manager struct {
 		t          cluster.Target
+		dm         *bundle.DataMover
+		pushes     *bundle.Streams // broadcast notifications
 		statRunner *stats.Trunner
 		filterGFN  *filter.Filter
-		client     *http.Client
-		netd, netc string
 		smap       atomic.Pointer // new smap which will be soon live
-		streams    *transport.StreamBundle
-		acks       *transport.StreamBundle
-		pushes     *transport.StreamBundle
 		lomacks    [cmn.MultiSyncMapCount]*lomAcks
 		awaiting   struct {
 			mu      sync.Mutex
@@ -78,26 +75,15 @@ type (
 		xreb       atomic.Pointer // *xaction.Rebalance
 		stages     *nodeStages
 		ec         *ecData
+		ecClient   *http.Client
 		rebID      atomic.Int64
-		laterx     atomic.Bool
 		inQueue    atomic.Int64
+		laterx     atomic.Bool
 	}
 	// Stage status of a single target
 	stageStatus struct {
 		batchID int64  // current batch ID (0 for non-EC stages)
 		stage   uint32 // current stage
-	}
-	nodeStages struct {
-		// Info about remote targets. It needs mutex for it can be
-		// updated from different goroutines
-		mtx     sync.Mutex
-		targets map[string]*stageStatus // daemonID <-> stageStatus
-		// Info about this target rebalance status. This info is used oftener
-		// than remote target ones, and updated more frequently locally.
-		// That is why it uses atomics instead of global mutex
-		currBatch atomic.Int64  // EC rebalance: current batch ID
-		lastBatch atomic.Int64  // EC rebalance: ID of the last batch
-		stage     atomic.Uint32 // rebStage* enum: this target current stage
 	}
 	lomAcks struct {
 		mu *sync.Mutex
@@ -121,106 +107,45 @@ var stages = map[uint32]string{
 	rebStageAbort:       "<abort>",
 }
 
-//
-// nodeStages
-//
+//////////////////////////////////////////////
+// rebalance manager: init, receive, common //
+//////////////////////////////////////////////
 
-func newNodeStages() *nodeStages {
-	return &nodeStages{targets: make(map[string]*stageStatus)}
-}
-
-// Returns true if the target is in `newStage` or in any next stage
-func (ns *nodeStages) stageReached(status *stageStatus, newStage uint32, newBatchID int64) bool {
-	// for simple stages: just check the stage
-	if newBatchID == 0 {
-		return status.stage >= newStage
-	}
-	// for cyclic stage (used in EC): check both batch ID and stage
-	return status.batchID > newBatchID ||
-		(status.batchID == newBatchID && status.stage >= newStage) ||
-		(status.stage >= rebStageECCleanup && status.stage > newStage)
-}
-
-// Mark a 'node' that it has reached the 'stage'. Do nothing if the target
-// is already in this stage or has finished it already
-func (ns *nodeStages) setStage(daemonID string, stage uint32, batchID int64) {
-	ns.mtx.Lock()
-	status, ok := ns.targets[daemonID]
-	if !ok {
-		status = &stageStatus{}
-		ns.targets[daemonID] = status
-	}
-
-	if !ns.stageReached(status, stage, batchID) {
-		status.stage = stage
-		status.batchID = batchID
-	}
-	ns.mtx.Unlock()
-}
-
-// Returns true if the target is in `newStage` or in any next stage.
-func (ns *nodeStages) isInStage(si *cluster.Snode, stage uint32) bool {
-	ns.mtx.Lock()
-	inStage := ns.isInStageBatchUnlocked(si, stage, 0)
-	ns.mtx.Unlock()
-	return inStage
-}
-
-// Returns true if the target is in `newStage` and has reached the given
-// batch ID or it is in any next stage
-func (ns *nodeStages) isInStageBatchUnlocked(si *cluster.Snode, stage uint32, batchID int64) bool {
-	status, ok := ns.targets[si.ID()]
-	if !ok {
-		return false
-	}
-	return ns.stageReached(status, stage, batchID)
-}
-
-func (ns *nodeStages) cleanup() {
-	ns.mtx.Lock()
-	for k := range ns.targets {
-		delete(ns.targets, k)
-	}
-	ns.mtx.Unlock()
-}
-
-//
-// Manager
-//
 func NewManager(t cluster.Target, config *cmn.Config, strunner *stats.Trunner) *Manager {
-	netd, netc := cmn.NetworkPublic, cmn.NetworkPublic
-	if config.Net.UseIntraData {
-		netd = cmn.NetworkIntraData
-	}
-	if config.Net.UseIntraControl {
-		netc = cmn.NetworkIntraControl
-	}
+	ecClient := cmn.NewClient(cmn.TransportArgs{
+		Timeout:    config.Client.Timeout,
+		UseHTTPS:   config.Net.HTTP.UseHTTPS,
+		SkipVerify: config.Net.HTTP.SkipVerify,
+	})
 	reb := &Manager{
 		t:          t,
 		filterGFN:  filter.NewDefaultFilter(),
-		netd:       netd,
-		netc:       netc,
 		statRunner: strunner,
 		stages:     newNodeStages(),
-		client: cmn.NewClient(cmn.TransportArgs{
-			Timeout:    config.Client.Timeout,
-			UseHTTPS:   config.Net.HTTP.UseHTTPS,
-			SkipVerify: config.Net.HTTP.SkipVerify,
-		}),
+		ecClient:   ecClient,
 	}
+	rebcfg := &config.Rebalance
+	dmExtra := bundle.Extra{
+		RecvAck:     reb.recvAck,
+		Compression: rebcfg.Compression,
+		Multiplier:  int(rebcfg.Multiplier),
+	}
+	dm, err := bundle.NewDataMover(t, rebTrname, reb.recvObj, dmExtra)
+	if err != nil {
+		cmn.ExitLogf("%v", err)
+	}
+	reb.dm = dm
 	reb.ec = newECData()
-	reb.initStreams()
+	reb.registerRecv()
 	return reb
 }
 
-func (reb *Manager) initStreams() {
-	if _, err := transport.Register(reb.netd, RebalanceStreamName, reb.recvObj); err != nil {
+// NOTE: these receive handlers are statically present throughout: unreg never done
+func (reb *Manager) registerRecv() {
+	if err := reb.dm.RegRecv(); err != nil {
 		cmn.ExitLogf("%v", err)
 	}
-	if _, err := transport.Register(reb.netc, RebalanceAcksName, reb.recvAck); err != nil {
-		cmn.ExitLogf("%v", err)
-	}
-	if _, err := transport.Register(reb.netc, RebalancePushName, reb.recvPush); err != nil {
+	if _, err := transport.Register(reb.dm.NetC(), rebPushTrname, reb.recvPush); err != nil {
 		cmn.ExitLogf("%v", err)
 	}
 	// serialization: one at a time
@@ -231,8 +156,8 @@ func (reb *Manager) initStreams() {
 func (reb *Manager) RebID() int64           { return reb.rebID.Load() }
 func (reb *Manager) FilterAdd(uname []byte) { reb.filterGFN.Insert(uname) }
 
-func (reb *Manager) xact() *xaction.Rebalance                  { return (*xaction.Rebalance)(reb.xreb.Load()) }
-func (reb *Manager) setXact(xact *xaction.Rebalance)           { reb.xreb.Store(unsafe.Pointer(xact)) }
+func (reb *Manager) xact() *runners.Rebalance                  { return (*runners.Rebalance)(reb.xreb.Load()) }
+func (reb *Manager) setXact(xact *runners.Rebalance)           { reb.xreb.Store(unsafe.Pointer(xact)) }
 func (reb *Manager) lomAcks() *[cmn.MultiSyncMapCount]*lomAcks { return &reb.lomacks }
 func (reb *Manager) addLomAck(lom *cluster.LOM) {
 	_, idx := lom.Hkey()
@@ -241,6 +166,7 @@ func (reb *Manager) addLomAck(lom *cluster.LOM) {
 	lomAck.q[lom.Uname()] = lom
 	lomAck.mu.Unlock()
 }
+
 func (reb *Manager) delLomAck(lom *cluster.LOM) {
 	_, idx := lom.Hkey()
 	lomAck := reb.lomAcks()[idx]
@@ -250,65 +176,12 @@ func (reb *Manager) delLomAck(lom *cluster.LOM) {
 }
 
 func (reb *Manager) logHdr(md *rebArgs) string {
-	var stage = stages[reb.stages.stage.Load()]
+	stage := stages[reb.stages.stage.Load()]
 	return fmt.Sprintf("%s[g%d,v%d,%s]", reb.t.Snode(), md.id, md.smap.Version, stage)
 }
+
 func (reb *Manager) rebIDMismatchMsg(remoteID int64) string {
 	return fmt.Sprintf("rebalance IDs mismatch: local %d, remote %d", reb.RebID(), remoteID)
-}
-
-func (reb *Manager) serialize(md *rebArgs) (newerRMD, alreadyRunning bool) {
-	var (
-		sleep  = md.config.Timeout.CplaneOperation
-		canRun bool
-	)
-	for {
-		select {
-		case <-reb.semaCh:
-			canRun = true
-		default:
-			runtime.Gosched()
-		}
-
-		// Compare rebIDs
-		logHdr := reb.logHdr(md)
-		if reb.rebID.Load() > md.id {
-			glog.Warningf("%s: seeing newer rebID g%d, not running", logHdr, reb.rebID.Load())
-			newerRMD = true
-			if canRun {
-				reb.semaCh <- struct{}{}
-			}
-			return
-		}
-		if reb.rebID.Load() == md.id {
-			if canRun {
-				reb.semaCh <- struct{}{}
-			}
-			glog.Warningf("%s: g%d is already running", logHdr, md.id)
-			alreadyRunning = true
-			return
-		}
-
-		// Check current xaction
-		entry := xaction.Registry.GetRunning(xaction.RegistryXactFilter{Kind: cmn.ActRebalance})
-		if entry == nil {
-			if canRun {
-				return
-			}
-			glog.Warningf("%s: waiting for ???...", logHdr)
-		} else {
-			otherXreb := entry.Get().(*xaction.Rebalance) // running or previous
-			if canRun {
-				return
-			}
-			if otherXreb.ID().Int() < md.id {
-				otherXreb.Abort()
-				glog.Warningf("%s: aborting older [%s]", logHdr, otherXreb)
-			}
-		}
-		cmn.Assert(!canRun)
-		time.Sleep(sleep)
-	}
 }
 
 func (reb *Manager) getStats() (s *stats.ExtRebalanceStats) {
@@ -322,66 +195,30 @@ func (reb *Manager) getStats() (s *stats.ExtRebalanceStats) {
 	return
 }
 
-func (reb *Manager) beginStreams(md *rebArgs) {
+func (reb *Manager) beginStreams() {
 	cmn.Assert(reb.stages.stage.Load() == rebStageInit)
-	if md.config.Rebalance.Multiplier == 0 {
-		md.config.Rebalance.Multiplier = 1
-	} else if md.config.Rebalance.Multiplier > 8 {
-		glog.Errorf("%s: stream-and-mp-jogger multiplier=%d - misconfigured?",
-			reb.t.Snode(), md.config.Rebalance.Multiplier)
-	}
-	//
-	// objects
-	//
-	client := transport.NewIntraDataClient()
-	sbArgs := transport.SBArgs{
-		Network: reb.netd,
-		Trname:  RebalanceStreamName,
-		Extra: &transport.Extra{
-			Compression: md.config.Rebalance.Compression,
-			Config:      md.config,
-			MMSA:        reb.t.GetMMSA()},
-		Multiplier:   int(md.config.Rebalance.Multiplier),
-		ManualResync: true,
-	}
-	reb.streams = transport.NewStreamBundle(reb.t.GetSowner(), reb.t.Snode(), client, sbArgs)
 
-	//
-	// ACKs
-	//
-	clientAcks := transport.NewIntraDataClient()
-	sbArgs = transport.SBArgs{
-		ManualResync: true,
-		Network:      reb.netc,
-		Trname:       RebalanceAcksName,
-	}
-	reb.acks = transport.NewStreamBundle(reb.t.GetSowner(), reb.t.Snode(), clientAcks, sbArgs)
-
-	pushArgs := transport.SBArgs{
-		Network: reb.netc,
-		Trname:  RebalancePushName,
-	}
-	reb.pushes = transport.NewStreamBundle(reb.t.GetSowner(), reb.t.Snode(), client, pushArgs)
+	reb.dm.Open()
+	pushArgs := bundle.Args{Network: reb.dm.NetC(), Trname: rebPushTrname}
+	reb.pushes = bundle.NewStreams(reb.t.Sowner(), reb.t.Snode(), transport.NewIntraDataClient(), pushArgs)
 
 	reb.laterx.Store(false)
 	reb.inQueue.Store(0)
 }
 
-func (reb *Manager) endStreams() {
+func (reb *Manager) endStreams(err error) {
 	if reb.stages.stage.CAS(rebStageFin, rebStageFinStreams) {
-		reb.streams.Close(true /* graceful */)
-		reb.streams = nil
-		reb.acks.Close(true)
+		reb.dm.Close(err)
 		reb.pushes.Close(true)
 	}
 }
 
-func (reb *Manager) recvObjRegular(hdr transport.Header, smap *cluster.Smap, unpacker *cmn.ByteUnpack, objReader io.Reader) {
+func (reb *Manager) recvObjRegular(hdr transport.ObjHdr, smap *cluster.Smap, unpacker *cmn.ByteUnpack, objReader io.Reader) {
 	defer cmn.DrainReader(objReader)
 
 	ack := &regularAck{}
 	if err := unpacker.ReadAny(ack); err != nil {
-		glog.Errorf("Failed to parse acknowledge: %v", err)
+		glog.Errorf("Failed to parse acknowledgement: %v", err)
 		return
 	}
 
@@ -396,7 +233,7 @@ func (reb *Manager) recvObjRegular(hdr transport.Header, smap *cluster.Smap, unp
 		glog.Error(err)
 		return
 	}
-	marked := xaction.GetRebMarked()
+	marked := registry.GetRebMarked()
 	if marked.Interrupted || marked.Xact == nil {
 		return
 	}
@@ -414,15 +251,15 @@ func (reb *Manager) recvObjRegular(hdr transport.Header, smap *cluster.Smap, unp
 	lom.SetAtimeUnix(hdr.ObjAttrs.Atime)
 	lom.SetVersion(hdr.ObjAttrs.Version)
 
-	if err := reb.t.PutObject(cluster.PutObjectParams{
-		LOM:          lom,
+	params := cluster.PutObjectParams{
 		Reader:       ioutil.NopCloser(objReader),
 		WorkFQN:      fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfilePut),
 		RecvType:     cluster.Migrated,
 		Cksum:        cmn.NewCksum(hdr.ObjAttrs.CksumType, hdr.ObjAttrs.CksumValue),
 		Started:      time.Now(),
 		WithFinalize: true,
-	}); err != nil {
+	}
+	if err := reb.t.PutObject(lom, params); err != nil {
 		glog.Error(err)
 		return
 	}
@@ -443,19 +280,19 @@ func (reb *Manager) recvObjRegular(hdr transport.Header, smap *cluster.Smap, unp
 	if stage := reb.stages.stage.Load(); stage < rebStageFinStreams && stage != rebStageInactive {
 		var (
 			ack = &regularAck{rebID: reb.RebID(), daemonID: reb.t.Snode().ID()}
-			mm  = reb.t.GetSmallMMSA()
+			mm  = reb.t.SmallMMSA()
 		)
 		hdr.Opaque = ack.NewPack(mm)
 		hdr.ObjAttrs.Size = 0
-		if err := reb.acks.Send(transport.Obj{Hdr: hdr, Callback: reb.rackSentCallback}, nil, tsi); err != nil {
+		if err := reb.dm.ACK(hdr, reb.rackSentCallback, tsi); err != nil {
 			mm.Free(hdr.Opaque)
 			glog.Error(err) // TODO: collapse same-type errors e.g. "src-id=>network: destination mismatch"
 		}
 	}
 }
 
-func (reb *Manager) rackSentCallback(hdr transport.Header, _ io.ReadCloser, _ unsafe.Pointer, _ error) {
-	reb.t.GetSmallMMSA().Free(hdr.Opaque)
+func (reb *Manager) rackSentCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ unsafe.Pointer, _ error) {
+	reb.t.SmallMMSA().Free(hdr.Opaque)
 }
 
 func (reb *Manager) waitForSmap() (*cluster.Smap, error) {
@@ -486,7 +323,7 @@ func (reb *Manager) waitForSmap() (*cluster.Smap, error) {
 	return smap, nil
 }
 
-func (reb *Manager) recvObj(w http.ResponseWriter, hdr transport.Header, objReader io.Reader, err error) {
+func (reb *Manager) recvObj(w http.ResponseWriter, hdr transport.ObjHdr, objReader io.Reader, err error) {
 	if err != nil {
 		glog.Error(err)
 		return
@@ -527,22 +364,22 @@ func (reb *Manager) changeStage(newStage uint32, batchID int64) {
 			daemonID: reb.t.Snode().DaemonID, stage: newStage,
 			rebID: reb.rebID.Load(), batch: int(batchID),
 		}
-		hdr = transport.Header{}
-		mm  = reb.t.GetSmallMMSA()
+		hdr = transport.ObjHdr{}
+		mm  = reb.t.SmallMMSA()
 	)
 	hdr.Opaque = reb.encodePushReq(&req, mm)
 	// second, notify all
-	if err := reb.pushes.Send(transport.Obj{Hdr: hdr, Callback: reb.pushSentCallback}, nil); err != nil {
+	if err := reb.pushes.Send(&transport.Obj{Hdr: hdr, Callback: reb.pushSentCallback}, nil); err != nil {
 		glog.Warningf("Failed to broadcast ack %s: %v", stages[newStage], err)
 		mm.Free(hdr.Opaque)
 	}
 }
 
-func (reb *Manager) pushSentCallback(hdr transport.Header, _ io.ReadCloser, _ unsafe.Pointer, _ error) {
-	reb.t.GetSmallMMSA().Free(hdr.Opaque)
+func (reb *Manager) pushSentCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ unsafe.Pointer, _ error) {
+	reb.t.SmallMMSA().Free(hdr.Opaque)
 }
 
-func (reb *Manager) recvPush(w http.ResponseWriter, hdr transport.Header, objReader io.Reader, err error) {
+func (reb *Manager) recvPush(w http.ResponseWriter, hdr transport.ObjHdr, objReader io.Reader, err error) {
 	if err != nil {
 		glog.Errorf("Failed to get notification %s from %s: %v", hdr.ObjName, hdr.Bck, err)
 		return
@@ -577,7 +414,7 @@ func (reb *Manager) recvPush(w http.ResponseWriter, hdr transport.Header, objRea
 	reb.stages.setStage(req.daemonID, req.stage, int64(req.batch))
 }
 
-func (reb *Manager) recvECAck(hdr transport.Header, unpacker *cmn.ByteUnpack) {
+func (reb *Manager) recvECAck(hdr transport.ObjHdr, unpacker *cmn.ByteUnpack) {
 	ack := &ecAck{}
 	if err := unpacker.ReadAny(ack); err != nil {
 		glog.Errorf("Failed to unmarshal EC ACK for %s/%s: %v", hdr.Bck, hdr.ObjName, err)
@@ -585,16 +422,17 @@ func (reb *Manager) recvECAck(hdr transport.Header, unpacker *cmn.ByteUnpack) {
 	}
 
 	rt := &retransmitCT{
-		header:  transport.Header{Bck: hdr.Bck, ObjName: hdr.ObjName},
+		header:  transport.ObjHdr{Bck: hdr.Bck, ObjName: hdr.ObjName},
 		sliceID: int16(ack.sliceID), daemonID: ack.daemonID,
 	}
 	if glog.FastV(4, glog.SmoduleReb) {
-		glog.Infof("%s: EC ack from %s on %s/%s [%d]", reb.t.Snode(), ack.daemonID, hdr.Bck, hdr.ObjName, ack.sliceID)
+		glog.Infof("%s: EC ack from %s on %s/%s [%d]",
+			reb.t.Snode(), ack.daemonID, hdr.Bck, hdr.ObjName, ack.sliceID)
 	}
 	reb.ec.ackCTs.remove(rt)
 }
 
-func (reb *Manager) recvRegularAck(hdr transport.Header, unpacker *cmn.ByteUnpack) {
+func (reb *Manager) recvRegularAck(hdr transport.ObjHdr, unpacker *cmn.ByteUnpack) {
 	ack := &regularAck{}
 	if err := unpacker.ReadAny(ack); err != nil {
 		glog.Errorf("Failed to parse acknowledge: %v", err)
@@ -623,7 +461,7 @@ func (reb *Manager) recvRegularAck(hdr transport.Header, unpacker *cmn.ByteUnpac
 	lom.Unlock(true)
 }
 
-func (reb *Manager) recvAck(w http.ResponseWriter, hdr transport.Header, _ io.Reader, err error) {
+func (reb *Manager) recvAck(w http.ResponseWriter, hdr transport.ObjHdr, _ io.Reader, err error) {
 	if err != nil {
 		glog.Error(err)
 		return
@@ -650,14 +488,17 @@ func (reb *Manager) recvAck(w http.ResponseWriter, hdr transport.Header, _ io.Re
 func (reb *Manager) retransmit(md *rebArgs) (cnt int) {
 	aborted := func() (yes bool) {
 		yes = reb.xact().Aborted()
-		yes = yes || (md.smap.Version != reb.t.GetSowner().Get().Version)
+		yes = yes || (md.smap.Version != reb.t.Sowner().Get().Version)
 		return
 	}
 	if aborted() {
 		return
 	}
 	var (
-		rj    = &rebalanceJogger{joggerBase: joggerBase{m: reb, xreb: &reb.xact().RebBase, wg: &sync.WaitGroup{}}, smap: md.smap}
+		rj = &rebalanceJogger{joggerBase: joggerBase{
+			m: reb, xreb: &reb.xact().RebBase,
+			wg: &sync.WaitGroup{},
+		}, smap: md.smap}
 		query = url.Values{}
 	)
 	query.Add(cmn.URLParamSilent, "true")
@@ -721,11 +562,11 @@ func (reb *Manager) abortRebalance() {
 			rebID:    reb.RebID(),
 			stage:    rebStageAbort,
 		}
-		hdr = transport.Header{}
-		mm  = reb.t.GetSmallMMSA()
+		hdr = transport.ObjHdr{}
+		mm  = reb.t.SmallMMSA()
 	)
 	hdr.Opaque = reb.encodePushReq(&req, mm)
-	if err := reb.pushes.Send(transport.Obj{Hdr: hdr, Callback: reb.pushSentCallback}, nil); err != nil {
+	if err := reb.pushes.Send(&transport.Obj{Hdr: hdr, Callback: reb.pushSentCallback}, nil); err != nil {
 		glog.Errorf("Failed to broadcast abort notification: %v", err)
 	}
 }

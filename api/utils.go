@@ -25,6 +25,7 @@ type (
 		Method string
 		Token  string
 	}
+
 	// ReqParams is used in constructing client-side API requests to the AIStore.
 	// Stores Query and Headers for providing arguments that are not used commonly in API requests
 	ReqParams struct {
@@ -41,6 +42,7 @@ type (
 		// Determines if the response should be validated with the checksum
 		Validate bool
 	}
+
 	wrappedResp struct {
 		*http.Response
 		n          int64  // number bytes read from `resp.Body`
@@ -48,16 +50,16 @@ type (
 	}
 )
 
-// HTTPStatus returns HTTP status or (-1) for non-HTTP error
+// HTTPStatus returns HTTP status or (-1) for non-HTTP error.
 func HTTPStatus(err error) int {
 	if err == nil {
 		return http.StatusOK
 	}
-	herr, ok := err.(*cmn.HTTPError)
-	if !ok {
-		return -1 // invalid
+
+	if herr, ok := err.(*cmn.HTTPError); ok && herr != nil {
+		return herr.Status
 	}
-	return herr.Status
+	return -1 // invalid
 }
 
 // DoHTTPRequest sends one HTTP request and decodes the `v` structure
@@ -71,12 +73,40 @@ func DoHTTPRequest(reqParams ReqParams, vs ...interface{}) error {
 	return err
 }
 
-// doHTTPRequestGetResp sends one HTTP request, decodes the `v` structure
-// (if provided) from `resp.Body` and returns the whole response.
+// doHTTPRequestGetResp makes HTTP request, retries on connection refused or
+// reset errors, decodes the `v` structure (if provided) from `resp.Body` and
+// returns the whole response.
+//
+// The function returns an error if response status code is >= 400.
 func doHTTPRequestGetResp(reqParams ReqParams, v interface{}) (*wrappedResp, error) {
-	var (
-		reqBody io.Reader
-	)
+	resp, err := doHTTPRequestGetHTTPResp(reqParams)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return readResp(reqParams, resp, v)
+}
+
+// doHTTPRequestGetResp makes HTTP request, retries on connection refused or
+// reset errors, and returns response body. The caller is responsible for
+// closing returned reader.
+//
+// The function returns an error if response status code is >= 400.
+func doHTTPRequestGetRespReader(reqParams ReqParams) (io.ReadCloser, error) {
+	resp, err := doHTTPRequestGetHTTPResp(reqParams)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := checkResp(reqParams, resp); err != nil {
+		return nil, err
+	}
+
+	return resp.Body, nil
+}
+
+func doHTTPRequestGetHTTPResp(reqParams ReqParams) (*http.Response, error) {
+	var reqBody io.Reader
 	if reqParams.Body != nil {
 		reqBody = bytes.NewBuffer(reqParams.Body)
 	}
@@ -89,44 +119,29 @@ func doHTTPRequestGetResp(reqParams ReqParams, v interface{}) (*wrappedResp, err
 	setRequestOptParams(req, reqParams)
 	setAuthToken(req, reqParams.BaseParams)
 
-	resp, err := reqParams.BaseParams.Client.Do(req) // nolint:bodyclose // it's closed later
+	resp, err := reqParams.BaseParams.Client.Do(req)
 	if err != nil {
 		sleep := httpRetrySleep
 		if cmn.IsErrConnectionReset(err) || cmn.IsErrConnectionRefused(err) {
 			for i := 0; i < httpMaxRetries && err != nil; i++ {
 				time.Sleep(sleep)
-				resp, err = reqParams.BaseParams.Client.Do(req) // nolint:bodyclose // it's closed later
+				resp, err = reqParams.BaseParams.Client.Do(req)
 				sleep += sleep / 2
 			}
 		}
 	}
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to %s, err: %v", reqParams.BaseParams.Method, err)
+		err = fmt.Errorf("failed to %s, err: %v", reqParams.BaseParams.Method, err)
 	}
-	defer resp.Body.Close()
-	return readResp(reqParams, resp, v)
+	return resp, err
 }
 
 func readResp(reqParams ReqParams, resp *http.Response, v interface{}) (*wrappedResp, error) {
 	defer cmn.DrainReader(resp.Body)
 
-	if resp.StatusCode >= http.StatusBadRequest {
-		var httpErr *cmn.HTTPError
-		if reqParams.BaseParams.Method != http.MethodHead && resp.StatusCode != http.StatusServiceUnavailable {
-			if err := jsoniter.NewDecoder(resp.Body).Decode(&httpErr); err != nil {
-				return nil,
-					fmt.Errorf("failed to read response (status: %d), err: %v", resp.StatusCode, err)
-			}
-		} else {
-			// HEAD request does not return the body - create http error
-			// 503 is also to be preserved
-			httpErr = &cmn.HTTPError{
-				Status:  resp.StatusCode,
-				Method:  reqParams.BaseParams.Method,
-				URLPath: reqParams.Path,
-			}
-		}
-		return nil, httpErr
+	if err := checkResp(reqParams, resp); err != nil {
+		return nil, err
 	}
 	wresp := &wrappedResp{Response: resp}
 	if v == nil {
@@ -176,8 +191,36 @@ func readResp(reqParams ReqParams, resp *http.Response, v interface{}) (*wrapped
 	return wresp, nil
 }
 
-// Given an existing HTTP Request and optional API parameters, setRequestOptParams
-// sets the optional fields of the request if provided
+func checkResp(reqParams ReqParams, resp *http.Response) error {
+	if resp.StatusCode < http.StatusBadRequest {
+		return nil
+	}
+	var httpErr *cmn.HTTPError
+	if reqParams.BaseParams.Method != http.MethodHead && resp.StatusCode != http.StatusServiceUnavailable {
+		if jsonErr := jsoniter.NewDecoder(resp.Body).Decode(&httpErr); jsonErr == nil {
+			return httpErr
+		}
+	}
+	msg, _ := ioutil.ReadAll(resp.Body)
+	strMsg := string(msg)
+
+	if resp.StatusCode == http.StatusServiceUnavailable && strMsg == "" {
+		strMsg = fmt.Sprintf("[%s]: starting up, please try again later...",
+			http.StatusText(http.StatusServiceUnavailable))
+	}
+	// HEAD request does not return the body - create http error
+	// 503 is also to be preserved
+	httpErr = &cmn.HTTPError{
+		Status:  resp.StatusCode,
+		Method:  reqParams.BaseParams.Method,
+		URLPath: reqParams.Path,
+		Message: strMsg,
+	}
+	return httpErr
+}
+
+// setRequestOptParams given an existing HTTP Request and optional API parameters,
+// sets the optional fields of the request if provided.
 func setRequestOptParams(req *http.Request, reqParams ReqParams) {
 	if len(reqParams.Query) != 0 {
 		req.URL.RawQuery = reqParams.Query.Encode()

@@ -165,7 +165,7 @@ List all objects contained in `BUCKET_NAME` bucket.
 | `--props` | `string` | Comma-separated properties to return with object names | `"size,version"`
 | `--limit` | `int` | Max. number of object names to list | `0` |
 | `--show-unmatched` | `bool` | List objects unmatched by regex and template as well, after the matched ones | `false` |
-| `--all-items` | `bool` | Show all items, including all, duplicated, etc. | `false` |
+| `--all` | `bool` | Show all objects, including misplaced, duplicated, etc. | `false` |
 | `--marker` | `string` | Start listing objects starting from the object that follows the marker alphabetically | `""` |
 | `--no-headers` | `bool` | Display tables without headers | `false` |
 | `--cached` | `bool` | For a cloud bucket, shows only objects that have already been downloaded and are cached on local drives (ignored for ais buckets) | `false` |
@@ -290,9 +290,15 @@ Renaming cloud buckets (cloud://new_bucket_name) not supported
 
 ## Copy bucket
 
-`ais cp bucket BUCKET_NAME NEW_NAME`
+`ais cp bucket SRC_BUCKET DST_BUCKET`
 
-Copy an existing ais bucket to a new ais bucket.
+Copy an existing bucket to a new bucket. If destination bucket is a cloud bucket it has to exist.
+
+### Options
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `--dry-run` | `bool` | Don't actually copy bucket, only include stats what would happen | `false` |
+| `--prefix` | `string` | Prefix added to every new object's name | `""` |
 
 ### Examples
 
@@ -302,17 +308,32 @@ Copy local bucket `bucket_name` to local bucket `new_bucket_name`.
 
 ```console
 $ ais cp bucket ais://bucket_name new_bucket_name
-Copying bucket "bucket_name" to "new_bucket_name" in progress.
+Copying bucket "ais://bucket_name" to "new_bucket_name" in progress.
 To check the status, run: ais show xaction copybck new_bucket_name
+```
+
+#### Copy cloud bucket to another cloud bucket
+
+Copy AWS bucket `bucket` to AWS bucket `dst_bucket`.
+
+```console
+# Make sure that both buckets exist.
+$ ais ls cloud://
+AWS Buckets (2)
+  aws://bucket
+  aws://dst_bucket
+$ ais cp bucket aws://bucket aws://dst_bucket
+Copying bucket "aws://bucket" to "aws://dst_bucket" in progress.
+To check the status, run: ais show xaction copybck aws://dst_bucket
 ```
 
 #### Incorrect bucket rename
 
-Copying cloud buckets is not supported.
+Copying bucket to the same bucket.
 
 ```console
-$ ais cp bucket cloud://bucket_name cloud://new_bucket_name
-Copying of cloud buckets not supported
+$ ais cp bucket bucket_name bucket_name
+Cannot copy bucket "bucket_name" onto itself.
 ```
 
 ## Show bucket summary

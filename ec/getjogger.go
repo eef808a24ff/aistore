@@ -143,9 +143,7 @@ func (c *getJogger) copyMissingReplicas(lom *cluster.LOM, reader cmn.ReadOpenClo
 		freeObject(reader)
 		return
 	}
-	var (
-		srcReader cmn.ReadOpenCloser
-	)
+	var srcReader cmn.ReadOpenCloser
 
 	switch r := reader.(type) {
 	case *memsys.SGL:
@@ -153,7 +151,7 @@ func (c *getJogger) copyMissingReplicas(lom *cluster.LOM, reader cmn.ReadOpenClo
 	case *cmn.FileHandle:
 		srcReader, err = cmn.NewFileHandle(lom.FQN)
 	default:
-		cmn.AssertFmt(false, "unsupported reader type", reader)
+		cmn.Assertf(false, "unsupported reader type: %v", reader)
 	}
 
 	if err != nil {
@@ -165,7 +163,7 @@ func (c *getJogger) copyMissingReplicas(lom *cluster.LOM, reader cmn.ReadOpenClo
 	// _ io.ReadCloser: pass copyMisssingReplicas reader argument(memsys.SGL type)
 	// instead of callback's reader argument(memsys.Reader type) to freeObject
 	// Reason: memsys.Reader does not provide access to internal memsys.SGL that must be freed
-	cb := func(hdr transport.Header, _ io.ReadCloser, _ unsafe.Pointer, err error) {
+	cb := func(hdr transport.ObjHdr, _ io.ReadCloser, _ unsafe.Pointer, err error) {
 		if err != nil {
 			glog.Errorf("%s failed to send %s/%s to %v: %v", c.parent.t.Snode(), lom.Bck(), lom.ObjName, daemons, err)
 		}
@@ -191,7 +189,7 @@ func (c *getJogger) copyMissingReplicas(lom *cluster.LOM, reader cmn.ReadOpenClo
 func (c *getJogger) restoreReplicatedFromMemory(req *Request, meta *Metadata, nodes map[string]*Metadata) error {
 	var (
 		writer *memsys.SGL
-		mm     = c.parent.t.GetSmallMMSA()
+		mm     = c.parent.t.SmallMMSA()
 	)
 	// try read a replica from targets one by one until the replica is got
 	for node := range nodes {
@@ -240,7 +238,7 @@ func (c *getJogger) restoreReplicatedFromDisk(req *Request, meta *Metadata, node
 	var (
 		writer *os.File
 		n      int64
-		mm     = c.parent.t.GetSmallMMSA()
+		mm     = c.parent.t.SmallMMSA()
 	)
 	// try read a replica from targets one by one until the replica is got
 	objFQN := req.LOM.FQN
@@ -258,7 +256,7 @@ func (c *getJogger) restoreReplicatedFromDisk(req *Request, meta *Metadata, node
 		lomClone := req.LOM.Clone(tmpFQN)
 		n, err = c.parent.readRemote(lomClone, node, uname, iReqBuf, w)
 		mm.Free(iReqBuf)
-		debug.AssertNoErr(w.Close())
+		cmn.Close(w)
 
 		if err == nil && n != 0 {
 			// a valid replica is found - break and do not free SGL
@@ -267,7 +265,8 @@ func (c *getJogger) restoreReplicatedFromDisk(req *Request, meta *Metadata, node
 			break
 		}
 
-		debug.AssertNoErr(os.RemoveAll(tmpFQN))
+		errRm := os.RemoveAll(tmpFQN)
+		debug.AssertNoErr(errRm)
 	}
 	if glog.V(4) {
 		glog.Infof("Found meta -> obj get %s/%s, writer found: %v", req.LOM.Bck(), req.LOM.ObjName, writer != nil)
@@ -329,7 +328,7 @@ func (c *getJogger) requestSlices(req *Request, meta *Metadata, nodes map[string
 		// create SGL to receive the slice data and save it to correct
 		// position in the slice list
 		var writer *slice
-		var lom = *(req.LOM)
+		lom := *(req.LOM)
 		if toDisk {
 			prefix := fmt.Sprintf("ec-restore-%d", v.SliceID)
 			fqn := fs.CSM.GenContentFQN(req.LOM.FQN, fs.WorkfileType, prefix)
@@ -361,9 +360,9 @@ func (c *getJogger) requestSlices(req *Request, meta *Metadata, nodes map[string
 
 	iReq := c.parent.newIntraReq(reqGet, meta)
 	iReq.isSlice = true
-	mm := c.parent.t.GetSmallMMSA()
+	mm := c.parent.t.SmallMMSA()
 	request := iReq.NewPack(mm)
-	hdr := transport.Header{
+	hdr := transport.ObjHdr{
 		Bck:     req.LOM.Bck().Bck,
 		ObjName: req.LOM.ObjName,
 		Opaque:  request,
@@ -668,8 +667,8 @@ func (c *getJogger) uploadRestoredSlices(req *Request, meta *Metadata, slices []
 		}
 
 		// every slice's SGL must be freed upon transfer completion
-		cb := func(daemonID string, s *slice) transport.SendCallback {
-			return func(hdr transport.Header, reader io.ReadCloser, _ unsafe.Pointer, err error) {
+		cb := func(daemonID string, s *slice) transport.ObjSentCB {
+			return func(hdr transport.ObjHdr, reader io.ReadCloser, _ unsafe.Pointer, err error) {
 				if err != nil {
 					glog.Errorf("%s failed to send %s/%s to %v: %v", c.parent.t.Snode(), req.LOM.Bck(), req.LOM.ObjName, daemonID, err)
 				}
@@ -834,7 +833,7 @@ func (c *getJogger) requestMeta(req *Request) (meta *Metadata, nodes map[string]
 			defer wg.Done()
 			md, err := requestECMeta(req.LOM.Bck().Bck, req.LOM.ObjName, si, c.client)
 			if err != nil {
-				if glog.FastV(4, glog.SmoduleAIS) {
+				if glog.V(4) {
 					glog.Infof("No EC meta %s from %s: %v", req.LOM.ObjName, si, err)
 				}
 				return

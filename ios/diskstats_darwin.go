@@ -18,13 +18,11 @@ type dblockStat struct {
 	ioMs       int64
 }
 
-var (
-	// interface guard
-	_ diskBlockStat = dblockStat{}
-)
+// interface guard
+var _ diskBlockStat = dblockStat{}
 
 // readDiskStats returns disk stats
-func readDiskStats(disks, sysfnames cmn.SimpleKVs) diskBlockStats {
+func readDiskStats(disks, _ cmn.SimpleKVs) diskBlockStats {
 	driveStats, err := iostat.ReadDriveStats()
 	if err != nil {
 		return diskBlockStats{}

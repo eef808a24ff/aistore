@@ -87,6 +87,9 @@ var _ = Describe("IterFields", func() {
 					"lru.dont_evict_time":   "",
 					"lru.capacity_upd_time": "",
 
+					"extra.original_url": "",
+					"extra.cloud_region": "",
+
 					"access":  cmn.AccessAttrs(0),
 					"created": int64(0),
 				},

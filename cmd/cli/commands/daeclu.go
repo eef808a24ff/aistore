@@ -92,15 +92,6 @@ func clusterDaemonStatus(c *cli.Context, smap *cluster.Smap, daemonID string, us
 	return fmt.Errorf(invalidDaemonMsg, daemonID)
 }
 
-// Removes existing node from the cluster.
-func clusterRemoveNode(c *cli.Context, daemonID string) (err error) {
-	if err := api.UnregisterNode(defaultAPIParams, daemonID); err != nil {
-		return err
-	}
-	fmt.Fprintf(c.App.Writer, "Node with ID %q successfully removed from the cluster\n", daemonID)
-	return nil
-}
-
 // Displays the disk stats of a target
 func daemonDiskStats(c *cli.Context, daemonID string, useJSON, hideHeader bool) error {
 	if _, ok := proxy[daemonID]; ok {
@@ -236,6 +227,23 @@ func daemonKeyValueArgs(c *cli.Context) (daemonID string, nvs cmn.SimpleKVs, err
 	if cmn.StringInSlice(args.First(), propList) || strings.Contains(args.First(), keyAndValueSeparator) {
 		daemonID = ""
 		kvs = args
+	} else {
+		var smap *cluster.Smap
+		smap, err = api.GetClusterMap(defaultAPIParams)
+		if err != nil {
+			return "", nil, err
+		}
+		if smap.GetNode(daemonID) == nil {
+			var err error
+			if c.NArg()%2 == 0 {
+				// Even - updating cluster configuration (a few key/value pairs)
+				err = fmt.Errorf("option %q does not exist (hint: run 'show config DAEMON_ID --json' to show list of options)", daemonID)
+			} else {
+				// Odd - updating daemon configuration (daemon ID + a few key/value pairs)
+				err = fmt.Errorf("node ID %q does not exist (hint: run 'show cluster' to show nodes)", daemonID)
+			}
+			return "", nil, err
+		}
 	}
 
 	if len(kvs) == 0 {
@@ -307,8 +315,8 @@ func showRebalance(c *cli.Context, keepMonitoring bool, refreshRate time.Duratio
 			fmt.Fprintf(tw,
 				"%s\t%d\t%d\t%s\t%d\t%s\t%s\t%s\t%t\n",
 				daemonID, extRebStats.RebID,
-				extRebStats.RebTxCount, cmn.B2S(extRebStats.RebTxSize, 2),
 				extRebStats.RebRxCount, cmn.B2S(extRebStats.RebRxSize, 2),
+				extRebStats.RebTxCount, cmn.B2S(extRebStats.RebTxSize, 2),
 				startTime, endTime, st.AbortedX,
 			)
 		}

@@ -19,16 +19,19 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/ais/cloud"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/dsort"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/reb"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -112,7 +115,7 @@ func (t *targetrunner) unregister(_ ...string) (int, error) {
 		si: smap.Primary,
 		req: cmn.ReqArgs{
 			Method: http.MethodDelete,
-			Path:   cmn.URLPath(cmn.Version, cmn.Cluster, cmn.Daemon, t.si.ID()),
+			Path:   cmn.JoinWords(cmn.Version, cmn.Cluster, cmn.Daemon, t.si.ID()),
 		},
 		timeout: cmn.DefaultTimeout,
 	}
@@ -180,7 +183,7 @@ func (t *targetrunner) daeputQuery(w http.ResponseWriter, r *http.Request, apiIt
 		// PUT /v1/daemon/proxy/newprimaryproxyid
 		t.httpdaesetprimaryproxy(w, r, apiItems)
 	case cmn.SyncSmap:
-		var newsmap = &smapX{}
+		newsmap := &smapX{}
 		if cmn.ReadJSON(w, r, newsmap) != nil {
 			return
 		}
@@ -219,7 +222,8 @@ func (t *targetrunner) daeputQuery(w http.ResponseWriter, r *http.Request, apiIt
 		//
 		aisConf, ok := cmn.GCO.Get().Cloud.ProviderConf(cmn.ProviderAIS)
 		cmn.Assert(ok)
-		if err := t.cloud.ais.Apply(aisConf, action); err != nil {
+		aisCloud := t.cloud[cmn.ProviderAIS].(*cloud.AisCloudProvider)
+		if err := aisCloud.Apply(aisConf, action); err != nil {
 			t.invalmsghdlr(w, r, err.Error())
 		}
 	}
@@ -245,28 +249,29 @@ func (t *targetrunner) httpdaesetprimaryproxy(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	smap := t.owner.smap.get()
-	psi := smap.GetProxy(proxyID)
-	if psi == nil {
-		err := &errNodeNotFound{"cannot set new primary", proxyID, t.si, smap}
-		t.invalmsghdlr(w, r, err.Error())
-		return
-	}
-
 	if prepare {
 		if glog.FastV(4, glog.SmoduleAIS) {
 			glog.Info("Preparation step: do nothing")
 		}
 		return
 	}
+	ctx := &smapModifier{pre: t._setPrim, sid: proxyID}
+	err = t.owner.smap.modify(ctx)
+	if err != nil {
+		t.invalmsghdlr(w, r, err.Error())
+	}
+}
 
-	err = t.owner.smap.modify(func(clone *smapX) error {
-		if clone.Primary.ID() != psi.ID() {
-			clone.Primary = psi
-		}
-		return nil
-	})
-	cmn.AssertNoErr(err)
+func (t *targetrunner) _setPrim(ctx *smapModifier, clone *smapX) (err error) {
+	if clone.Primary.ID() == ctx.sid {
+		return
+	}
+	psi := clone.GetProxy(ctx.sid)
+	if psi == nil {
+		return &errNodeNotFound{"cannot set new primary", ctx.sid, t.si, clone}
+	}
+	clone.Primary = psi
+	return
 }
 
 func (t *targetrunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
@@ -306,7 +311,7 @@ func (t *targetrunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
 		tstats := getstorstatsrunner()
 
 		var rebStats *stats.RebalanceTargetStats
-		if entry := xaction.Registry.GetLatest(xaction.RegistryXactFilter{Kind: cmn.ActRebalance}); entry != nil {
+		if entry := registry.Registry.GetLatest(registry.XactFilter{Kind: cmn.ActRebalance}); entry != nil {
 			if xact := entry.Get(); xact != nil {
 				var ok bool
 				rebStats, ok = xact.Stats().(*stats.RebalanceTargetStats)
@@ -333,8 +338,8 @@ func (t *targetrunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
 		}
 		clusterConf, ok := conf.(cmn.CloudConfAIS)
 		cmn.Assert(ok)
-		aisCloudInfo := t.cloud.ais.GetInfo(clusterConf)
-		t.writeJSON(w, r, aisCloudInfo, httpdaeWhat)
+		aisCloud := t.cloud[cmn.ProviderAIS].(*cloud.AisCloudProvider)
+		t.writeJSON(w, r, aisCloud.GetInfo(clusterConf), httpdaeWhat)
 	default:
 		t.httprunner.httpdaeget(w, r)
 	}
@@ -414,7 +419,7 @@ func (t *targetrunner) handleUnregisterReq() {
 	dsort.Managers.AbortAll(errors.New("target was removed from the cluster"))
 
 	// Stop all xactions
-	xaction.Registry.AbortAll()
+	registry.Registry.AbortAll()
 }
 
 func (t *targetrunner) handleMountpathReq(w http.ResponseWriter, r *http.Request) {
@@ -565,6 +570,7 @@ func (t *targetrunner) receiveBMD(newBMD *bucketMD, msg *aisMsg, tag, caller str
 	}
 	return
 }
+
 func (t *targetrunner) _recvBMD(newBMD *bucketMD, msg *aisMsg, tag, caller string) (err error) {
 	const (
 		downgrade = "attempt to downgrade"
@@ -583,9 +589,7 @@ func (t *targetrunner) _recvBMD(newBMD *bucketMD, msg *aisMsg, tag, caller strin
 		act = ", action " + msg.Action
 	}
 	glog.Infof("%s: %s cur=%s, new=%s%s%s", t.si, tag, bmd, newBMD, act, call)
-	//
-	// lock =======================
-	//
+
 	t.owner.bmd.Lock()
 	bmd = t.owner.bmd.get()
 	curVer = bmd.version()
@@ -634,16 +638,16 @@ func (t *targetrunner) _recvBMD(newBMD *bucketMD, msg *aisMsg, tag, caller strin
 	bmd.Range(nil, nil, func(obck *cluster.Bck) bool {
 		var present bool
 		newBMD.Range(nil, nil, func(nbck *cluster.Bck) bool {
-			if !obck.Equal(nbck, false /*ignore BID*/) {
+			if !obck.Equal(nbck, false /*ignore BID*/, false /* ignore backend */) {
 				return false
 			}
 			present = true
 			if obck.Props.Mirror.Enabled && !nbck.Props.Mirror.Enabled {
-				xaction.Registry.DoAbort(cmn.ActPutCopies, nbck)
+				registry.Registry.DoAbort(cmn.ActPutCopies, nbck)
 				// NOTE: cmn.ActMakeNCopies takes care of itself
 			}
 			if obck.Props.EC.Enabled && !nbck.Props.EC.Enabled {
-				xaction.Registry.DoAbort(cmn.ActECEncode, nbck)
+				registry.Registry.DoAbort(cmn.ActECEncode, nbck)
 			}
 			return true
 		})
@@ -657,7 +661,7 @@ func (t *targetrunner) _recvBMD(newBMD *bucketMD, msg *aisMsg, tag, caller strin
 		return false
 	})
 
-	t.owner.bmd.Unlock() // unlock ================
+	t.owner.bmd.Unlock()
 
 	if destroyErrs != "" {
 		// TODO: revisit error handling
@@ -666,7 +670,7 @@ func (t *targetrunner) _recvBMD(newBMD *bucketMD, msg *aisMsg, tag, caller strin
 
 	// evict LOM cache
 	if len(bcksToDelete) > 0 {
-		xaction.Registry.AbortAllBuckets(bcksToDelete...)
+		registry.Registry.AbortAllBuckets(bcksToDelete...)
 		go func(bcks ...*cluster.Bck) {
 			for _, b := range bcks {
 				cluster.EvictLomCache(b)
@@ -687,9 +691,7 @@ func (t *targetrunner) _recvBMD(newBMD *bucketMD, msg *aisMsg, tag, caller strin
 }
 
 func (t *targetrunner) receiveSmap(newSmap *smapX, msg *aisMsg, caller string) (err error) {
-	var (
-		s, from string
-	)
+	var s, from string
 	if caller != "" {
 		from = " from " + caller
 	}
@@ -706,6 +708,8 @@ func (t *targetrunner) receiveSmap(newSmap *smapX, msg *aisMsg, caller string) (
 	if err = t.owner.smap.synchronize(newSmap, true /* lesserIsErr */); err != nil {
 		return
 	}
+	node := newSmap.GetNode(t.si.ID())
+	t.si.Flags = node.Flags
 	return
 }
 
@@ -731,9 +735,12 @@ func (t *targetrunner) receiveRMD(newRMD *rebMD, msg *aisMsg, caller string) (er
 	}
 
 	smap := t.owner.smap.Get()
+	notif := &xaction.NotifXact{
+		NotifBase: nl.NotifBase{When: cluster.UponTerm, Dsts: []string{equalIC}, F: t.callerNotifyFin},
+	}
 	if msg.Action == cmn.ActRebalance { // manual (triggered by user)
 		glog.Infof("%s: manual rebalance (version: %d)", t.si, newRMD.version())
-		go t.rebManager.RunRebalance(smap, newRMD.Version)
+		go t.rebManager.RunRebalance(smap, newRMD.Version, notif)
 		return
 	}
 
@@ -741,9 +748,9 @@ func (t *targetrunner) receiveRMD(newRMD *rebMD, msg *aisMsg, caller string) (er
 		"%s: rebalance (version: %d; new_targets: %v; resilver: %t)",
 		t.si, newRMD.version(), newRMD.TargetIDs, newRMD.Resilver,
 	)
-	go t.rebManager.RunRebalance(smap, newRMD.Version)
+	go t.rebManager.RunRebalance(smap, newRMD.Version, notif)
 	if newRMD.Resilver {
-		go t.rebManager.RunResilver("", true /*skipGlobMisplaced*/)
+		go t.runResilver("", true /*skipGlobMisplaced*/)
 	}
 	return
 }
@@ -847,7 +854,7 @@ func (t *targetrunner) fetchPrimaryMD(what string, outStruct interface{}, rename
 	if renamed != "" {
 		q.Add(whatRenamedLB, renamed)
 	}
-	path := cmn.URLPath(cmn.Version, cmn.Daemon)
+	path := cmn.JoinWords(cmn.Version, cmn.Daemon)
 	url := psi.URL(cmn.NetworkIntraControl)
 	timeout := cmn.GCO.Get().Timeout.CplaneOperation
 	args := callArgs{
@@ -881,7 +888,7 @@ func (t *targetrunner) smapVersionFixup(r *http.Request) {
 		glog.Error(err)
 		return
 	}
-	var msg = t.newAisMsgStr("get-what="+cmn.GetWhatSmap, newSmap, nil)
+	msg := t.newAisMsgStr("get-what="+cmn.GetWhatSmap, newSmap, nil)
 	if r != nil {
 		caller = r.Header.Get(cmn.HeaderCallerName)
 	}
@@ -935,8 +942,8 @@ func (t *targetrunner) metasyncHandler(w http.ResponseWriter, r *http.Request) {
 
 // PUT /v1/metasync
 func (t *targetrunner) metasyncHandlerPut(w http.ResponseWriter, r *http.Request) {
-	var payload = make(msPayload)
-	if err := jsp.Decode(r.Body, &payload, jsp.CCSign(), "metasync put"); err != nil {
+	payload := make(msPayload)
+	if err := jsp.Decode(r.Body, &payload, jspMetasyncOpts, "metasync put"); err != nil {
 		cmn.InvalidHandlerDetailed(w, r, err.Error())
 		return
 	}
@@ -997,8 +1004,8 @@ func (t *targetrunner) metasyncHandlerPut(w http.ResponseWriter, r *http.Request
 
 // POST /v1/metasync
 func (t *targetrunner) metasyncHandlerPost(w http.ResponseWriter, r *http.Request) {
-	var payload = make(msPayload)
-	if err := jsp.Decode(r.Body, &payload, jsp.CCSign(), "metasync post"); err != nil {
+	payload := make(msPayload)
+	if err := jsp.Decode(r.Body, &payload, jspMetasyncOpts, "metasync post"); err != nil {
 		cmn.InvalidHandlerDetailed(w, r, err.Error())
 		return
 	}
@@ -1121,14 +1128,17 @@ func (t *targetrunner) enable() error {
 
 // lookupRemoteSingle sends the message to the given target to see if it has the specific object.
 func (t *targetrunner) LookupRemoteSingle(lom *cluster.LOM, tsi *cluster.Snode) (ok bool) {
+	header := make(http.Header)
+	header.Add(cmn.HeaderCallerID, t.Snode().ID())
 	query := make(url.Values)
 	query.Add(cmn.URLParamSilent, "true")
 	args := callArgs{
 		si: tsi,
 		req: cmn.ReqArgs{
 			Method: http.MethodHead,
+			Header: header,
 			Base:   tsi.URL(cmn.NetworkIntraControl),
-			Path:   cmn.URLPath(cmn.Version, cmn.Objects, lom.BckName(), lom.ObjName),
+			Path:   cmn.JoinWords(cmn.Version, cmn.Objects, lom.BckName(), lom.ObjName),
 			Query:  query,
 		},
 		timeout: lom.Config().Timeout.CplaneOperation,
@@ -1141,16 +1151,20 @@ func (t *targetrunner) LookupRemoteSingle(lom *cluster.LOM, tsi *cluster.Snode) 
 // lookupRemoteAll sends the broadcast message to all targets to see if they
 // have the specific object.
 func (t *targetrunner) lookupRemoteAll(lom *cluster.LOM, smap *smapX) *cluster.Snode {
+	header := make(http.Header)
+	header.Add(cmn.HeaderCallerID, t.Snode().ID())
 	query := make(url.Values)
 	query.Add(cmn.URLParamSilent, "true")
 	query.Add(cmn.URLParamCheckExistsAny, "true") // lookup all mountpaths _and_ copy if misplaced
 	res := t.bcastToGroup(bcastArgs{
 		req: cmn.ReqArgs{
 			Method: http.MethodHead,
-			Path:   cmn.URLPath(cmn.Version, cmn.Objects, lom.BckName(), lom.ObjName),
+			Header: header,
+			Path:   cmn.JoinWords(cmn.Version, cmn.Objects, lom.BckName(), lom.ObjName),
 			Query:  query,
 		},
-		smap: smap,
+		ignoreMaintenance: true,
+		smap:              smap,
 	})
 	for r := range res {
 		if r.err == nil {

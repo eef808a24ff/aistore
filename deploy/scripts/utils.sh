@@ -1,18 +1,37 @@
 #!/bin/bash
+
 function list_all_go_dirs {
   go list -f '{{.Dir}}' "${AISTORE_DIR}/..."
 }
 
+function check_gomod {
+  # For now there is no `-check` flag that would tell us if there is something
+  # that needs to be updated with `go.mod` or `go.sum`. Therefore, we can just
+  # run tidy and check if anything has changed in the files.
+  # See: https://github.com/golang/go/issues/27005.
+  if ! command -v git &>/dev/null; then
+    return
+  fi
+
+  go mod tidy &>/dev/null
+  if ! git diff --exit-code -- go.mod go.sum &>/dev/null; then
+    printf "\nproject requires to run 'go mod tidy'\n"
+    exit 1
+  fi
+}
+
 function check_files_headers {
   for f in $(find ${AISTORE_DIR} -type f -name "*.go" ! -regex $EXTERNAL_SRC_REGEX); do
-    out=$(head -n 1 $f | grep -P "(\s*+build.*|\/(\/|\*)(\s)*Package(.)*)$")
+    # Expect '// +build ...' or '// Package ...'.
+    out=$(head -n 1 $f | grep -P "\/\/\s(\+build(.*)|Package(.*))")
     if [[ $? -ne 0 ]]; then
       echo "$f: first line should be package a description. Instead got:"
       head -n 1 $f
       exit 1
     fi
 
-    out=$(head -n 10 $f | grep -P "((.)*no-copyright(.)*|(.)*NVIDIA(.)*All rights reserved(.)*)")
+    # Expect '// no-copyright' or standard copyright preamble.
+    out=$(head -n 10 $f | grep -P "((.*)\/\/\sno-copyright(.*)|(.*)Copyright(.*)NVIDIA(.*)All rights reserved(.*))")
     if [[ $? -ne 0 ]]; then
       echo "$f: copyright statement not found in first 10 lines. Use no-copyright to skip"
       exit 1
@@ -27,6 +46,17 @@ function check_imports {
     out=$(head -n 50 $f | grep -Pz 'import \((.|\n)*(\n\n)+(\t(\w|\.)?\s?(.*)"(.*)"\n)*\n+(\t(\w|\.)?\s?"(.*)"\n)*\)')
     if [[ $? -eq 0 ]]; then
       echo "$f: 'import' block contains (at least) 2 empty lines (expected: 1)"
+      exit 1
+    fi
+  done
+}
+
+function check_deps {
+  # Check if `aisloader` package imports `tutils`.
+  for f in $(find ${AISTORE_DIR}/bench/aisloader -type f -name "*.go" ! -regex $EXTERNAL_SRC_REGEX); do
+    out=$(cat $f | grep '"github.com/NVIDIA/aistore/tutils"')
+    if [[ $? -eq 0 ]]; then
+      echo "$f: imports 'tutils' package which is forbidden"
       exit 1
     fi
   done

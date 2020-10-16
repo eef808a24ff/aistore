@@ -23,8 +23,6 @@ import (
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/transport"
-	"github.com/NVIDIA/aistore/xaction"
-	jsoniter "github.com/json-iterator/go"
 )
 
 // runners
@@ -86,8 +84,7 @@ type (
 //
 //====================
 var (
-	daemon     = daemonCtx{}
-	jsonCompat = jsoniter.ConfigCompatibleWithStandardLibrary
+	daemon = daemonCtx{}
 )
 
 //====================
@@ -174,9 +171,7 @@ func dryRunInit() {
 }
 
 func initDaemon(version, build string) (rmain cmn.Runner) {
-	var (
-		err error
-	)
+	var err error
 	flag.Parse()
 	if daemon.cli.role != cmn.Proxy && daemon.cli.role != cmn.Target {
 		cmn.ExitLogf(
@@ -196,7 +191,7 @@ func initDaemon(version, build string) (rmain cmn.Runner) {
 		str += "Usage: aisnode -role=<proxy|target> -config=</dir/config.json> ..."
 		cmn.ExitLogf(str)
 	}
-	jsp.LoadConfig(daemon.cli.confPath)
+	jsp.MustLoadConfig(daemon.cli.confPath)
 
 	// even more config changes, e.g:
 	// -config=/etc/ais.json -role=target -persist=true -config_custom="client.timeout=13s, proxy.primary_url=https://localhost:10080"
@@ -254,7 +249,6 @@ func initDaemon(version, build string) (rmain cmn.Runner) {
 	}
 
 	daemon.rg.add(hk.DefaultHK, xhk)
-	xaction.Init()
 	if daemon.cli.role == cmn.Proxy {
 		rmain = initProxy()
 	} else {
@@ -282,8 +276,9 @@ func initProxy() cmn.Runner {
 
 func initTarget() cmn.Runner {
 	t := &targetrunner{
-		gmm: &memsys.MMSA{Name: gmmName},
-		smm: &memsys.MMSA{Name: smmName, Small: true},
+		gmm:   &memsys.MMSA{Name: gmmName},
+		smm:   &memsys.MMSA{Name: smmName, Small: true},
+		cloud: make(clouds, 8),
 	}
 	_ = t.gmm.Init(true /*panicOnErr*/)
 	_ = t.smm.Init(true /*panicOnErr*/)

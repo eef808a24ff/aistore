@@ -18,12 +18,13 @@ import (
 	"github.com/NVIDIA/aistore/tutils"
 	"github.com/NVIDIA/aistore/tutils/readers"
 	"github.com/NVIDIA/aistore/tutils/tassert"
+	"github.com/NVIDIA/aistore/tutils/tetl"
 	"github.com/NVIDIA/go-tfdata/tfdata/core"
 	jsoniter "github.com/json-iterator/go"
 )
 
 func startTar2TfTransformer(t *testing.T) (uuid string) {
-	spec, err := tutils.GetTransformYaml(tutils.Tar2TF)
+	spec, err := tetl.GetTransformYaml(tetl.Tar2TF)
 	tassert.CheckError(t, err)
 
 	pod, err := etl.ParsePodSpec(nil, spec)
@@ -31,12 +32,12 @@ func startTar2TfTransformer(t *testing.T) (uuid string) {
 	spec, _ = jsoniter.Marshal(pod)
 
 	// Starting transformer
-	uuid, err = api.TransformInit(baseParams, spec)
+	uuid, err = api.ETLInit(baseParams, spec)
 	tassert.CheckFatal(t, err)
 	return uuid
 }
 
-func TestKubeTar2TFS3(t *testing.T) {
+func TestETLTar2TFS3(t *testing.T) {
 	tutils.CheckSkip(t, tutils.SkipTestArgs{K8s: true})
 
 	const (
@@ -73,7 +74,7 @@ func TestKubeTar2TFS3(t *testing.T) {
 
 	uuid := startTar2TfTransformer(t)
 	defer func() {
-		tassert.CheckFatal(t, api.TransformStop(baseParams, uuid))
+		tassert.CheckFatal(t, api.ETLStop(baseParams, uuid))
 	}()
 	// GET TFRecord from TAR
 	outFileBuffer := bytes.NewBuffer(nil)
@@ -100,8 +101,9 @@ func TestKubeTar2TFS3(t *testing.T) {
 	tassert.Errorf(t, equal == true, "actual and expected records different")
 }
 
-func TestKubeTar2TFRanges(t *testing.T) {
-	tutils.CheckSkip(t, tutils.SkipTestArgs{K8s: true})
+func TestETLTar2TFRanges(t *testing.T) {
+	// TestETLTar2TFS3 already runs in short tests, no need for short here as well.
+	tutils.CheckSkip(t, tutils.SkipTestArgs{K8s: true, Long: true})
 
 	type testCase struct {
 		start, end int64
@@ -145,7 +147,7 @@ func TestKubeTar2TFRanges(t *testing.T) {
 
 	uuid := startTar2TfTransformer(t)
 	defer func() {
-		tassert.CheckFatal(t, api.TransformStop(baseParams, uuid))
+		tassert.CheckFatal(t, api.ETLStop(baseParams, uuid))
 	}()
 
 	// This is to mimic external S3 clients like Tensorflow

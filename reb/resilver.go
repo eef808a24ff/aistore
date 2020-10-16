@@ -15,7 +15,8 @@ import (
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
+	"github.com/NVIDIA/aistore/xaction/runners"
 )
 
 type (
@@ -27,43 +28,49 @@ type (
 	}
 )
 
-func (reb *Manager) RunResilver(id string, skipGlobMisplaced bool) {
-	var (
-		availablePaths, _ = fs.Get()
-		err               = fs.PutMarker(xaction.GetMarkerName(cmn.ActResilver))
-	)
-	if err != nil {
+func (reb *Manager) RunResilver(id string, skipGlobMisplaced bool, notifs ...cluster.Notif) {
+	cmn.Assert(id != "")
+
+	availablePaths, _ := fs.Get()
+	if len(availablePaths) < 2 {
+		glog.Errorf("Cannot run resilver with less than 2 mountpaths (%d)", len(availablePaths))
+		return
+	}
+
+	if err := fs.PutMarker(registry.GetMarkerName(cmn.ActResilver)); err != nil {
 		glog.Errorln("failed to create resilver marker", err)
 	}
 
-	xreb := xaction.Registry.RenewResilver(id)
+	xreb := registry.Registry.RenewResilver(id).(*runners.Resilver)
 	defer xreb.MarkDone()
+
+	if len(notifs) != 0 {
+		xreb.AddNotif(notifs[0])
+	}
 
 	glog.Infoln(xreb.String())
 
-	slab, err := reb.t.GetMMSA().GetSlab(memsys.MaxPageSlabSize) // TODO: estimate
+	slab, err := reb.t.MMSA().GetSlab(memsys.MaxPageSlabSize) // TODO: estimate
 	cmn.AssertNoErr(err)
 
 	wg := &sync.WaitGroup{}
 	for _, mpathInfo := range availablePaths {
-		var (
-			jogger = &resilverJogger{
-				joggerBase:        joggerBase{m: reb, xreb: &xreb.RebBase, wg: wg},
-				slab:              slab,
-				skipGlobMisplaced: skipGlobMisplaced,
-			}
-		)
+		jogger := &resilverJogger{
+			joggerBase:        joggerBase{m: reb, xreb: &xreb.RebBase, wg: wg},
+			slab:              slab,
+			skipGlobMisplaced: skipGlobMisplaced,
+		}
 		wg.Add(1)
 		go jogger.jog(mpathInfo)
 	}
 	wg.Wait()
 
 	if !xreb.Aborted() {
-		if err := fs.RemoveMarker(xaction.GetMarkerName(cmn.ActResilver)); err != nil {
+		if err := fs.RemoveMarker(registry.GetMarkerName(cmn.ActResilver)); err != nil {
 			glog.Errorf("%s: failed to remove in-progress mark, err: %v", reb.t.Snode(), err)
 		}
 	}
-	reb.t.GetGFN(cluster.GFNLocal).Deactivate()
+	reb.t.GFN(cluster.GFNLocal).Deactivate()
 	xreb.Finish()
 }
 
@@ -86,7 +93,7 @@ func (rj *resilverJogger) jog(mpathInfo *fs.MountpathInfo) {
 		Callback: rj.walk,
 		Sorted:   false,
 	}
-	rj.m.t.GetBowner().Get().Range(nil, nil, func(bck *cluster.Bck) bool {
+	rj.m.t.Bowner().Get().Range(nil, nil, func(bck *cluster.Bck) bool {
 		opts.ErrCallback = nil
 		opts.Bck = bck.Bck
 		if err := fs.Walk(opts); err != nil {
@@ -196,7 +203,8 @@ func (rj *resilverJogger) moveObject(fqn string, ct *cluster.CT) {
 			return
 		}
 	}
-	copied, err := t.CopyObject(lom, lom.Bck(), rj.buf, true)
+	params := cluster.CopyObjectParams{BckTo: lom.Bck(), Buf: rj.buf}
+	copied, _, err := t.CopyObject(lom, params, true /*localOnly*/)
 	if err != nil || !copied {
 		if err != nil {
 			glog.Errorf("%s: %v", lom, err)
@@ -215,11 +223,13 @@ func (rj *resilverJogger) moveObject(fqn string, ct *cluster.CT) {
 			glog.Warningf("%s: failed to cleanup old metafile %q: %v", lom, metaOldPath, err)
 		}
 	}
+	rj.xreb.BytesAdd(lom.Size())
+	rj.xreb.ObjectsInc()
 	// NOTE: rely on LRU to remove "misplaced"
 }
 
 func (rj *resilverJogger) walk(fqn string, de fs.DirEntry) (err error) {
-	var t = rj.m.t
+	t := rj.m.t
 	if rj.xreb.Aborted() {
 		return cmn.NewAbortedErrorDetails("traversal", rj.xreb.String())
 	}
@@ -227,7 +237,7 @@ func (rj *resilverJogger) walk(fqn string, de fs.DirEntry) (err error) {
 		return nil
 	}
 
-	ct, err := cluster.NewCTFromFQN(fqn, t.GetBowner())
+	ct, err := cluster.NewCTFromFQN(fqn, t.Bowner())
 	if err != nil {
 		if cmn.IsErrBucketLevel(err) {
 			return err
@@ -240,7 +250,7 @@ func (rj *resilverJogger) walk(fqn string, de fs.DirEntry) (err error) {
 	// optionally, skip those that must be globally rebalanced
 	if rj.skipGlobMisplaced {
 		uname := ct.Bck().MakeUname(ct.ObjName())
-		tsi, err := cluster.HrwTarget(uname, t.GetSowner().Get())
+		tsi, err := cluster.HrwTarget(uname, t.Sowner().Get())
 		if err != nil {
 			return err
 		}

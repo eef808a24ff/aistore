@@ -5,17 +5,20 @@
 package downloader
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 
+	"github.com/NVIDIA/aistore/3rdparty/atomic"
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/stats"
-	"github.com/NVIDIA/aistore/xaction/demand"
+	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 // =============================== Summary ====================================
@@ -92,7 +95,7 @@ import (
 // using the "Content-Length" field returned in the Header.
 // Note: not all servers respond with a "Content-Length" request header.
 // For these cases, a progress percentage is not returned, just the current
-// number of bytes that have been downloaded.
+// downloaded size (in bytes).
 //
 // ====== Notes ======
 //
@@ -118,33 +121,26 @@ var (
 	// arbitrary server. The downloader chooses the correct client by
 	// server's URL. Certification check is disabled always for now and
 	// does not depend on cluster settings.
-	httpClient  = &http.Client{}
+	httpClient  = cmn.NewClient(cmn.TransportArgs{})
 	httpsClient = cmn.NewClient(cmn.TransportArgs{
 		UseHTTPS:   true,
 		SkipVerify: true,
 	})
+	instance atomic.Int64
 )
 
-// public types
 type (
-	// Downloader implements the fs.PathRunner and XactDemand interface. When
-	// download related requests are made to AIS using the download endpoint,
+	// Downloader implements the fs.PathRunner and demand.XactDemand interface.
+	// When download related requests are made to AIS using the download endpoint,
 	// Downloader dispatches these requests to the corresponding jogger.
 	Downloader struct {
-		cmn.Named
-		demand.XactDemandBase
+		xaction.XactDemandBase
 
 		t          cluster.Target
 		statsT     stats.Tracker
-		mpathReqCh chan fs.ChangeReq
-		adminCh    chan *request
-		downloadCh chan DlJob
 		dispatcher *dispatcher
 	}
-)
 
-// private types
-type (
 	// The result of calling one of Downloader's exposed methods is encapsulated
 	// in a response object, which is used to communicate the outcome of the
 	// request.
@@ -163,6 +159,7 @@ type (
 		id         string         // id of the job task
 		regex      *regexp.Regexp // regex of descriptions to return if id is empty
 		responseCh chan *response // where the outcome of the request is written
+		onlyActive bool           // request status of only active tasks
 	}
 
 	progressReader struct {
@@ -178,7 +175,7 @@ func clientForURL(u string) *http.Client {
 	return httpClient
 }
 
-//==================================== Requests ===========================================
+// ============================ Requests =======================================
 
 func (req *request) write(resp interface{}, err error, statusCode int) {
 	req.responseCh <- &response{
@@ -215,85 +212,65 @@ func (pr *progressReader) Close() error {
 
 // ============================= Downloader ====================================
 
-var (
-	// interface guard
-	_ fs.PathRunner = &Downloader{}
-)
+func init() {
+	registry.Registry.RegisterGlobalXact(&downloaderProvider{})
+}
 
-func (d *Downloader) Name() string                    { return "downloader" }
-func (d *Downloader) IsMountpathXact() bool           { return true }
-func (d *Downloader) ReqAddMountpath(mpath string)    { d.mpathReqCh <- fs.MountpathAdd(mpath) }
-func (d *Downloader) ReqRemoveMountpath(mpath string) { d.mpathReqCh <- fs.MountpathRem(mpath) }
-func (d *Downloader) ReqEnableMountpath(_ string)     {}
-func (d *Downloader) ReqDisableMountpath(_ string)    {}
+type downloaderProvider struct {
+	registry.BaseGlobalEntry
+	xact *Downloader
 
-func NewDownloader(t cluster.Target, statsT stats.Tracker) (d *Downloader) {
+	t      cluster.Target
+	statsT stats.Tracker
+}
+
+func (*downloaderProvider) New(args registry.XactArgs) registry.GlobalEntry {
+	return &downloaderProvider{t: args.T, statsT: args.Custom.(stats.Tracker)}
+}
+
+func (p *downloaderProvider) Start(_ cmn.Bck) error {
+	xdl := newDownloader(p.t, p.statsT)
+	p.xact = xdl
+	go xdl.Run()
+	return nil
+}
+func (*downloaderProvider) Kind() string        { return cmn.ActDownload }
+func (p *downloaderProvider) Get() cluster.Xact { return p.xact }
+
+func (d *Downloader) Name() string {
+	i := strconv.FormatInt(instance.Load(), 10)
+	return "downloader" + i
+}
+func (d *Downloader) IsMountpathXact() bool { return true }
+
+func newDownloader(t cluster.Target, statsT stats.Tracker) (d *Downloader) {
 	downloader := &Downloader{
-		XactDemandBase: *demand.NewXactDemandBaseBck(cmn.Download, cmn.Bck{Provider: cmn.ProviderAIS}),
+		XactDemandBase: *xaction.NewXactDemandBaseBck(cmn.Download, cmn.Bck{Provider: cmn.ProviderAIS}),
 		t:              t,
 		statsT:         statsT,
-		mpathReqCh:     make(chan fs.ChangeReq, 1),
-		adminCh:        make(chan *request),
-		downloadCh:     make(chan DlJob, jobsChSize),
 	}
 
 	downloader.dispatcher = newDispatcher(downloader)
 	downloader.InitIdle()
+	instance.Inc()
 	return downloader
 }
 
-func (d *Downloader) init() {
-	d.dispatcher.init()
-}
-
-// TODO: Downloader doesn't necessarily has to be a go routine
-// all it does is forwards the requests to dispatcher
-func (d *Downloader) Run() (err error) {
-	glog.Infof("Starting %s", d.GetRunName())
-	d.t.GetFSPRG().Reg(d)
-	d.init()
-Loop:
-	for {
-		select {
-		case req := <-d.adminCh:
-			switch req.action {
-			case actStatus:
-				d.dispatcher.dispatchStatus(req)
-			case actAbort:
-				d.dispatcher.dispatchAbort(req)
-			case actRemove:
-				d.dispatcher.dispatchRemove(req)
-			case actList:
-				d.dispatcher.dispatchList(req)
-			default:
-				cmn.AssertFmt(false, req, req.action)
-			}
-		case job := <-d.downloadCh:
-			d.dispatcher.ScheduleForDownload(job)
-		case req := <-d.mpathReqCh:
-			err = fmt.Errorf("mountpaths have changed when downloader was running; %s: %s; aborting", req.Action, req.Path)
-			break Loop
-		case <-d.IdleTimer():
-			glog.Infof("%s has timed out. Exiting...", d.GetRunName())
-			break Loop
-		case <-d.ChanAbort():
-			glog.Infof("%s has been aborted. Exiting...", d.GetRunName())
-			break Loop
-		}
-	}
-	d.Stop(err)
+func (d *Downloader) Run() error {
+	glog.Infof("starting %s", d.Name())
+	err := d.dispatcher.run()
+	d.stop(err)
 	return nil
 }
 
-// Stop terminates the downloader
-func (d *Downloader) Stop(err error) {
-	d.t.GetFSPRG().Unreg(d)
+// stop terminates the downloader and all dependent entities.
+func (d *Downloader) stop(err error) {
 	d.XactDemandBase.Stop()
-	d.dispatcher.Abort()
 	d.Finish()
-	glog.Infof("Stopped %s", d.GetRunName())
 	if err != nil {
-		glog.Errorf("stopping downloader; %s", err.Error())
+		glog.Errorf("stopping %s, err: %v", d.Name(), err)
+	} else {
+		glog.Infof("stopped %s", d.Name())
 	}
 }
 
@@ -306,7 +283,7 @@ func (d *Downloader) Download(dJob DlJob) (resp interface{}, err error, statusCo
 	dlStore.setJob(dJob.ID(), dJob)
 
 	select {
-	case d.downloadCh <- dJob:
+	case d.dispatcher.dispatchDownloadCh <- dJob:
 		return nil, nil, http.StatusOK
 	default:
 		return "downloader job queue is full", nil, http.StatusTooManyRequests
@@ -315,72 +292,70 @@ func (d *Downloader) Download(dJob DlJob) (resp interface{}, err error, statusCo
 
 func (d *Downloader) AbortJob(id string) (resp interface{}, err error, statusCode int) {
 	d.IncPending()
+	defer d.DecPending()
 	req := &request{
 		action:     actAbort,
 		id:         id,
 		responseCh: make(chan *response, 1),
 	}
-	d.adminCh <- req
+	d.dispatcher.adminCh <- req
 
 	// await the response
 	r := <-req.responseCh
-	d.DecPending()
 	return r.resp, r.err, r.statusCode
 }
 
 func (d *Downloader) RemoveJob(id string) (resp interface{}, err error, statusCode int) {
 	d.IncPending()
+	defer d.DecPending()
 	req := &request{
 		action:     actRemove,
 		id:         id,
 		responseCh: make(chan *response, 1),
 	}
-	d.adminCh <- req
+	d.dispatcher.adminCh <- req
 
 	// await the response
 	r := <-req.responseCh
-	d.DecPending()
 	return r.resp, r.err, r.statusCode
 }
 
-func (d *Downloader) JobStatus(id string) (resp interface{}, err error, statusCode int) {
+func (d *Downloader) JobStatus(id string, onlyActive bool) (resp interface{}, err error, statusCode int) {
 	d.IncPending()
+	defer d.DecPending()
 	req := &request{
 		action:     actStatus,
 		id:         id,
 		responseCh: make(chan *response, 1),
+		onlyActive: onlyActive,
 	}
-	d.adminCh <- req
+	d.dispatcher.adminCh <- req
 
 	// await the response
 	r := <-req.responseCh
-	d.DecPending()
 	return r.resp, r.err, r.statusCode
 }
 
 func (d *Downloader) ListJobs(regex *regexp.Regexp) (resp interface{}, err error, statusCode int) {
 	d.IncPending()
+	defer d.DecPending()
 	req := &request{
 		action:     actList,
 		regex:      regex,
 		responseCh: make(chan *response, 1),
 	}
-	d.adminCh <- req
+	d.dispatcher.adminCh <- req
 
 	// await the response
 	r := <-req.responseCh
-	d.DecPending()
 	return r.resp, r.err, r.statusCode
 }
 
 func (d *Downloader) checkJob(req *request) (*downloadJobInfo, error) {
 	jInfo, err := dlStore.getJob(req.id)
 	if err != nil {
-		if err == errJobNotFound {
-			req.writeErrResp(fmt.Errorf("download job %q not found", req.id), http.StatusNotFound)
-			return nil, err
-		}
-		req.writeErrResp(err, http.StatusInternalServerError)
+		cmn.Assert(errors.Is(err, errJobNotFound))
+		req.writeErrResp(fmt.Errorf("download job %q not found", req.id), http.StatusNotFound)
 		return nil, err
 	}
 	return jInfo, nil

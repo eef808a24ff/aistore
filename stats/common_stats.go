@@ -24,6 +24,7 @@ import (
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/stats/statsd"
+	"github.com/NVIDIA/aistore/xaction"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -79,17 +80,15 @@ const (
 	ErrDownloadCount = "err.dl.n"
 
 	// KindLatency
-	GetLatency          = "get.µs"
-	ListLatency         = "lst.µs"
-	KeepAliveMinLatency = "kalive.µs.min"
-	KeepAliveMaxLatency = "kalive.µs.max"
-	KeepAliveLatency    = "kalive.µs"
+	GetLatency          = "get.ns"
+	ListLatency         = "lst.ns"
+	KeepAliveMinLatency = "kalive.ns.min"
+	KeepAliveMaxLatency = "kalive.ns.max"
+	KeepAliveLatency    = "kalive.ns"
 
 	// KindSpecial
-	Uptime = "up.µs.time"
+	Uptime = "up.ns.time"
 )
-
-var jsonCompat = jsoniter.ConfigCompatibleWithStandardLibrary
 
 //
 // public types
@@ -116,7 +115,7 @@ type (
 	}
 
 	RebalanceTargetStats struct {
-		cmn.BaseXactStats
+		xaction.BaseXactStats
 		Ext ExtRebalanceStats `json:"ext"`
 	}
 
@@ -145,10 +144,10 @@ type (
 
 // interface guard
 var (
-	_ Tracker       = &statsRunner{}
-	_ Tracker       = &Prunner{}
-	_ Tracker       = &Trunner{}
-	_ cmn.XactStats = &RebalanceTargetStats{}
+	_ Tracker           = &statsRunner{}
+	_ Tracker           = &Prunner{}
+	_ Tracker           = &Trunner{}
+	_ cluster.XactStats = &RebalanceTargetStats{}
 )
 
 //
@@ -211,7 +210,7 @@ func (s *CoreStats) init(size int) {
 func (s *CoreStats) UpdateUptime(d time.Duration) {
 	v := s.Tracker[Uptime]
 	v.Lock()
-	v.Value = d.Nanoseconds() / int64(time.Microsecond)
+	v.Value = d.Nanoseconds()
 	v.Unlock()
 }
 
@@ -227,15 +226,15 @@ func (s *CoreStats) get(name string) (val int64) {
 }
 
 //
-// NOTE naming convention: ".n" for the count and ".µs" for microseconds
+// NOTE naming convention: ".n" for the count and ".ns" for duration (nanoseconds)
 //
 func (s *CoreStats) doAdd(name, nameSuffix string, val int64) {
 	v, ok := s.Tracker[name]
-	cmn.AssertMsg(ok, "Invalid stats name '"+name+"'")
+	cmn.Assertf(ok, "invalid stats name %q", name)
 	switch v.kind {
 	case KindLatency:
-		if strings.HasSuffix(name, ".µs") {
-			nroot := strings.TrimSuffix(name, ".µs")
+		if strings.HasSuffix(name, ".ns") {
+			nroot := strings.TrimSuffix(name, ".ns")
 			if nameSuffix != "" {
 				nroot += "." + nameSuffix
 			}
@@ -247,7 +246,6 @@ func (s *CoreStats) doAdd(name, nameSuffix string, val int64) {
 		}
 		v.Lock()
 		v.numSamples++
-		val = int64(time.Duration(val) / time.Microsecond)
 		v.cumulative += val
 		v.Value += val
 		v.Unlock()
@@ -386,7 +384,7 @@ func (v *copyValue) UnmarshalJSON(b []byte) error       { return jsoniter.Unmars
 //
 
 func (tracker statsTracker) register(key, kind string, isCommon ...bool) {
-	cmn.AssertMsg(cmn.StringInSlice(kind, kinds), "invalid stats kind '"+kind+"'")
+	cmn.Assertf(cmn.StringInSlice(kind, kinds), "invalid stats kind %q", kind)
 
 	tracker[key] = &statsValue{kind: kind}
 	if len(isCommon) > 0 {
@@ -537,7 +535,7 @@ func (r *statsRunner) recycleLogs() time.Duration {
 }
 
 func (r *statsRunner) removeLogs(config *cmn.Config) {
-	var maxtotal = int64(config.Log.MaxTotal)
+	maxtotal := int64(config.Log.MaxTotal)
 	logfinfos, err := ioutil.ReadDir(config.Log.Dir)
 	if err != nil {
 		glog.Errorf("GC logs: cannot read log dir %s, err: %v", config.Log.Dir, err)
@@ -545,7 +543,7 @@ func (r *statsRunner) removeLogs(config *cmn.Config) {
 		return
 	}
 	// sample name ais.ip-10-0-2-19.root.log.INFO.20180404-031540.2249
-	var logtypes = []string{".INFO.", ".WARNING.", ".ERROR."}
+	logtypes := []string{".INFO.", ".WARNING.", ".ERROR."}
 	for _, logtype := range logtypes {
 		var (
 			tot   = int64(0)

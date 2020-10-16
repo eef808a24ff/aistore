@@ -5,6 +5,7 @@
 package tutils
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"net"
@@ -151,12 +152,14 @@ func DestroyBucket(tb testing.TB, proxyURL string, bck cmn.Bck) {
 	}
 }
 
-func CleanCloudBucket(t *testing.T, proxyURL string, bck cmn.Bck, prefix string) {
-	bck.Provider = cmn.AnyCloud
+func CleanupCloudBucket(t *testing.T, proxyURL string, bck cmn.Bck, prefix string) {
 	toDelete, err := ListObjectNames(proxyURL, bck, prefix, 0)
 	tassert.CheckFatal(t, err)
 	baseParams := BaseAPIParams(proxyURL)
-	_, err = api.DeleteList(baseParams, bck, toDelete)
+	xactID, err := api.DeleteList(baseParams, bck, toDelete)
+	tassert.CheckFatal(t, err)
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActDelete, Timeout: time.Minute}
+	_, err = api.WaitForXaction(baseParams, args)
 	tassert.CheckFatal(t, err)
 }
 
@@ -434,8 +437,9 @@ func EvictObjects(t *testing.T, proxyURL string, bck cmn.Bck, objList []string) 
 	if err != nil {
 		t.Errorf("Evict bucket %s failed, err = %v", bck, err)
 	}
-	xactArgs := api.XactReqArgs{ID: xactID, Timeout: evictPrefetchTimeout}
-	if err := api.WaitForXaction(baseParams, xactArgs); err != nil {
+
+	args := api.XactReqArgs{ID: xactID, Kind: cmn.ActEvictObjects, Timeout: evictPrefetchTimeout}
+	if _, err := api.WaitForXaction(baseParams, args); err != nil {
 		t.Errorf("Wait for xaction to finish failed, err = %v", err)
 	}
 }
@@ -465,17 +469,25 @@ func WaitForRebalanceToComplete(t *testing.T, baseParams api.BaseParams, timeout
 	go func() {
 		defer wg.Done()
 		xactArgs := api.XactReqArgs{Kind: cmn.ActRebalance, Timeout: timeout}
-		err := api.WaitForXaction(baseParams, xactArgs)
-		if err != nil {
+		if _, err := api.WaitForXaction(baseParams, xactArgs); err != nil {
+			if hErr, ok := err.(*cmn.HTTPError); ok {
+				if hErr.Status == http.StatusNotFound {
+					return
+				}
+			}
 			errCh <- err
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		xactArgs := api.XactReqArgs{Kind: cmn.ActResilver, Timeout: timeout}
-		err := api.WaitForXaction(baseParams, xactArgs)
-		if err != nil {
+		xactArgs := api.XactReqArgs{Kind: cmn.ActResilver, Latest: true, Timeout: timeout}
+		if _, err := api.WaitForXaction(baseParams, xactArgs); err != nil {
+			if hErr, ok := err.(*cmn.HTTPError); ok {
+				if hErr.Status == http.StatusNotFound {
+					return
+				}
+			}
 			errCh <- err
 		}
 	}()
@@ -507,50 +519,16 @@ func GetDaemonStats(t *testing.T, u string) (stats map[string]interface{}) {
 	baseParams.Method = http.MethodGet
 	err := api.DoHTTPRequest(api.ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Daemon),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Daemon),
 		Query:      url.Values{cmn.URLParamWhat: {cmn.GetWhatStats}},
 	}, &stats)
 	tassert.CheckFatal(t, err)
 	return
 }
 
-func WaitStarted(t *testing.T, url string) {
-	var (
-		baseParams = BaseAPIParams(url)
-		err        error
-		i, max     = 0, 2
-	)
-while503:
-	err = api.Health(baseParams)
-	if err == nil {
-		return
-	}
-	if api.HTTPStatus(err) != http.StatusServiceUnavailable {
-		tassert.CheckFatal(t, err)
-	}
-	t.Logf("waiting for %q to start up...", url)
-	time.Sleep(waitClusterStartup / 2)
-	i++
-	if i > max {
-		tassert.CheckFatal(t, err)
-	}
-	goto while503
-}
-
 func GetClusterMap(t *testing.T, url string) (smap *cluster.Smap) {
-	var (
-		baseParams = BaseAPIParams(url)
-		err        error
-	)
-while503:
-	smap, err = api.GetClusterMap(baseParams)
-	if err != nil && api.HTTPStatus(err) == http.StatusServiceUnavailable {
-		t.Log("waiting for the cluster to start up...")
-		time.Sleep(waitClusterStartup)
-		goto while503
-	}
-	tassert.CheckFatal(t, err)
-	return smap
+	smap, _ = waitForStartup(BaseAPIParams(url), t)
+	return
 }
 
 func GetClusterConfig(t *testing.T) (config *cmn.Config) {
@@ -578,61 +556,79 @@ func SetClusterConfig(t *testing.T, nvs cmn.SimpleKVs) {
 	tassert.CheckFatal(t, err)
 }
 
-func GetXactionStatsByID(t *testing.T, id string) (stats api.NodesXactStat) {
-	var (
-		err        error
-		proxyURL   = GetPrimaryURL()
-		baseParams = BaseAPIParams(proxyURL)
-	)
-	stats, err = api.GetXactionStatsByID(baseParams, id)
-	tassert.CheckFatal(t, err)
-	return
-}
-
-func StartXaction(t *testing.T, xactKind string, bck cmn.Bck) (xactID string) {
-	var (
-		proxyURL   = GetPrimaryURL()
-		baseParams = BaseAPIParams(proxyURL)
-		xactArgs   = api.XactReqArgs{Kind: xactKind, Bck: bck}
-	)
-	xactID, err := api.StartXaction(baseParams, xactArgs)
-	tassert.CheckFatal(t, err)
-
-	xactStats := GetXactionStatsByID(t, xactID)
-	tassert.Fatalf(t, len(xactStats) != 0, "ID %q missing for xaction %q", xactID, xactKind)
-	for _, xact := range xactStats {
-		tassert.Fatalf(t, xact.Kind() == xactKind, "%q != %q", xact.Kind(), xactKind)
+func isErrAcceptable(err error) bool {
+	if err == nil {
+		return true
+	}
+	if hErr, ok := err.(*cmn.HTTPError); ok {
+		// TODO: http.StatusBadGateway should be handled while performing reverseProxy (if a IC node is killed)
+		return hErr.Status == http.StatusServiceUnavailable || hErr.Status == http.StatusBadGateway
 	}
 
-	return
+	// Below errors occur when the node is killed/just started while requesting
+	return strings.Contains(err.Error(), "ContentLength") ||
+		strings.Contains(err.Error(), "connection refused") ||
+		strings.Contains(err.Error(), "EOF")
 }
 
-func AbortXaction(t *testing.T, xactID, xactKind string, bck cmn.Bck) {
+func WaitForXactionByID(id string, timeouts ...time.Duration) error {
 	var (
-		proxyURL   = GetPrimaryURL()
-		baseParams = BaseAPIParams(proxyURL)
-		xactArgs   = api.XactReqArgs{ID: xactID, Kind: xactKind, Bck: bck}
+		retryInterval = time.Second
+		args          = api.XactReqArgs{ID: id}
+		ctx           = context.Background()
 	)
-	err := api.AbortXaction(baseParams, xactArgs)
-	tassert.CheckFatal(t, err)
 
-	xactStats := GetXactionStatsByID(t, xactID)
-	tassert.Fatalf(t, len(xactStats) != 0, "ID %q missing for xaction %q", xactID, xactKind)
-	for _, xact := range xactStats {
-		tassert.Fatalf(t, xact.Kind() == xactKind, "%q != %q", xact.Kind(), xactKind)
-		tassert.Fatalf(t, xact.Finished() || xact.Aborted(), "xaction(%s) ID=%q not aborted", xact.Kind(), xactID)
+	if len(timeouts) > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeouts[0])
+		defer cancel()
+	}
+
+	for {
+		baseParams := BaseAPIParams()
+		if status, err := api.GetXactionStatus(baseParams, args); !isErrAcceptable(err) || status.Finished() {
+			return err
+		}
+
+		time.Sleep(retryInterval)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			break
+		}
 	}
 }
 
 func CheckErrIsNotFound(t *testing.T, err error) {
 	if err == nil {
-		t.Errorf("expected error")
+		t.Fatalf("expected error")
 		return
 	}
 	httpErr, ok := err.(*cmn.HTTPError)
 	tassert.Fatalf(t, ok, "expected an error of type *cmn.HTTPError, but got: %T.", err)
-	tassert.Errorf(
+	tassert.Fatalf(
 		t, httpErr.Status == http.StatusNotFound,
 		"expected status: %d, got: %d.", http.StatusNotFound, httpErr.Status,
 	)
+}
+
+func waitForStartup(baseParams api.BaseParams, ts ...*testing.T) (*cluster.Smap, error) {
+	for {
+		smap, err := api.GetClusterMap(baseParams)
+		if err != nil {
+			if api.HTTPStatus(err) == http.StatusServiceUnavailable {
+				Logln("waiting for the cluster to start up...")
+				time.Sleep(waitClusterStartup)
+				continue
+			}
+
+			Logf("unable to get usable cluster map, err: %v\n", err)
+			if len(ts) > 0 {
+				tassert.CheckFatal(ts[0], err)
+			}
+			return nil, err
+		}
+		return smap, nil
+	}
 }

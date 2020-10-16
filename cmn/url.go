@@ -5,12 +5,15 @@
 package cmn
 
 import (
+	"encoding/base64"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/OneOfOne/xxhash"
 )
 
 const (
@@ -22,6 +25,9 @@ const (
 
 	azBlobURL = ".blob.core.windows.net"
 )
+
+func IsHTTPS(url string) bool { return strings.HasPrefix(url, "https://") }
+func IsHTTP(url string) bool  { return strings.HasPrefix(url, "http://") }
 
 func IsGoogleStorageURL(u *url.URL) bool {
 	return u.Host == gsStorageURL
@@ -67,10 +73,40 @@ func ReparseQuery(r *http.Request) {
 	}
 }
 
-func JoinPath(urlBase, path string) string {
-	url := strings.TrimSuffix(urlBase, "/")
-	if !strings.HasPrefix(path, "/") {
-		url += "/"
+// JoinWords uses forward slash to join any number of words into a single path.
+// The words are assumed not to be prefixed with slashes.
+// Returned path is prefixed with a slash.
+func JoinWords(words ...string) (path string) {
+	switch len(words) {
+	case 1:
+		path = "/" + words[0]
+	case 2:
+		path = "/" + words[0] + "/" + words[1]
+	default:
+		for _, s := range words {
+			path += "/" + s
+		}
+	}
+	return
+}
+
+// JoinPath joins two path elements that may (or may not) be prefixed/suffixed with a slash.
+func JoinPath(url, path string) string {
+	suffix := url[len(url)-1:] == "/"
+	prefix := path[:1] == "/"
+	if suffix && prefix {
+		return url + path[1:]
+	}
+	if !suffix && !prefix {
+		return url + "/" + path
 	}
 	return url + path
+}
+
+func OrigURLBck2Name(origURLBck string) (bckName string) {
+	_, b := ParseURLScheme(origURLBck)
+	b1 := xxhash.ChecksumString64S(b, MLCG32)
+	b2 := strconv.FormatUint(b1, 16)
+	bckName = base64.RawURLEncoding.EncodeToString([]byte(b2))
+	return
 }

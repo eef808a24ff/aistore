@@ -50,7 +50,7 @@ const (
 	SizeofI16 = int(unsafe.Sizeof(uint16(0)))
 
 	configHomeEnvVar = "XDG_CONFIG_HOME" // https://wiki.archlinux.org/index.php/XDG_Base_Directory
-	configDirMode    = 0755 | os.ModeDir
+	configDirMode    = 0o755 | os.ModeDir
 
 	assertMsg = "assertion failed"
 
@@ -67,34 +67,31 @@ const (
 	QuantityBytes   = "bytes"
 )
 
-var (
-	EnvVars = struct {
-		Endpoint string
+var EnvVars = struct {
+	Endpoint string
 
-		IsPrimary string
-		PrimaryID string
+	IsPrimary string
+	PrimaryID string
 
-		SkipVerifyCrt string
-		UseHTTPS      string
-		NumTarget     string
-		NumProxy      string
-	}{
-		Endpoint:      "AIS_ENDPOINT",
-		IsPrimary:     "AIS_IS_PRIMARY",
-		PrimaryID:     "AIS_PRIMARY_ID",
-		SkipVerifyCrt: "AIS_SKIP_VERIFY_CRT",
-		UseHTTPS:      "AIS_USE_HTTPS",
+	SkipVerifyCrt string
+	UseHTTPS      string
+	NumTarget     string
+	NumProxy      string
+}{
+	Endpoint:      "AIS_ENDPOINT",
+	IsPrimary:     "AIS_IS_PRIMARY",
+	PrimaryID:     "AIS_PRIMARY_ID",
+	SkipVerifyCrt: "AIS_SKIP_VERIFY_CRT",
+	UseHTTPS:      "AIS_USE_HTTPS",
 
-		// Env variables used for tests or CI
-		NumTarget: "NUM_TARGET",
-		NumProxy:  "NUM_PROXY",
-	}
-)
+	// Env variables used for tests or CI
+	NumTarget: "NUM_TARGET",
+	NumProxy:  "NUM_PROXY",
+}
 
 type (
 	StringSet      map[string]struct{}
 	SimpleKVs      map[string]string
-	SimpleKVsInt   map[string]int64
 	JSONRawMsgs    map[string]jsoniter.RawMessage
 	SimpleKVsEntry struct {
 		Key   string
@@ -167,6 +164,7 @@ var (
 	bucketReg *regexp.Regexp
 	nsReg     *regexp.Regexp
 )
+
 var (
 	ErrInvalidFmtFormat  = errors.New("input 'fmt' format is invalid should be 'prefix-%06d-suffix")
 	ErrInvalidBashFormat = errors.New("input 'bash' format is invalid, should be 'prefix-{0001..0010..1}-suffix'")
@@ -176,28 +174,28 @@ var (
 	ErrNegativeStart   = errors.New("'start' is negative")
 	ErrNonPositiveStep = errors.New("'step' is non positive number")
 )
+
 var (
 	ErrInvalidQuantityUsage       = errors.New("invalid quantity, format should be '81%' or '1GB'")
 	errInvalidQuantityNonNegative = errors.New("quantity should not be negative")
 	ErrInvalidQuantityPercent     = errors.New("percent must be in the range (0, 100)")
 	ErrInvalidQuantityBytes       = errors.New("value (bytes) must be non-negative")
 )
-var (
-	toBiBytes = map[string]int64{
-		"K":   KiB,
-		"KB":  KiB,
-		"KIB": KiB,
-		"M":   MiB,
-		"MB":  MiB,
-		"MIB": MiB,
-		"G":   GiB,
-		"GB":  GiB,
-		"GIB": GiB,
-		"T":   TiB,
-		"TB":  TiB,
-		"TIB": TiB,
-	}
-)
+
+var toBiBytes = map[string]int64{
+	"K":   KiB,
+	"KB":  KiB,
+	"KIB": KiB,
+	"M":   MiB,
+	"MB":  MiB,
+	"MIB": MiB,
+	"G":   GiB,
+	"GB":  GiB,
+	"GIB": GiB,
+	"T":   TiB,
+	"TB":  TiB,
+	"TIB": TiB,
+}
 
 func init() {
 	// General
@@ -287,12 +285,12 @@ func (kv SimpleKVs) Keys() []string {
 	return keys
 }
 
-func (kv SimpleKVsInt) Keys() []string {
-	keys := make([]string, 0, len(kv))
-	for k := range kv {
-		keys = append(keys, k)
+func (kv SimpleKVs) Contains(key string) (ok bool) {
+	if len(kv) == 0 {
+		return false
 	}
-	return keys
+	_, ok = kv[key]
+	return
 }
 
 // only for +ve int values
@@ -336,6 +334,9 @@ func (ss StringSet) Add(keys ...string) {
 }
 
 func (ss StringSet) Contains(key string) bool {
+	if len(ss) == 0 {
+		return false
+	}
 	_, ok := ss[key]
 	return ok
 }
@@ -350,6 +351,14 @@ func (ss StringSet) Intersection(other StringSet) StringSet {
 		if other.Contains(key) {
 			result.Add(key)
 		}
+	}
+	return result
+}
+
+func (ss StringSet) Clone() StringSet {
+	result := make(StringSet, len(ss))
+	for k, v := range ss {
+		result[k] = v
 	}
 	return result
 }
@@ -401,45 +410,6 @@ func ParseBool(s string) (value bool, err error) {
 
 func IsParseBool(s string) (yes bool) { yes, _ = ParseBool(s); return }
 
-// NOTE: not to be used in the datapath - consider instead one of the 3 flavors below
-func AssertFmt(cond bool, args ...interface{}) {
-	if cond {
-		return
-	}
-	var message = assertMsg
-	if len(args) > 0 {
-		message += ": "
-		for i := 0; i < len(args); i++ {
-			message += fmt.Sprintf("%#v ", args[i])
-		}
-	}
-	panic(message)
-}
-
-// this and the other two asserts get inlined and optimized
-func Assert(cond bool) {
-	if !cond {
-		glog.Flush()
-		panic(assertMsg)
-	}
-}
-
-// NOTE: preferable usage is to have the 'if' in the calling code:
-//       if (!cond) { AssertMsg(false, msg) }
-// - otherwise the message (e.g. Sprintf) may get evaluated every time
-func AssertMsg(cond bool, msg string) {
-	if !cond {
-		glog.Flush()
-		panic(assertMsg + ": " + msg)
-	}
-}
-func AssertNoErr(err error) {
-	if err != nil {
-		glog.Flush()
-		panic(err)
-	}
-}
-
 func CopyStruct(dst, src interface{}) {
 	x := reflect.ValueOf(src)
 	Assert(x.Kind() == reflect.Ptr)
@@ -448,10 +418,6 @@ func CopyStruct(dst, src interface{}) {
 	starY := y.Elem()
 	starY.Set(starX)
 	reflect.ValueOf(dst).Elem().Set(y.Elem())
-}
-
-func HasTarExtension(objName string) bool {
-	return strings.HasSuffix(objName, ExtTar) || strings.HasSuffix(objName, ExtTarTgz) || strings.HasSuffix(objName, ExtTgz)
 }
 
 // WaitForFunc executes a function in goroutine and waits for it to finish.

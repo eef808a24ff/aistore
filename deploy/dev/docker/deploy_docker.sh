@@ -1,15 +1,15 @@
 #!/bin/bash
 
+set -e
+
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 name=$(basename "$0")
 
 usage() {
-    echo "Usage: $name [-a=AWS_DIR] [-c=NUM] [-d=NUM] [-f=LIST] [-g] [-h] [-l] [-m] [-p=NUM] [-s] [-t=NUM] [-qs=AWS_DIR (Optional)]"
-    echo "  -a=AWS_DIR or --aws=AWS_DIR             : to use AWS, where AWS_DIR is the location of AWS configuration and credential files"
+    echo "Usage: $name [-c=NUM] [-d=NUM] [-f=LIST] [-g] [-h] [-l] [-m] [-p=NUM] [-s] [-t=NUM] [-qs=AWS_DIR (Optional)]"
     echo "  -c=NUM or --cluster=NUM                 : where NUM is the number of clusters"
     echo "  -d=NUM or --directories=NUM             : where NUM is the number of local cache directories"
     echo "  -f=LIST or --filesystems=LIST           : where LIST is a comma separated list of filesystems"
-    echo "  -g or --gcp                             : to use GCP"
     echo "  -h or --help                            : show usage"
     echo "  -l or --last                            : redeploy using the arguments from the last ais docker deployment"
     echo "  -m or --multi                           : use multiple networks"
@@ -20,7 +20,6 @@ usage() {
     echo "  -nocloud                                : to deploy AIS without any cloud provider"
     echo "  -grafana                                : starts Graphite and Grafana containers"
     echo "  -nodiskio=BOOL                          : run Dry-Run mode with disk IO is disabled (default = false)"
-    echo "  -nonetio=BOOL                           : run Dry-Run mode with network IO is disabled (default = false)"
     echo "  -dryobjsize=SIZE                        : size of an object when a source is a 'fake' one."
     echo "                                            'g' or 'G' - GiB, 'm' or 'M' - MiB, 'k' or 'K' - KiB. Default value is '8m'"
     echo "Note:"
@@ -57,7 +56,7 @@ save_env() {
     echo "" > ${TMP_ENV}
     echo "QUICK=${QUICK}" >> ${TMP_ENV}
     echo "TARGET_CNT=${TARGET_CNT:-1000}" >> ${TMP_ENV}
-    echo "AIS_CLD_PROVIDER=${AIS_CLD_PROVIDER-}" >> ${TMP_ENV}
+    echo "AIS_CLD_PROVIDERS=${AIS_CLD_PROVIDERS-}" >> ${TMP_ENV}
     echo "TEST_FSPATH_COUNT=${TEST_FSPATH_COUNT}" >> ${TMP_ENV}
     echo "AIS_FS_PATHS=${AIS_FS_PATHS}" >> ${TMP_ENV}
 
@@ -67,7 +66,6 @@ save_env() {
     echo "GRAPHITE_PORT=${GRAPHITE_PORT}" >> ${TMP_ENV}
     echo "GRAPHITE_SERVER=${GRAPHITE_SERVER}" >> ${TMP_ENV}
 
-    echo "AIS_PRIMARY_URL=http://${PUB_NET}.2:${PORT}" >> ${TMP_ENV}
     echo "PUB_SUBNET=${PUB_SUBNET}" >> ${TMP_ENV}
     echo "INT_CONTROL_SUBNET=${INT_CONTROL_SUBNET}" >> ${TMP_ENV}
     echo "INT_DATA_SUBNET=${INT_DATA_SUBNET}" >> ${TMP_ENV}
@@ -84,7 +82,7 @@ save_setup() {
     echo "TARGET_CNT=$TARGET_CNT" >> ${SETUP_FILE}
     echo "NETWORK=${NETWORK}" >> ${SETUP_FILE}
 
-    echo "CLOUD=$CLOUD" >> ${SETUP_FILE}
+    echo "AIS_CLD_PROVIDERS=$AIS_CLD_PROVIDERS" >> ${SETUP_FILE}
 
     echo "DRYRUN"=$DRYRUN >> ${SETUP_FILE}
     echo "NODISKIO"=$NODISKIO >> ${SETUP_FILE}
@@ -151,7 +149,7 @@ if ! [ -x "$(command -v docker-compose)" ]; then
   exit 1
 fi
 
-CLOUD=""
+AIS_CLD_PROVIDERS=""
 CLUSTER_CNT=0
 PROXY_CNT=0
 TARGET_CNT=0
@@ -173,25 +171,11 @@ DRYRUN=0
 NODISKIO=false
 DRYOBJSIZE="8m"
 
+source ../utils.sh
+
 for i in "$@"
 do
 case $i in
-    -a=*|--aws=*)
-        AWS_ENV="${i#*=}"
-        shift # past argument=value
-        CLOUD=1
-        ;;
-
-    -g|--gcp)
-        CLOUD=2
-        shift # past argument
-        ;;
-
-    -nocloud)
-        CLOUD=0
-        shift # past argument
-        ;;
-
     -c=*|--cluster=*)
         CLUSTER_CNT="${i#*=}"
         is_number $CLUSTER_CNT
@@ -258,7 +242,7 @@ case $i in
         ;;
 
     -nodiskio=*|--nodiskio=*)
-        NODISKIO="${i#*=}"
+        export NODISKIO="${i#*=}"
         if $NODISKIO; then
             DRYRUN=1
         fi
@@ -286,56 +270,34 @@ if [ $DRYRUN -ne 0 ]; then
     is_size $DRYOBJSIZE
 fi
 
-if [[ -z $CLOUD ]]; then
-    echo "Select:"
-    echo " 0: No 3rd party Cloud"
-    echo " 1: Amazon S3"
-    echo " 2: Google Cloud Storage"
-    echo " 3: Azure Cloud"
-    read -r CLOUD
-    is_number $CLOUD
-    if [ $CLOUD -ne 0 ] && [ $CLOUD -ne 1 ] && [ $CLOUD -ne 2 ] && [ $CLOUD -ne 3 ]; then
-        echo "Not a valid entry. Exiting..."
-        exit 1
+parse_cld_providers
+
+touch $LOCAL_AWS
+echo "Configured cloud providers: '${AIS_CLD_PROVIDERS}'"
+if [[ "${AIS_CLD_PROVIDERS}" == *aws* ]]; then
+    echo "Enter the location of your AWS configuration and credentials files:"
+    echo "Note: No input will result in using the default aws dir (~/.aws/)"
+    read aws_env
+
+    if [[ -z ${aws_env} ]]; then
+        AWS_ENV="${HOME}/.aws/"
     fi
 
-    if [ $CLOUD -eq 1 ]; then
-        echo "Enter the location of your AWS configuration and credentials files:"
-        echo "Note: No input will result in using the default aws dir (~/.aws/)"
-        read aws_env
-
-        if [ -z "$aws_env" ]; then
-            AWS_ENV="~/.aws/"
-        fi
-    fi
-fi
-
-if [ $CLOUD -eq 1 ]; then
-    if [ -z "$AWS_ENV" ]; then
-        echo -a is a required parameter. Provide the path for aws.env file
-        usage
-    fi
-    AIS_CLD_PROVIDER="aws"
-    # to get proper tilde expansion
     AWS_ENV="${AWS_ENV/#\~/$HOME}"
     temp_file="${AWS_ENV}/credentials"
-    if [ -f $"$temp_file" ]; then
-        cp $"$temp_file"  ${LOCAL_AWS}
+    if [[ -f ${temp_file} ]]; then
+        cp ${temp_file} ${LOCAL_AWS}
     else
         echo "No AWS credentials file found in specified directory. Exiting..."
         exit 1
     fi
 
-    # By default, the region field is found in the aws config file.
-    # Sometimes it is found in the credentials file.
-    if [ $(cat "$temp_file" | grep -c "region") -eq 0 ]; then
-        temp_file="${AWS_ENV}/config"
-        if [ -f $"$temp_file" ] && [ $(cat $"$temp_file" | grep -c "region") -gt 0 ]; then
-            grep region "$temp_file" >> ${LOCAL_AWS}
-        else
-            echo "No region config field found in aws directory. Exiting..."
-            exit 1
-        fi
+    temp_file="${AWS_ENV}/config"
+    if [[ -f ${temp_file} ]] && [[ $(cat ${temp_file} | grep -c "region") -gt 0 ]]; then
+        grep region ${temp_file} >> ${LOCAL_AWS}
+    else
+        echo "No region config field found in aws directory. Exiting..."
+        exit 1
     fi
 
     sed -i 's/\[default\]//g' ${LOCAL_AWS}
@@ -343,15 +305,6 @@ if [ $CLOUD -eq 1 ]; then
     sed -i 's/aws_access_key_id/AWS_ACCESS_KEY_ID/g' ${LOCAL_AWS}
     sed -i 's/aws_secret_access_key/AWS_SECRET_ACCESS_KEY/g' ${LOCAL_AWS}
     sed -i 's/region/AWS_DEFAULT_REGION/g' ${LOCAL_AWS}
-elif [ $CLOUD -eq 2 ]; then
-    AIS_CLD_PROVIDER="gcp"
-    touch $LOCAL_AWS
-elif [ $CLOUD -eq 3 ]; then
-    AIS_CLD_PROVIDER="azure"
-    touch $LOCAL_AWS
-else
-    AIS_CLD_PROVIDER=""
-    touch $LOCAL_AWS
 fi
 
 if [ "$CLUSTER_CNT" -eq 0 ]; then
@@ -364,9 +317,9 @@ if [ "$CLUSTER_CNT" -eq 0 ]; then
 fi
 
 if [[ -z "${NETWORK// }" ]]; then
-	echo Enter s for single network configuration or m for multi-network configuration..
+    echo "Enter 's' for single network configuration or 'm' for multi-network configuration:"
     read network_config
-	if [ "$network_config" = "s" ]; then
+    if [ "$network_config" = "s" ]; then
         NETWORK="single"
     elif [ $network_config = 'm' ] ; then
         NETWORK="multi"
@@ -440,18 +393,19 @@ else
     GRAPHITE_SERVER="localhost"
 fi
 
-PORT=8080
 PORT_INTRA_CONTROL=9080
 PORT_INTRA_DATA=10080
-
+export PORT=51080
+export AIS_NO_DISK_IO=${NODISKIO}
+export AIS_CLD_PROVIDERS=${AIS_CLD_PROVIDERS}
 # Setting the IP addresses for the containers
 echo "Network type: ${NETWORK}"
 for ((i=0; i<${CLUSTER_CNT}; i++)); do
-    PUB_NET="172.5$((0 + ($i * 3))).0"
+    PUB_NET="172.5$((0 + (i * 3))).0"
     PUB_SUBNET="${PUB_NET}.0/24"
-    INT_CONTROL_NET="172.5$((1 + ($i * 3))).0"
+    INT_CONTROL_NET="172.5$((1 + (i * 3))).0"
     INT_CONTROL_SUBNET="${INT_CONTROL_NET}.0/24"
-    INT_DATA_NET="172.5$((2 + ($i * 3))).0"
+    INT_DATA_NET="172.5$((2 + (i * 3))).0"
     INT_DATA_SUBNET="${INT_DATA_NET}.0/24"
 
     if [ $i -eq 0 ]; then
@@ -471,25 +425,25 @@ for ((i=0; i<${CLUSTER_CNT}; i++)); do
     export UID # (see docker compose files)
     export CLUSTER=${i}
 
-    for j in `seq 2 $((($TARGET_CNT + $PROXY_CNT + 1) * $CLUSTER_CNT))`; do
+    for j in $(seq 2 $(((TARGET_CNT + PROXY_CNT + 1) * CLUSTER_CNT))); do
         IPV4LIST="${IPV4LIST}${PUB_NET}.$j,"
     done
     if [ "$IPV4LIST" != "" ]; then
-        IPV4LIST=${IPV4LIST::-1} # remove last ","
+        IPV4LIST=${IPV4LIST/%?/} # remove last ","
     fi
 
     if [ "${NETWORK}" = "multi" ]; then
         # IPV4LIST_INTRA
-        for j in `seq 2 $((($TARGET_CNT + $PROXY_CNT + 1) * $CLUSTER_CNT))`; do
+        for j in $(seq 2 $(((TARGET_CNT + PROXY_CNT + 1) * CLUSTER_CNT))); do
             IPV4LIST_INTRA_CONTROL="${IPV4LIST_INTRA_CONTROL}${INT_CONTROL_NET}.$j,"
         done
-        IPV4LIST_INTRA_CONTROL=${IPV4LIST_INTRA_CONTROL::-1} # remove last ","
+        IPV4LIST_INTRA_CONTROL=${IPV4LIST_INTRA_CONTROL/%?/} # remove last ","
 
-        #IPV4LIST_INTRA_DATA
-        for j in `seq 2 $((($TARGET_CNT + $PROXY_CNT + 1) * $CLUSTER_CNT))`; do
+        # IPV4LIST_INTRA_DATA
+        for j in $(seq 2 $(((TARGET_CNT + PROXY_CNT + 1) * CLUSTER_CNT))); do
             IPV4LIST_INTRA_DATA="${IPV4LIST_INTRA_DATA}${INT_DATA_NET}.$j,"
         done
-        IPV4LIST_INTRA_DATA=${IPV4LIST_INTRA_DATA::-1} # remove last ","
+        IPV4LIST_INTRA_DATA=${IPV4LIST_INTRA_DATA/%?/} # remove last ","
     fi
 
     save_env
@@ -503,9 +457,9 @@ for ((i=0; i<${CLUSTER_CNT}; i++)); do
     echo Starting Primary Proxy
     AIS_IS_PRIMARY=true docker-compose -p ais${i} -f ${composer_file} up -d proxy
     sleep 2 # give primary proxy some room to breathe
-
     echo Starting cluster ..
-    docker-compose -p ais${i} -f ${composer_file} up -d --scale proxy=${PROXY_CNT} --scale target=$TARGET_CNT --scale grafana=0 --scale graphite=0 --no-recreate
+    PRIMARY_IP=$(docker inspect -f "{{ .NetworkSettings.Networks.ais${i}_public.IPAddress }}" ais${i}_proxy_1)
+    PRIMARY_IP=${PRIMARY_IP} docker-compose -p ais${i} -f ${composer_file} up -d --scale proxy=${PROXY_CNT} --scale target=$TARGET_CNT --scale grafana=0 --scale graphite=0 --no-recreate
 done
 
 sleep 5

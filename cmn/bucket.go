@@ -7,23 +7,33 @@ package cmn
 import (
 	"errors"
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"strings"
+
+	"github.com/NVIDIA/aistore/cmn/debug"
 )
 
 // Cloud Provider enum
 const (
-	AnyCloud = "cloud" // refers to any 3rd party Cloud
-
 	ProviderAmazon = "aws"
 	ProviderGoogle = "gcp"
 	ProviderAIS    = "ais"
 	ProviderAzure  = "azure"
-	allProviders   = "aws, gcp, ais, azure"
+	ProviderHTTP   = "ht"
+	allProviders   = "aws, gcp, ais, azure, ht"
 
 	NsUUIDPrefix = '@' // BEWARE: used by on-disk layout
 	NsNamePrefix = '#' // BEWARE: used by on-disk layout
 
 	BckProviderSeparator = "://"
+
+	// Scheme parsing
+	DefaultScheme = "https"
+	GSScheme      = "gs"
+	S3Scheme      = "s3"
+	AZScheme      = "az"
+	AISScheme     = "ais"
 )
 
 type (
@@ -42,10 +52,19 @@ type (
 	}
 
 	Bck struct {
-		Name     string `json:"name"`
-		Provider string `json:"provider"`
-		Ns       Ns     `json:"namespace" list:"omitempty"`
+		Name     string       `json:"name"`
+		Provider string       `json:"provider"`
+		Ns       Ns           `json:"namespace" list:"omitempty"`
+		Props    *BucketProps `json:"-"`
 	}
+
+	// Represents the AIS bucket, object and URL associated with a HTTP resource
+	HTTPBckObj struct {
+		Bck        Bck
+		ObjName    string
+		OrigURLBck string // HTTP URL of the bucket (object name excluded)
+	}
+
 	QueryBcks Bck
 
 	BucketNames []Bck
@@ -67,12 +86,13 @@ var (
 	// exclusively to AIS (provider) given that other Cloud providers are remote by definition.
 	NsAnyRemote = Ns{UUID: string(NsUUIDPrefix)}
 
-	Providers = map[string]struct{}{
-		ProviderAIS:    {},
-		ProviderGoogle: {},
-		ProviderAmazon: {},
-		ProviderAzure:  {},
-	}
+	Providers = NewStringSet(
+		ProviderAIS,
+		ProviderGoogle,
+		ProviderAmazon,
+		ProviderAzure,
+		ProviderHTTP,
+	)
 )
 
 // Parses [@uuid][#namespace]. It does a little bit more than just parsing
@@ -88,6 +108,76 @@ func ParseNsUname(s string) (n Ns) {
 		n.UUID = s[:idx]
 		n.Name = s[idx+1:]
 	}
+	return
+}
+
+// Replace provider aliases with real provider names
+func NormalizeProvider(provider string) (string, error) {
+	switch provider {
+	case GSScheme:
+		return ProviderGoogle, nil
+	case S3Scheme:
+		return ProviderAmazon, nil
+	case AZScheme:
+		return ProviderAzure, nil
+	}
+
+	if provider != "" && !IsValidProvider(provider) {
+		return "", fmt.Errorf("invalid bucket provider %q", provider)
+	}
+	return provider, nil
+}
+
+// Parses "provider://@uuid#namespace/bucketName/objectName"
+func ParseBckObjectURI(objName string, query ...bool) (bck Bck, object string, err error) {
+	const (
+		bucketSepa = "/"
+	)
+
+	parts := strings.SplitN(objName, BckProviderSeparator, 2)
+
+	if len(parts) > 1 {
+		bck.Provider, err = NormalizeProvider(parts[0])
+		objName = parts[1]
+	}
+
+	if err != nil {
+		return
+	}
+
+	parts = strings.SplitN(objName, bucketSepa, 2)
+	if len(parts[0]) > 0 && (parts[0][0] == NsUUIDPrefix || parts[0][0] == NsNamePrefix) {
+		bck.Ns = ParseNsUname(parts[0])
+		if err := bck.Ns.Validate(); err != nil {
+			return bck, "", err
+		}
+		if len(parts) == 1 {
+			isQuery := len(query) > 0 && query[0]
+			if parts[0] == string(NsUUIDPrefix) && isQuery {
+				// Case: "[provider://]@" (only valid if uri is query)
+				// We need to list buckets from all possible remote clusters
+				bck.Ns = NsAnyRemote
+				return bck, "", nil
+			}
+
+			// Case: "[provider://]@uuid#ns"
+			return bck, "", nil
+		}
+
+		// Case: "[provider://]@uuid#ns/bucket"
+		parts = strings.SplitN(parts[1], bucketSepa, 2)
+	}
+
+	bck.Name = parts[0]
+	if bck.Name != "" {
+		if err := ValidateBckName(bck.Name); err != nil {
+			return bck, "", err
+		}
+	}
+	if len(parts) > 1 {
+		object = parts[1]
+	}
+
 	return
 }
 
@@ -201,18 +291,46 @@ func (n Ns) IsGlobal() bool    { return n == NsGlobal }
 func (n Ns) IsAnyRemote() bool { return n == NsAnyRemote }
 func (n Ns) IsRemote() bool    { return n.UUID != "" }
 
-func (b Bck) IsAIS() bool       { return b.Provider == ProviderAIS && !b.Ns.IsRemote() } // is local AIS cluster
-func (b Bck) IsRemoteAIS() bool { return b.Provider == ProviderAIS && b.Ns.IsRemote() }  // is remote AIS cluster
-func (b Bck) IsRemote() bool    { return b.IsCloud() || b.IsRemoteAIS() }                // is remote
-func (b Bck) IsCloud(anyCloud ...string) bool { // is 3rd party Cloud
-	if b.Provider == ProviderAIS {
+func (b *Bck) HasBackendBck() bool {
+	return b.Provider == ProviderAIS && b.Props != nil && !b.Props.BackendBck.IsEmpty()
+}
+
+func (b *Bck) BackendBck() *Bck {
+	if b.HasBackendBck() {
+		return &b.Props.BackendBck
+	}
+	return nil
+}
+
+func (b *Bck) RemoteBck() *Bck {
+	if !b.IsRemote() {
+		return nil
+	}
+	if b.HasBackendBck() {
+		return &b.Props.BackendBck
+	}
+	return b
+}
+
+func (b Bck) IsAIS() bool       { return b.Provider == ProviderAIS && !b.Ns.IsRemote() && !b.HasBackendBck() } // is local AIS cluster
+func (b Bck) IsRemoteAIS() bool { return b.Provider == ProviderAIS && b.Ns.IsRemote() }                        // is remote AIS cluster
+func (b Bck) IsHTTP() bool      { return b.Provider == ProviderHTTP }                                          // is HTTP
+
+func (b Bck) IsRemote() bool {
+	return b.IsCloud() || b.IsRemoteAIS() || b.IsHTTP() || b.HasBackendBck()
+}
+
+func (b Bck) IsCloud() bool { // is 3rd party Cloud
+	if b.Provider == ProviderHTTP {
 		return false
 	}
-	if IsValidProvider(b.Provider) {
-		return true
+	if bck := b.BackendBck(); bck != nil {
+		debug.Assert(bck.IsCloud()) // currently, backend is always Cloud
+		return bck.IsCloud()
 	}
-	return len(anyCloud) > 0 && b.Provider == AnyCloud && b.Provider == anyCloud[0]
+	return b.Provider != ProviderAIS && IsValidProvider(b.Provider)
 }
+
 func (b Bck) HasProvider() bool { return IsValidProvider(b.Provider) }
 
 func IsValidProvider(provider string) bool {
@@ -233,16 +351,33 @@ func (query QueryBcks) Contains(other Bck) bool {
 		if query.Provider == "" {
 			// If query's provider not set, we should match the expected bucket
 			query.Provider = other.Provider
-		} else if query.Provider == AnyCloud && other.IsCloud() {
-			// If provider is any cloud then we can just match the expected cloud bucket
-			query.Provider = other.Provider
 		}
 		return query.Equal(other)
 	}
-	ok := query.Provider == other.Provider ||
-		query.Provider == "" ||
-		(query.Provider == AnyCloud && other.IsCloud())
+	ok := query.Provider == other.Provider || query.Provider == ""
 	return ok && query.Ns.Contains(other.Ns)
+}
+
+func AddBckToQuery(query url.Values, bck Bck) url.Values {
+	if bck.Provider != "" {
+		if query == nil {
+			query = make(url.Values)
+		}
+		query.Set(URLParamProvider, bck.Provider)
+	}
+	if !bck.Ns.IsGlobal() {
+		if query == nil {
+			query = make(url.Values)
+		}
+		query.Set(URLParamNamespace, bck.Ns.Uname())
+	}
+	return query
+}
+
+func DelBckFromQuery(query url.Values) url.Values {
+	query.Del(URLParamProvider)
+	query.Del(URLParamNamespace)
+	return query
 }
 
 /////////////////
@@ -296,4 +431,29 @@ func (names BucketNames) Equal(other BucketNames) bool {
 		}
 	}
 	return true
+}
+
+////////////////
+// HTTPBckObj //
+////////////////
+
+func NewHTTPObj(u *url.URL) *HTTPBckObj {
+	hbo := &HTTPBckObj{
+		Bck: Bck{
+			Provider: ProviderHTTP,
+			Ns:       NsGlobal,
+		},
+	}
+	hbo.OrigURLBck, hbo.ObjName = filepath.Split(u.Path)
+	hbo.OrigURLBck = u.Scheme + "://" + u.Host + hbo.OrigURLBck
+	hbo.Bck.Name = OrigURLBck2Name(hbo.OrigURLBck)
+	return hbo
+}
+
+func NewHTTPObjPath(rawURL string) (*HTTPBckObj, error) {
+	urlObj, err := url.ParseRequestURI(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return NewHTTPObj(urlObj), nil
 }

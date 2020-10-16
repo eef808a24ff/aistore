@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -42,16 +43,44 @@ const (
 	dryRunExplanation = "No modifications on the cluster"
 )
 
-func getObject(c *cli.Context, bck cmn.Bck, object, outFile string, silent bool) (err error) {
+func getObject(c *cli.Context, outFile string, silent bool) (err error) {
+	var (
+		objArgs                api.GetObjectInput
+		bck                    cmn.Bck
+		object, origURL        string
+		fullObjName            = c.Args().Get(0)
+		objLen, offset, length int64
+	)
+
+	if c.NArg() < 1 {
+		return missingArgumentsError(c, "object name in the form bucket/object", "output file")
+	}
+
+	if isWebURL(fullObjName) {
+		hbo, err := cmn.NewHTTPObjPath(fullObjName)
+		if err != nil {
+			return err
+		}
+		bck, object = hbo.Bck, hbo.ObjName
+		origURL = fullObjName
+	} else if bck, object, err = parseBckObjectURI(c, fullObjName); err != nil {
+		return
+	}
+
+	if origURL == "" || !flagIsSet(c, forceFlag) {
+		if bck, _, err = validateBucket(c, bck, fullObjName, false /* optional */); err != nil {
+			return
+		}
+	}
+
+	if object == "" {
+		return incorrectUsageMsg(c, "%q: missing object name", fullObjName)
+	}
+
 	// just check if object is cached, don't get object
 	if flagIsSet(c, isCachedFlag) {
 		return objectCheckExists(c, bck, object)
 	}
-
-	var (
-		objArgs                api.GetObjectInput
-		objLen, offset, length int64
-	)
 
 	if flagIsSet(c, lengthFlag) != flagIsSet(c, offsetFlag) {
 		return incorrectUsageMsg(c, "%q and %q flags both need to be set", lengthFlag.Name, offsetFlag.Name)
@@ -73,6 +102,11 @@ func getObject(c *cli.Context, bck cmn.Bck, object, outFile string, silent bool)
 		}
 		defer file.Close()
 		objArgs = api.GetObjectInput{Writer: file, Header: hdr}
+	}
+
+	if origURL != "" {
+		objArgs.Query = make(url.Values, 1)
+		objArgs.Query.Set(cmn.URLParamOrigURL, origURL)
 	}
 
 	if flagIsSet(c, checksumFlag) {
@@ -113,6 +147,7 @@ func promoteFileOrDir(c *cli.Context, bck cmn.Bck, objName, fqn string) (err err
 		FQN:        fqn,
 		Recurs:     flagIsSet(c, recursiveFlag),
 		Overwrite:  flagIsSet(c, overwriteFlag),
+		KeepOrig:   c.Bool(keepOrigFlag.GetName()),
 		Verbose:    flagIsSet(c, verboseFlag),
 	}
 	if err = api.PromoteFileOrDir(promoteArgs); err != nil {
@@ -649,7 +684,7 @@ func objectStats(c *cli.Context, bck cmn.Bck, object string) error {
 		propsFlag []string
 	)
 	if flagIsSet(c, objPropsFlag) {
-		propsFlag = parseStrSliceFlag(c, objPropsFlag)
+		propsFlag = strings.Split(parseStrFlag(c, objPropsFlag), ",")
 	}
 	// TODO: we should reuse `SelectMsg.AddProps` code.
 	if len(propsFlag) == 0 {
@@ -712,11 +747,15 @@ func listOp(c *cli.Context, command string, bck cmn.Bck) (err error) {
 		xactID, err = api.DeleteList(defaultAPIParams, bck, fileList)
 		command = "removed"
 	case commandPrefetch:
-		bck.Provider = cmn.AnyCloud
+		if err = ensureHasProvider(bck, command); err != nil {
+			return
+		}
 		xactID, err = api.PrefetchList(defaultAPIParams, bck, fileList)
 		command += "ed"
 	case commandEvict:
-		bck.Provider = cmn.AnyCloud
+		if err = ensureHasProvider(bck, command); err != nil {
+			return
+		}
 		xactID, err = api.EvictList(defaultAPIParams, bck, fileList)
 		command += "ed"
 	default:
@@ -761,11 +800,15 @@ func rangeOp(c *cli.Context, command string, bck cmn.Bck) (err error) {
 		xactID, err = api.DeleteRange(defaultAPIParams, bck, rangeStr)
 		command = "removed"
 	case commandPrefetch:
-		bck.Provider = cmn.AnyCloud
+		if err = ensureHasProvider(bck, command); err != nil {
+			return
+		}
 		xactID, err = api.PrefetchRange(defaultAPIParams, bck, rangeStr)
 		command += "ed"
 	case commandEvict:
-		bck.Provider = cmn.AnyCloud
+		if err = ensureHasProvider(bck, command); err != nil {
+			return
+		}
 		xactID, err = api.EvictRange(defaultAPIParams, bck, rangeStr)
 		command += "ed"
 	default:
@@ -789,9 +832,7 @@ func rangeOp(c *cli.Context, command string, bck cmn.Bck) (err error) {
 func multiObjOp(c *cli.Context, command string) error {
 	// stops iterating if it encounters an error
 	for _, fullObjName := range c.Args() {
-		var (
-			bck, objectName, err = parseBckObjectURI(fullObjName)
-		)
+		bck, objectName, err := parseBckObjectURI(c, fullObjName)
 		if err != nil {
 			return err
 		}

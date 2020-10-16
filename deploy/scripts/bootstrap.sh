@@ -1,4 +1,35 @@
 #!/bin/bash
+
+run_tests() {
+  SECONDS=0
+
+  if [[ -n "$RE" ]]; then
+    re_val="-run=${RE}"
+  fi
+
+  timeout_val="2h"
+  if [[ -n "$SHORT" ]]; then
+    short_val="-short"
+    timeout_val="30m"
+  fi
+
+  failed_tests=$(
+    BUCKET=${BUCKET} AIS_ENDPOINT=${AIS_ENDPOINT} \
+      go test -v -p 1 -parallel 4 -count 1 -timeout "${timeout_val}" ${short_val} ${re_val} "${AISTORE_DIR}/..." 2>&1 \
+    | tee -a /dev/stderr \
+    | grep -ae "^---FAIL: Bench\|^--- FAIL: Test\|^FAIL[[:space:]]github.com/NVIDIA/.*$"; \
+    exit ${PIPESTATUS[0]} # Exit with the status of the first command in the pipe(line).
+  )
+  exit_code=$?
+
+  echo "Tests took: $((SECONDS/3600))h$(((SECONDS%3600)/60))m$((SECONDS%60))s"
+
+  if [[ $exit_code -ne 0 ]]; then
+    echo "${failed_tests}"
+    exit $exit_code
+  fi
+}
+
 AISTORE_DIR="$(cd "$(dirname "$0")/../../"; pwd -P)"
 YAPF_STYLE="$(dirname ${0})/config/.style.yapf"
 PYLINT_STYLE="$(dirname ${0})/config/.pylintrc"
@@ -15,13 +46,16 @@ lint)
 
 fmt)
   err_count=0
-  echo "Running style check..." >&2
   case $2 in
   --fix)
-    gofmt -w ${AISTORE_DIR}
+    echo "Running style fixing..." >&2
+
+    gofumpt -s -w ${AISTORE_DIR}
     python_yapf_fix
     ;;
   *)
+    echo "Running style check..." >&2
+
     out=$(gofmt -l -e ${AISTORE_DIR})
 
     if [[ -n ${out} ]]; then
@@ -29,10 +63,11 @@ fmt)
       exit 1
     fi
 
+    check_gomod
     check_imports
+    check_deps
     check_files_headers
     check_python_formatting
-
     ;;
   esac
   ;;
@@ -93,25 +128,17 @@ test-env)
 
 test-short)
   echo "Running short tests..." >&2
-  SECONDS=0
-  errs=$(BUCKET=${BUCKET} AIS_ENDPOINT=${AIS_ENDPOINT} go test -v -p 1 -parallel 4 -count 1 -timeout 30m -short "${AISTORE_DIR}/..." 2>&1 | tee -a /dev/stderr | grep -ae "^--- FAIL: Bench\|^--- FAIL: Test" )
-  echo "Tests took: $((SECONDS/3600))h$(((SECONDS%3600)/60))m$((SECONDS%60))s"
-  perror $1 "${errs}"
+  SHORT="true" run_tests
   ;;
 
 test-long)
   echo "Running long tests..." >&2
-  SECONDS=0
-  errs=$(BUCKET=${BUCKET} AIS_ENDPOINT=${AIS_ENDPOINT} go test -v -p 1 -parallel 4 -count 1 -timeout 2h "${AISTORE_DIR}/..." 2>&1 | tee -a /dev/stderr | grep -ae "^--- FAIL: Bench\|^--- FAIL: Test" )
-  echo "Tests took: $((SECONDS/3600))h$(((SECONDS%3600)/60))m$((SECONDS%60))s"
-  perror $1 "${errs}"
+  run_tests
   ;;
 
 test-run)
   echo "Running test with regex..." >&2
-  errs=$(BUCKET=${BUCKET} AIS_ENDPOINT=${AIS_ENDPOINT} go test -v -p 1 -parallel 4 -count 1 -timeout 2h  -run="${RE}" "${AISTORE_DIR}/..." 2>&1 | tee -a /dev/stderr | grep -e "^--- FAIL: Bench\|^--- FAIL: Test" )
-  echo "Tests took: $((SECONDS/3600))h$(((SECONDS%3600)/60))m$((SECONDS%60))s"
-  perror $1 "${errs}"
+  run_tests
   ;;
 
 test-docker)

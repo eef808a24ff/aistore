@@ -12,16 +12,16 @@ import (
 )
 
 const (
-	// The ETL container receives POST request from target with the data. It must read
-	// the data and return response to the target which then will be transferred
-	// to the client.
+	// The ETL container receives POST request from target with the data. It
+	// must read the data and return response to the target which then will be
+	// transferred to the client.
 	PushCommType = "hpush://"
 	// Target redirects the GET request to the ETL container. Then ETL container
 	// contacts the target via `AIS_TARGET_URL` env variable to get the data.
 	// The data is then transformed and returned to the client.
 	RedirectCommType = "hpull://"
 	// Similar to redirection strategy but with usage of reverse proxy.
-	RevProxyCommType = "hrev://" // TODO: try to think on different naming, it is not much different than redirect
+	RevProxyCommType = "hrev://"
 )
 
 type (
@@ -31,12 +31,14 @@ type (
 	}
 )
 
-var reg = newRegistry()
+var (
+	reg       *registry
+	reqSecret string
+)
 
-func newRegistry() *registry {
-	return &registry{
-		byUUID: make(map[string]Communicator),
-	}
+func init() {
+	reg = &registry{byUUID: make(map[string]Communicator)}
+	reqSecret = cmn.RandString(10)
 }
 
 func (r *registry) put(uuid string, c Communicator) error {
@@ -44,7 +46,7 @@ func (r *registry) put(uuid string, c Communicator) error {
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
 	if _, ok := r.byUUID[uuid]; ok {
-		return fmt.Errorf("ETL with uuid %q already exists", uuid)
+		return fmt.Errorf("ETL %q already exists", uuid)
 	}
 	r.byUUID[uuid] = c
 	return nil
@@ -58,9 +60,7 @@ func (r *registry) getByUUID(uuid string) (c Communicator, exists bool) {
 }
 
 func (r *registry) removeByUUID(uuid string) (c Communicator) {
-	var (
-		ok bool
-	)
+	var ok bool
 	cmn.Assert(uuid != "")
 	r.mtx.Lock()
 	if c, ok = r.byUUID[uuid]; ok {
@@ -81,4 +81,11 @@ func (r *registry) list() []Info {
 	}
 	r.mtx.RUnlock()
 	return etls
+}
+
+func CheckSecret(secret string) error {
+	if secret != reqSecret {
+		return fmt.Errorf("unrecognized request source")
+	}
+	return nil
 }

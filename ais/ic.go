@@ -9,10 +9,14 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/nl"
+	"github.com/NVIDIA/aistore/xaction"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -32,10 +36,16 @@ const (
 
 type (
 	regIC struct {
-		nl    notifListener
+		nl    nl.NotifListener
 		smap  *smapX
 		query url.Values
 		msg   interface{}
+	}
+
+	xactRegMsg struct {
+		UUID string   `json:"uuid"`
+		Kind string   `json:"kind"`
+		Srcs []string `json:"srcs"` // list of daemonIDs
 	}
 
 	icBundle struct {
@@ -53,8 +63,7 @@ func (ic *ic) init(p *proxyrunner) {
 }
 
 // TODO -- FIXME: add redirect-to-owner capability to support list/query caching
-func (ic *ic) reverseToOwner(w http.ResponseWriter, r *http.Request, uuid string,
-	msg interface{}) (reversedOrFailed bool) {
+func (ic *ic) reverseToOwner(w http.ResponseWriter, r *http.Request, uuid string, msg interface{}) (reversedOrFailed bool) {
 	retry := true
 begin:
 	var (
@@ -68,14 +77,13 @@ begin:
 	}
 	if selfIC {
 		if !exists && !retry {
-			ic.p.invalmsghdlrf(w, r, "%q not found (%s)", uuid, smap.StrIC(ic.p.si))
+			ic.p.invalmsghdlrstatusf(w, r, http.StatusNotFound, "%q not found (%s)", uuid, smap.StrIC(ic.p.si))
 			return true
 		} else if retry {
-			withLocalRetry(func() bool {
+			withRetry(func() bool {
 				owner, exists = ic.p.notifs.getOwner(uuid)
 				return exists
 			})
-
 			if !exists {
 				retry = false
 				_ = ic.syncICBundle() // TODO -- handle error
@@ -98,16 +106,25 @@ outer:
 		if selfIC {
 			owner = ic.p.si.ID()
 		} else {
-			for pid := range smap.IC {
+			for pid, si := range smap.Pmap {
+				if !psi.IsIC() {
+					continue
+				}
 				owner = pid
-				psi = smap.GetProxy(owner)
-				cmn.Assert(smap.IsIC(psi))
+				psi = si
 				break outer
 			}
 		}
 	default: // cached + owned
 		psi = smap.GetProxy(owner)
-		cmn.AssertMsg(smap.IsIC(psi), owner+", "+smap.StrIC(ic.p.si)) // TODO -- FIXME: handle
+		if psi == nil || !smap.IsIC(psi) {
+			var err error
+			if psi, err = cluster.HrwIC(&smap.Smap, uuid); err != nil {
+				ic.p.invalmsghdlr(w, r, err.Error(), http.StatusInternalServerError)
+				return true
+			}
+		}
+		cmn.Assertf(smap.IsIC(psi), "%s, %s", psi, smap.StrIC(ic.p.si))
 	}
 	if owner == ic.p.si.ID() {
 		return
@@ -121,14 +138,32 @@ outer:
 	return true
 }
 
-func (ic *ic) checkEntry(w http.ResponseWriter, r *http.Request, uuid string) (nl notifListener, ok bool) {
+// TODO: add more functionality similar to reverseToOwner
+func (ic *ic) redirectToIC(w http.ResponseWriter, r *http.Request) bool {
+	smap := ic.p.owner.smap.get()
+	if !smap.IsIC(ic.p.si) {
+		var node *cluster.Snode
+		for _, psi := range smap.Pmap {
+			if psi.IsIC() {
+				node = psi
+				break
+			}
+		}
+		redirectURL := ic.p.redirectURL(r, node, time.Now(), cmn.NetworkIntraControl)
+		http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+		return true
+	}
+	return false
+}
+
+func (ic *ic) checkEntry(w http.ResponseWriter, r *http.Request, uuid string) (nl nl.NotifListener, ok bool) {
 	nl, exists := ic.p.notifs.entry(uuid)
 	if !exists {
 		smap := ic.p.owner.smap.get()
 		ic.p.invalmsghdlrstatusf(w, r, http.StatusNotFound, "%q not found (%s)", uuid, smap.StrIC(ic.p.si))
 		return
 	}
-	if nl.finished() {
+	if nl.Finished() {
 		// TODO: Maybe we should just return empty response and `http.StatusNoContent`?
 		smap := ic.p.owner.smap.get()
 		ic.p.invalmsghdlrstatusf(w, r, http.StatusGone, "%q finished (%s)", uuid, smap.StrIC(ic.p.si))
@@ -137,21 +172,64 @@ func (ic *ic) checkEntry(w http.ResponseWriter, r *http.Request, uuid string) (n
 	return nl, true
 }
 
-func (ic *ic) writeStatus(w http.ResponseWriter, r *http.Request, uuid string) {
-	nl, exists := ic.p.notifs.entry(uuid)
-	if !exists {
-		smap := ic.p.owner.smap.get()
-		ic.p.invalmsghdlrstatusf(w, r, http.StatusNotFound, "%q not found (%s)", uuid, smap.StrIC(ic.p.si))
+func (ic *ic) writeStatus(w http.ResponseWriter, r *http.Request) {
+	var (
+		msg      = &xaction.XactReqMsg{}
+		bck      *cluster.Bck
+		nl       nl.NotifListener
+		interval = cmn.GCO.Get().Periodic.NotifTime
+		exists   bool
+	)
+	if err := cmn.ReadJSON(w, r, msg); err != nil {
+		return
+	}
+	if msg.ID == "" && msg.Kind == "" {
+		ic.p.invalmsghdlrstatusf(w, r, http.StatusBadRequest, "invalid %s", msg)
 		return
 	}
 
-	if err := nl.err(); err != nil {
+	// for queries of type {Kind: cmn.ActRebalance}
+	if msg.ID == "" && ic.redirectToIC(w, r) {
+		return
+	}
+	if msg.ID != "" && ic.reverseToOwner(w, r, msg.ID, msg) {
+		return
+	}
+
+	if msg.Bck.Name != "" {
+		bck = cluster.NewBckEmbed(msg.Bck)
+		if err := bck.Init(ic.p.owner.bmd, ic.p.si); err != nil {
+			ic.p.invalmsghdlrsilent(w, r, err.Error(), http.StatusNotFound)
+			return
+		}
+	}
+	flt := nlFilter{ID: msg.ID, Kind: msg.Kind, Bck: bck, OnlyRunning: msg.OnlyRunning}
+	withRetry(func() bool {
+		nl, exists = ic.p.notifs.find(flt)
+		return exists
+	})
+	if !exists {
+		smap := ic.p.owner.smap.get()
+		ic.p.invalmsghdlrstatusf(w, r, http.StatusNotFound, "%s, %s", smap.StrIC(ic.p.si), msg)
+		return
+	}
+
+	if msg.Kind != "" && nl.Kind() != msg.Kind {
+		ic.p.invalmsghdlrf(w, r, "kind mismatch: %s, expected kind=%s", msg, nl.Kind())
+		return
+	}
+
+	ic.p.notifs.syncStats(nl, interval)
+	nl.RLock()
+	defer nl.RUnlock()
+
+	if err := nl.Err(true); err != nil && !nl.Aborted() {
 		ic.p.invalmsghdlr(w, r, err.Error())
 		return
 	}
 
 	// TODO: Also send stats, eg. progress when ready
-	w.Write(cmn.MustMarshal(nl.finished()))
+	w.Write(cmn.MustMarshal(nl.Status()))
 }
 
 // verb /v1/ic
@@ -188,28 +266,22 @@ func (ic *ic) handleGet(w http.ResponseWriter, r *http.Request) {
 
 // POST /v1/ic
 func (ic *ic) handlePost(w http.ResponseWriter, r *http.Request) {
-	smap := ic.p.owner.smap.get()
-	msg := &aisMsg{}
+	var (
+		smap = ic.p.owner.smap.get()
+		msg  = &aisMsg{}
+	)
 	if err := cmn.ReadJSON(w, r, msg); err != nil {
 		ic.p.invalmsghdlr(w, r, err.Error())
 		return
 	}
-
-	reCheck := true
-check:
 	if !smap.IsIC(ic.p.si) {
-		if msg.SmapVersion < smap.Version || !reCheck {
+		if !withRetry(func() bool {
+			smap = ic.p.owner.smap.get()
+			return smap.IsIC(ic.p.si)
+		}) {
 			ic.p.invalmsghdlrf(w, r, "%s: not an IC member", ic.p.si)
 			return
 		}
-
-		reCheck = false
-		// wait for smap update
-		withLocalRetry(func() bool {
-			smap = ic.p.owner.smap.get()
-			return smap.IsIC(ic.p.si)
-		})
-		goto check
 	}
 
 	switch msg.Action {
@@ -224,8 +296,35 @@ check:
 			ic.p.invalmsghdlr(w, r, err.Error())
 			return
 		}
-		cmn.Assert(nlMsg.nl.notifTy() == notifXact || nlMsg.nl.notifTy() == notifCache)
 		ic.p.notifs.add(nlMsg.nl)
+	case cmn.ActRegGlobalXaction:
+		var (
+			regMsg = &xactRegMsg{}
+			ver    = smap.Version
+			tmap   cluster.NodeMap
+			err    error
+		)
+		if err = cmn.MorphMarshal(msg.Value, regMsg); err != nil {
+			ic.p.invalmsghdlr(w, r, err.Error())
+			return
+		}
+		debug.Assert(len(regMsg.Srcs) != 0)
+		withRetry(func() bool {
+			if smap.Version < msg.SmapVersion || err != nil {
+				smap = ic.p.owner.smap.get()
+			}
+			if smap.Version == ver && err != nil {
+				return false
+			}
+			tmap, err = smap.NewTmap(regMsg.Srcs)
+			return err == nil
+		})
+		if err != nil {
+			ic.p.invalmsghdlrstatusf(w, r, http.StatusNotFound, "%s: failed to %q: %v", ic.p.si, msg.Action, err)
+			return
+		}
+		nl := xaction.NewXactNL(regMsg.UUID, &smap.Smap, tmap, regMsg.Kind)
+		ic.p.notifs.add(nl)
 	default:
 		ic.p.invalmsghdlrf(w, r, fmtUnknownAct, msg.ActionMsg)
 	}
@@ -238,51 +337,30 @@ func (ic *ic) registerEqual(a regIC) {
 	if a.smap.IsIC(ic.p.si) {
 		ic.p.notifs.add(a.nl)
 	}
-	if len(a.smap.IC) > 1 {
-		// TODO -- FIXME: handle errors, here and elsewhere
-		_ = ic.bcastListenIC(a.nl, a.smap)
+	if a.smap.ICCount() > 1 {
+		ic.bcastListenIC(a.nl, a.smap)
 	}
 }
 
-func (ic *ic) bcastListenIC(nl notifListener, smap *smapX) (err error) {
-	nodes := make(cluster.NodeMap, len(smap.IC))
-	for pid := range smap.IC {
-		if pid != ic.p.si.ID() {
-			psi := smap.GetProxy(pid)
-			cmn.Assert(psi != nil)
-			nodes.Add(psi)
-		}
-	}
-	actMsg := cmn.ActionMsg{Action: cmn.ActListenToNotif, Value: newNLMsg(nl)}
-	msg := ic.p.newAisMsg(&actMsg, smap, nil)
-	cmn.Assert(len(nodes) > 0)
-	results := ic.p.bcastToNodes(bcastArgs{
-		req: cmn.ReqArgs{
-			Method: http.MethodPost,
-			Path:   cmn.URLPath(cmn.Version, cmn.IC),
-			Body:   cmn.MustMarshal(msg),
-		},
-		network: cmn.NetworkIntraControl,
-		timeout: cmn.GCO.Get().Timeout.MaxKeepalive,
-		nodes:   []cluster.NodeMap{nodes},
-	})
-	for res := range results {
-		if res.err != nil {
-			glog.Error(res.err)
-			err = res.err
-		}
-	}
-	return
+func (ic *ic) bcastListenIC(nl nl.NotifListener, smap *smapX) {
+	var (
+		actMsg = cmn.ActionMsg{Action: cmn.ActListenToNotif, Value: newNLMsg(nl)}
+		msg    = ic.p.newAisMsg(&actMsg, smap, nil)
+	)
+	ic.p.bcastToIC(msg, false /*wait*/)
 }
 
 func (ic *ic) sendOwnershipTbl(si *cluster.Snode) error {
 	actMsg := &cmn.ActionMsg{Action: cmn.ActMergeOwnershipTbl, Value: &ic.p.notifs}
 	msg := ic.p.newAisMsg(actMsg, nil, nil)
-	result := ic.p.call(callArgs{si: si,
-		req: cmn.ReqArgs{Method: http.MethodPost,
-			Path: cmn.URLPath(cmn.Version, cmn.IC),
-			Body: cmn.MustMarshal(msg),
-		}, timeout: cmn.GCO.Get().Timeout.CplaneOperation},
+	result := ic.p.call(callArgs{
+		si: si,
+		req: cmn.ReqArgs{
+			Method: http.MethodPost,
+			Path:   cmn.JoinWords(cmn.Version, cmn.IC),
+			Body:   cmn.MustMarshal(msg),
+		}, timeout: cmn.GCO.Get().Timeout.CplaneOperation,
+	},
 	)
 	return result.err
 }
@@ -290,8 +368,13 @@ func (ic *ic) sendOwnershipTbl(si *cluster.Snode) error {
 // sync ownership table
 func (ic *ic) syncICBundle() error {
 	smap := ic.p.owner.smap.get()
-	si, _ := smap.OldestIC()
-	cmn.Assert(si != nil)
+	si := ic.p.si
+	for _, psi := range smap.Pmap {
+		if psi.IsIC() && psi.ID() != si.ID() {
+			si = psi
+			break
+		}
+	}
 
 	if si.Equals(ic.p.si) {
 		return nil
@@ -301,14 +384,14 @@ func (ic *ic) syncICBundle() error {
 		si: si,
 		req: cmn.ReqArgs{
 			Method: http.MethodGet,
-			Path:   cmn.URLPath(cmn.Version, cmn.IC),
+			Path:   cmn.JoinWords(cmn.Version, cmn.IC),
 			Query:  url.Values{cmn.URLParamWhat: []string{cmn.GetWhatICBundle}},
 		},
 		timeout: cmn.GCO.Get().Timeout.CplaneOperation,
 	})
 	if result.err != nil {
 		// TODO: Handle error. Should try calling another IC member maybe.
-		glog.Errorf("%s: failed to get ownership table from %s (%s)", ic.p.si, si, result.err.Error())
+		glog.Errorf("%s: failed to get ownership table from %s, err: %v", ic.p.si, si, result.err)
 		return result.err
 	}
 
@@ -318,7 +401,7 @@ func (ic *ic) syncICBundle() error {
 		return err
 	}
 
-	cmn.AssertMsg(smap.UUID == bundle.Smap.UUID, smap.StringEx()+"vs. "+bundle.Smap.StringEx())
+	cmn.Assertf(smap.UUID == bundle.Smap.UUID, "%s vs %s", smap.StringEx(), bundle.Smap.StringEx())
 
 	if err := ic.p.owner.smap.synchronize(bundle.Smap, true /* lesserIsErr */); err != nil {
 		glog.Errorf("%s: sync Smap err %v", ic.p.si, err)

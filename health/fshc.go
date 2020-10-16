@@ -17,7 +17,6 @@ import (
 
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 )
@@ -144,9 +143,7 @@ func (f *FSHC) tryReadFile(fqn string, sgl *memsys.SGL) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		debug.AssertNoErr(file.Close())
-	}()
+	defer cmn.Close(file)
 
 	slab := sgl.Slab()
 	buf := slab.Alloc()
@@ -196,7 +193,7 @@ func (f *FSHC) tryWriteFile(mountpath string, fileSize int, sgl *memsys.SGL) err
 	}()
 
 	tmpFileName := f.ctxResolver.GenContentFQN(filepath.Join(tmpdir, fshcNameTemplate), fs.WorkfileType, fs.WorkfileFSHC)
-	tmpFile, err := os.OpenFile(tmpFileName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	tmpFile, err := os.OpenFile(tmpFileName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		glog.Errorf("Failed to create temporary file: %v", err)
 		return err

@@ -41,10 +41,8 @@ var (
 	errInvalidAlgorithmExtension = errors.New("invalid extension provided, should be in format: .ext")
 )
 
-var (
-	// supportedExtensions is a list of supported extensions by dSort
-	supportedExtensions = []string{cmn.ExtTar, cmn.ExtTgz, cmn.ExtTarTgz, cmn.ExtZip}
-)
+// supportedExtensions is a list of supported extensions by dSort
+var supportedExtensions = []string{cmn.ExtTar, cmn.ExtTgz, cmn.ExtTarTgz, cmn.ExtZip}
 
 // TODO: maybe this struct should be composed of `type` and `template` where
 // template is interface and each template has it's own struct. Then we could
@@ -98,7 +96,7 @@ type RequestSpec struct {
 	ExtractConcMaxLimit int `json:"extract_concurrency_max_limit" yaml:"extract_concurrency_max_limit"`
 	// Default: calcMaxLimit()
 	CreateConcMaxLimit int `json:"create_concurrency_max_limit" yaml:"create_concurrency_max_limit"`
-	// Default: transport.IntraBundleMultiplier
+	// Default: bundle.Multiplier
 	StreamMultiplier int `json:"stream_multiplier" yaml:"stream_multiplier"`
 	// Default: false
 	ExtendedMetrics bool `json:"extended_metrics" yaml:"extended_metrics"`

@@ -17,13 +17,13 @@ import (
 // ais config //
 ////////////////
 
-func LoadConfig(confPath string) {
-	if err := loadConfig(confPath); err != nil {
+func MustLoadConfig(confPath string) {
+	if err := LoadConfig(confPath); err != nil {
 		cmn.ExitLogf("%v", err)
 	}
 }
 
-func loadConfig(confPath string) (err error) {
+func LoadConfig(confPath string) (err error) {
 	cmn.GCO.SetConfigFile(confPath)
 
 	config := cmn.GCO.BeginUpdate()
@@ -115,7 +115,7 @@ func SaveConfig(action string) (err error) {
 	if err = Save(cmn.GCO.GetConfigFile(), conf, Options{}); err != nil {
 		glog.Errorf("%s: failed to write, err: %v", action, err)
 	} else {
-		glog.Infof("%s: stored", action)
+		glog.Infof("Stored config (action=%s)", action)
 	}
 	return
 }

@@ -29,6 +29,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/containers"
 	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/xaction"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 	"github.com/vbauerster/mpb/v4"
@@ -45,19 +46,17 @@ const (
 	invalidDaemonMsg = "%s is not a valid DAEMON_ID"
 	invalidCmdMsg    = "invalid command name %q"
 
-	// Scheme parsing
-	defaultScheme = "https"
-	gsScheme      = "gs"
-	s3Scheme      = "s3"
-	azScheme      = "az"
-	aisScheme     = "ais"
-	gsHost        = "storage.googleapis.com"
-	s3Host        = "s3.amazonaws.com"
+	gsHost = "storage.googleapis.com"
+	s3Host = "s3.amazonaws.com"
 
 	sizeArg  = "SIZE"
 	unitsArg = "UNITS"
 
 	incorrectCmdDistance = 3
+
+	maintenanceModeStart        = "start-maintenance"
+	maintenanceModeStop         = "stop-maintenance"
+	maintenanceModeDecommission = "decommission"
 )
 
 var (
@@ -67,36 +66,39 @@ var (
 	defaultAPIParams  api.BaseParams
 	authParams        api.BaseParams
 	mu                sync.Mutex
+
+	maintenanceModes = map[string]string{
+		maintenanceModeStart:        cmn.ActStartMaintenance,
+		maintenanceModeStop:         cmn.ActStopMaintenance,
+		maintenanceModeDecommission: cmn.ActDecommission,
+	}
 )
 
-//
-// Error handling
-//
+type (
+	usageError struct {
+		context       *cli.Context
+		message       string
+		bottomMessage string
+		helpData      interface{}
+		helpTemplate  string
+	}
+	additionalInfoError struct {
+		baseErr        error
+		additionalInfo string
+	}
+	progressBarArgs struct {
+		barType string
+		barText string
+		total   int64
+		options []mpb.BarOption
+	}
+	prop struct {
+		Name  string
+		Value string
+	}
+)
 
-type usageError struct {
-	context       *cli.Context
-	message       string
-	bottomMessage string
-	helpData      interface{}
-	helpTemplate  string
-}
-
-type additionalInfoError struct {
-	baseErr        error
-	additionalInfo string
-}
-
-type progressBarArgs struct {
-	barType string
-	barText string
-	total   int64
-	options []mpb.BarOption
-}
-
-type prop struct {
-	Name  string
-	Value string
-}
+func isWebURL(url string) bool { return cmn.IsHTTP(url) || cmn.IsHTTPS(url) }
 
 func (e *usageError) Error() string {
 	msg := helpMessage(e.helpTemplate, e.helpData)
@@ -104,7 +106,8 @@ func (e *usageError) Error() string {
 		msg += fmt.Sprintf("\n%s\n", e.bottomMessage)
 	}
 	if e.context.Command.Name != "" {
-		return fmt.Sprintf("Incorrect usage of \"%s %s\": %s.\n\n%s", e.context.App.Name, e.context.Command.Name, e.message, msg)
+		return fmt.Sprintf("Incorrect usage of \"%s %s\": %s.\n\n%s",
+			e.context.App.Name, e.context.Command.Name, e.message, msg)
 	}
 	return fmt.Sprintf("Incorrect usage of \"%s\": %s.\n\n%s", e.context.App.Name, e.message, msg)
 }
@@ -214,9 +217,7 @@ func newAdditionalInfoError(err error, info string) error {
 
 // Populates the proxy and target maps
 func fillMap() (*cluster.Smap, error) {
-	var (
-		wg = &sync.WaitGroup{}
-	)
+	wg := &sync.WaitGroup{}
 	smap, err := api.GetClusterMap(defaultAPIParams)
 	if err != nil {
 		return nil, err
@@ -240,6 +241,11 @@ func fillMap() (*cluster.Smap, error) {
 func retrieveStatus(nodeMap cluster.NodeMap, daeMap map[string]*stats.DaemonStatus, wg *sync.WaitGroup) {
 	fill := func(node *cluster.Snode) {
 		obj, _ := api.GetDaemonStatus(defaultAPIParams, node)
+		if node.Flags.IsSet(cluster.SnodeMaintenance) {
+			obj.Status = "maintenance"
+		} else if node.Flags.IsSet(cluster.SnodeDecomission) {
+			obj.Status = "decomission"
+		}
 		mu.Lock()
 		daeMap[node.ID()] = obj
 		mu.Unlock()
@@ -301,7 +307,7 @@ func parseSource(rawURL string) (source dlSource, err error) {
 	// If `rawURL` is using `gs` or `s3` scheme ({gs/s3}://<bucket>/...)
 	// then <bucket> is considered a `Host` by `url.Parse`.
 	switch u.Scheme {
-	case gsScheme, cmn.ProviderGoogle:
+	case cmn.GSScheme, cmn.ProviderGoogle:
 		cloudSource = dlSourceCloud{
 			bck:    cmn.Bck{Name: host, Provider: cmn.ProviderGoogle},
 			prefix: strings.TrimPrefix(fullPath, "/"),
@@ -310,7 +316,7 @@ func parseSource(rawURL string) (source dlSource, err error) {
 		scheme = "https"
 		host = gsHost
 		fullPath = path.Join(u.Host, fullPath)
-	case s3Scheme, cmn.ProviderAmazon:
+	case cmn.S3Scheme, cmn.ProviderAmazon:
 		cloudSource = dlSourceCloud{
 			bck:    cmn.Bck{Name: host, Provider: cmn.ProviderAmazon},
 			prefix: strings.TrimPrefix(fullPath, "/"),
@@ -319,7 +325,7 @@ func parseSource(rawURL string) (source dlSource, err error) {
 		scheme = "http"
 		host = s3Host
 		fullPath = path.Join(u.Host, fullPath)
-	case azScheme, cmn.ProviderAzure:
+	case cmn.AZScheme, cmn.ProviderAzure:
 		// NOTE: We don't set the link here because there is no way to translate
 		//  `az://bucket/object` into Azure link without account name.
 		return dlSource{
@@ -329,7 +335,7 @@ func parseSource(rawURL string) (source dlSource, err error) {
 				prefix: strings.TrimPrefix(fullPath, "/"),
 			},
 		}, nil
-	case aisScheme:
+	case cmn.AISScheme:
 		// TODO: add support for the remote cluster
 		scheme = "http" // TODO: How about `https://`?
 		if !strings.Contains(host, ":") {
@@ -337,7 +343,7 @@ func parseSource(rawURL string) (source dlSource, err error) {
 		}
 		fullPath = path.Join(cmn.Version, cmn.Objects, fullPath)
 	case "":
-		scheme = defaultScheme
+		scheme = cmn.DefaultScheme
 	case "https", "http":
 		break
 	default:
@@ -365,9 +371,9 @@ func parseDest(rawURL string) (bucket, pathSuffix string, err error) {
 	if err != nil {
 		return
 	}
-	if destScheme != aisScheme {
+	if destScheme != cmn.AISScheme {
 		err = fmt.Errorf("destination must look as %q, for instance: %s://bucket/objName (got %s)",
-			aisScheme, aisScheme, destScheme)
+			cmn.AISScheme, cmn.AISScheme, destScheme)
 		return
 	}
 	if destBucket == "" {
@@ -376,6 +382,28 @@ func parseDest(rawURL string) (bucket, pathSuffix string, err error) {
 	}
 	destPathSuffix = strings.Trim(destPathSuffix, "/")
 	return destBucket, destPathSuffix, nil
+}
+
+func parseBckURI(c *cli.Context, bucketDef string, query ...bool) (bck cmn.Bck, err error) {
+	var objName string
+	bck, objName, err = parseBckObjectURI(c, bucketDef, query...)
+	if err != nil {
+		return
+	}
+	if objName != "" {
+		err = objectNameArgumentNotSupported(c, objName)
+		return
+	}
+
+	return
+}
+
+func parseBckObjectURI(c *cli.Context, objName string, query ...bool) (bck cmn.Bck, object string, err error) {
+	bck, object, err = cmn.ParseBckObjectURI(objName, query...)
+	if err != nil {
+		return bck, object, incorrectUsageError(c, err)
+	}
+	return
 }
 
 func parseURI(rawURL string) (scheme, bucket, objName string, err error) {
@@ -428,15 +456,6 @@ func parseStrFlag(c *cli.Context, flag cli.Flag) string {
 	return c.String(flagName)
 }
 
-// Returns the value of a string slice flag (either parent or local scope)
-func parseStrSliceFlag(c *cli.Context, flag cli.Flag) []string {
-	flagName := cleanFlag(flag.GetName())
-	if c.GlobalIsSet(flagName) {
-		return c.GlobalStringSlice(flagName)
-	}
-	return c.StringSlice(flagName)
-}
-
 // Returns the value of an int flag (either parent or local scope)
 func parseIntFlag(c *cli.Context, flag cli.IntFlag) int {
 	flagName := cleanFlag(flag.GetName())
@@ -476,7 +495,7 @@ func parseChecksumFlags(c *cli.Context) []*cmn.Cksum {
 
 func calcRefreshRate(c *cli.Context) time.Duration {
 	const (
-		refreshRateMin = 500 * time.Millisecond
+		refreshRateMin = time.Second
 	)
 
 	refreshRate := refreshRateDefault
@@ -580,22 +599,12 @@ func chooseTmpl(tmplShort, tmplLong string, useShort bool) string {
 	return tmplLong
 }
 
-// Replace provider aliases with real provider names
-func parseBckProvider(provider string) string {
-	if provider == gsScheme {
-		return cmn.ProviderGoogle
-	}
-	if provider == s3Scheme {
-		return cmn.ProviderAmazon
-	}
-	if provider == azScheme {
-		return cmn.ProviderAzure
-	}
-	return provider
-}
-
 func parseBck(c *cli.Context, uri string) (*cmn.Bck, error) {
-	bck, objName, err := parseBckObjectURI(uri)
+	if isWebURL(uri) {
+		bck := parseURLtoBck(uri)
+		return &bck, nil
+	}
+	bck, objName, err := cmn.ParseBckObjectURI(uri)
 	if err != nil {
 		return nil, err
 	}
@@ -603,57 +612,6 @@ func parseBck(c *cli.Context, uri string) (*cmn.Bck, error) {
 		return nil, objectNameArgumentNotSupported(c, objName)
 	}
 	return &bck, nil
-}
-
-// Parses "provider://@uuid#namespace/bucketName/objectName"
-func parseBckObjectURI(objName string, query ...bool) (bck cmn.Bck, object string, err error) {
-	const (
-		bucketSepa = "/"
-	)
-
-	parts := strings.SplitN(objName, cmn.BckProviderSeparator, 2)
-	if len(parts) > 1 {
-		bck.Provider = parseBckProvider(parts[0])
-		objName = parts[1]
-	}
-	bck.Provider = parseBckProvider(bck.Provider)
-	if bck.Provider != "" && !cmn.IsValidProvider(bck.Provider) && bck.Provider != cmn.AnyCloud {
-		return bck, "", fmt.Errorf("invalid bucket provider %q", bck.Provider)
-	}
-
-	parts = strings.SplitN(objName, bucketSepa, 2)
-	if len(parts[0]) > 0 && (parts[0][0] == cmn.NsUUIDPrefix || parts[0][0] == cmn.NsNamePrefix) {
-		bck.Ns = cmn.ParseNsUname(parts[0])
-		if err := bck.Ns.Validate(); err != nil {
-			return bck, "", err
-		}
-		if len(parts) == 1 {
-			isQuery := len(query) > 0 && query[0]
-			if parts[0] == string(cmn.NsUUIDPrefix) && isQuery {
-				// Case: "[provider://]@" (only valid if uri is query)
-				// We need to list buckets from all possible remote clusters
-				bck.Ns = cmn.NsAnyRemote
-				return bck, "", nil
-			}
-
-			// Case: "[provider://]@uuid#ns"
-			return bck, "", nil
-		}
-
-		// Case: "[provider://]@uuid#ns/bucket"
-		parts = strings.SplitN(parts[1], bucketSepa, 2)
-	}
-
-	bck.Name = parts[0]
-	if bck.Name != "" {
-		if err := cmn.ValidateBckName(bck.Name); err != nil {
-			return bck, "", err
-		}
-	}
-	if len(parts) > 1 {
-		object = parts[1]
-	}
-	return
 }
 
 func parseAliasURL(c *cli.Context) (alias, remAisURL string, err error) {
@@ -681,28 +639,24 @@ ret:
 func parseXactionFromArgs(c *cli.Context) (xactID, xactKind string, bck cmn.Bck, err error) {
 	xactKind = c.Args().Get(0)
 	bckName := c.Args().Get(1)
-	if !cmn.IsValidXaction(xactKind) {
+	if !xaction.IsValidXaction(xactKind) {
 		xactID = xactKind
 		xactKind = ""
 	} else {
-		switch cmn.XactsDtor[xactKind].Type {
-		case cmn.XactTypeGlobal:
+		switch xaction.XactsDtor[xactKind].Type {
+		case xaction.XactTypeGlobal:
 			if c.NArg() > 1 {
 				fmt.Fprintf(c.App.ErrWriter, "Warning: %q is a global xaction, ignoring bucket name\n", xactKind)
 			}
-		case cmn.XactTypeBck:
-			var objName string
-			bck, objName, err = parseBckObjectURI(bckName)
+		case xaction.XactTypeBck:
+			bck, err = parseBckURI(c, bckName)
 			if err != nil {
 				return "", "", bck, err
-			}
-			if objName != "" {
-				return "", "", bck, objectNameArgumentNotSupported(c, objName)
 			}
 			if bck, _, err = validateBucket(c, bck, "", true); err != nil {
 				return "", "", bck, err
 			}
-		case cmn.XactTypeTask:
+		case xaction.XactTypeTask:
 			// TODO: we probably should not ignore bucket...
 			if c.NArg() > 1 {
 				fmt.Fprintf(c.App.ErrWriter, "Warning: %q is a task xaction, ignoring bucket name\n", xactKind)
@@ -715,7 +669,7 @@ func parseXactionFromArgs(c *cli.Context) (xactID, xactKind string, bck cmn.Bck,
 // Get list of xactions
 func listXactions(onlyStartable bool) []string {
 	xactKinds := make([]string, 0)
-	for kind, meta := range cmn.XactsDtor {
+	for kind, meta := range xaction.XactsDtor {
 		if !onlyStartable || (onlyStartable && meta.Startable) {
 			xactKinds = append(xactKinds, kind)
 		}
@@ -774,7 +728,7 @@ func parseBckPropsFromContext(c *cli.Context) (props cmn.BucketPropsToUpdate, er
 
 func validateLocalBuckets(buckets []cmn.Bck, operation string) error {
 	for _, bck := range buckets {
-		if bck.IsCloud(cmn.AnyCloud) {
+		if bck.IsCloud() {
 			return fmt.Errorf("%s cloud buckets (%s) is not supported", operation, bck)
 		}
 		bck.Provider = cmn.ProviderAIS
@@ -815,8 +769,12 @@ func headBucket(bck cmn.Bck) (p *cmn.BucketProps, err error) {
 	if p, err = api.HeadBucket(defaultAPIParams, bck); err == nil {
 		return
 	}
-	if httpErr, ok := err.(*cmn.HTTPError); ok && httpErr.Status == http.StatusNotFound {
-		err = fmt.Errorf("bucket %q does not exist", bck)
+	if httpErr, ok := err.(*cmn.HTTPError); ok {
+		if httpErr.Status == http.StatusNotFound {
+			err = fmt.Errorf("bucket %q does not exist", bck)
+		} else {
+			err = fmt.Errorf("failed to HEAD bucket %q: %s", bck, http.StatusText(httpErr.Status))
+		}
 	} else {
 		err = fmt.Errorf("failed to HEAD bucket %q: %v", bck, err)
 	}
@@ -924,7 +882,7 @@ func simpleProgressBar(args ...progressBarArgs) (*mpb.Progress, []*mpb.Bar) {
 		case sizeArg:
 			argDecorators = []decor.Decorator{decor.Name(a.barText, decor.WC{W: len(a.barText) + 1, C: decor.DidentRight}), decor.CountersKibiByte("% .2f / % .2f", decor.WCSyncWidth)}
 		default:
-			cmn.AssertMsg(false, a.barType+" argument is invalid")
+			cmn.Assertf(false, "invalid argument: %s", a.barType)
 		}
 
 		options := append(
@@ -979,6 +937,9 @@ func bckPropList(props *cmn.BucketProps, verbose bool) (propList []prop, err err
 			{"ec", props.EC.String()},
 			{"lru", props.LRU.String()},
 			{"versioning", props.Versioning.String()},
+		}
+		if props.Extra.OrigURLBck != "" {
+			propList = append(propList, prop{Name: "original-url", Value: props.Extra.OrigURLBck})
 		}
 	} else {
 		err = cmn.IterFields(props, func(uniqueTag string, field cmn.IterField) (err error, b bool) {
@@ -1038,4 +999,28 @@ func confirm(c *cli.Context, prompt string, warning ...string) (ok bool) {
 		}
 		return
 	}
+}
+
+func ensureHasProvider(bck cmn.Bck, cmd string) error {
+	if !bck.IsHTTP() && !bck.IsCloud() {
+		return fmt.Errorf("missing cloud provider for %q", cmd)
+	}
+	return nil
+}
+
+func parseURLtoBck(strURL string) (bck cmn.Bck) {
+	if strURL[len(strURL)-1:] != "/" {
+		strURL += "/"
+	}
+	bck.Provider = cmn.ProviderHTTP
+	bck.Name = cmn.OrigURLBck2Name(strURL)
+	return
+}
+
+func maintenanceModeToAction(c *cli.Context, mode string) (string, error) {
+	if action, ok := maintenanceModes[mode]; ok {
+		return action, nil
+	}
+	return "", incorrectUsageMsg(c, "'mode' is one of %s, %s, and %s",
+		maintenanceModeStart, maintenanceModeStop, maintenanceModeDecommission)
 }

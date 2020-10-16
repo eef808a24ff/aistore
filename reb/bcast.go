@@ -16,13 +16,9 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/stats"
-	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 	jsoniter "github.com/json-iterator/go"
 )
-
-//
-// rebalance: cluster-wide synchronization at certain stages
-//
 
 type (
 	Status struct {
@@ -40,6 +36,10 @@ type (
 	}
 )
 
+////////////////////////////////////////////
+// rebalance manager: node <=> node comm. //
+////////////////////////////////////////////
+
 // via GET /v1/health (cmn.Health)
 func (reb *Manager) RebStatus(status *Status) {
 	var (
@@ -47,8 +47,8 @@ func (reb *Manager) RebStatus(status *Status) {
 		config     = cmn.GCO.Get()
 		sleepRetry = cmn.KeepaliveRetryDuration(config)
 		rsmap      = (*cluster.Smap)(reb.smap.Load())
-		tsmap      = reb.t.GetSowner().Get()
-		marked     = xaction.GetRebMarked()
+		tsmap      = reb.t.Sowner().Get()
+		marked     = registry.GetRebMarked()
 	)
 	status.Aborted, status.Running = marked.Interrupted, marked.Xact != nil
 	status.Stage = reb.stages.stage.Load()
@@ -187,7 +187,7 @@ func (reb *Manager) pingTarget(tsi *cluster.Snode, md *rebArgs) (ok bool) {
 		}
 		glog.Warningf("%s: waiting for %s, err %v(%d)", logHdr, tsi, err, code)
 		time.Sleep(sleep)
-		nver := reb.t.GetSowner().Get().Version
+		nver := reb.t.Sowner().Get().Version
 		if nver > ver {
 			return
 		}

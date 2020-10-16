@@ -18,7 +18,6 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/transport"
@@ -208,8 +207,8 @@ func (c *putJogger) encode(req *Request) error {
 	return nil
 }
 
-func (c *putJogger) ctSendCallback(hdr transport.Header, _ io.ReadCloser, _ unsafe.Pointer, err error) {
-	c.parent.t.GetSmallMMSA().Free(hdr.Opaque)
+func (c *putJogger) ctSendCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ unsafe.Pointer, err error) {
+	c.parent.t.SmallMMSA().Free(hdr.Opaque)
 	if err != nil {
 		glog.Errorf("failed to send o[%s/%s], err: %v", hdr.Bck, hdr.ObjName, err)
 	}
@@ -230,9 +229,9 @@ func (c *putJogger) cleanup(req *Request) error {
 		glog.Errorf("Error removing metafile %q", fqnMeta)
 	}
 
-	mm := c.parent.t.GetSmallMMSA()
+	mm := c.parent.t.SmallMMSA()
 	request := c.parent.newIntraReq(reqDel, nil).NewPack(mm)
-	hdr := transport.Header{
+	hdr := transport.ObjHdr{
 		Bck:     req.LOM.Bck().Bck,
 		ObjName: req.LOM.ObjName,
 		Opaque:  request,
@@ -240,15 +239,13 @@ func (c *putJogger) cleanup(req *Request) error {
 			Size: 0,
 		},
 	}
-	return c.parent.reqBundle.Send(transport.Obj{Hdr: hdr, Callback: c.ctSendCallback}, nil)
+	return c.parent.reqBundle.Send(&transport.Obj{Hdr: hdr, Callback: c.ctSendCallback}, nil)
 }
 
 // Sends object replicas to targets that must have replicas after the client
 // uploads the main replica
 func (c *putJogger) createCopies(req *Request, metadata *Metadata) error {
-	var (
-		copies = req.LOM.Bprops().EC.ParitySlices
-	)
+	copies := req.LOM.Bprops().EC.ParitySlices
 
 	// generate a list of target to send the replica (all excluding this one)
 	targets, err := cluster.HrwTargetList(req.LOM.Uname(), c.parent.smap.Get(), copies+1)
@@ -270,7 +267,7 @@ func (c *putJogger) createCopies(req *Request, metadata *Metadata) error {
 	}
 
 	// broadcast the replica to the targets
-	cb := func(hdr transport.Header, reader io.ReadCloser, _ unsafe.Pointer, err error) {
+	cb := func(hdr transport.ObjHdr, reader io.ReadCloser, _ unsafe.Pointer, err error) {
 		if err != nil {
 			glog.Errorf("Failed to to %v: %v", nodes, err)
 		}
@@ -331,7 +328,6 @@ func generateSlicesToMemory(lom *cluster.LOM, dataSlices, paritySlices int) (cmn
 	}
 
 	err = finalizeSlices(ctx, lom, sliceWriters, dataSlices, paritySlices)
-	ctx.wgCksmReaders.Wait()
 	return ctx.fh, ctx.slices, err
 }
 
@@ -407,6 +403,7 @@ func finalizeSlices(ctx *encodeCtx, lom *cluster.LOM, writers []io.Writer, dataS
 		return err
 	}
 
+	ctx.wgCksmReaders.Wait()
 	conf := lom.CksumConf()
 	if conf.Type != cmn.ChecksumNone {
 		for i := range ctx.cksums {
@@ -449,7 +446,7 @@ func generateSlicesToDisk(lom *cluster.LOM, dataSlices, paritySlices int) (cmn.R
 			// writer can be only *os.File within this function
 			f, ok := wr.(*os.File)
 			cmn.Assert(ok)
-			debug.AssertNoErr(f.Close())
+			cmn.Close(f)
 		}
 	}()
 
@@ -543,7 +540,7 @@ func (c *putJogger) sendSlices(req *Request, meta *Metadata) ([]*slice, error) {
 			case *cmn.FileSectionHandle:
 				_, err = r.Open()
 			default:
-				cmn.AssertFmt(false, "unsupported reader type", reader)
+				cmn.Assertf(false, "unsupported reader type: %v", reader)
 			}
 		} else {
 			if sgl, ok := slices[i].obj.(*memsys.SGL); ok {
@@ -551,7 +548,7 @@ func (c *putJogger) sendSlices(req *Request, meta *Metadata) ([]*slice, error) {
 			} else if slices[i].workFQN != "" {
 				reader, err = cmn.NewFileHandle(slices[i].workFQN)
 			} else {
-				cmn.AssertFmt(false, "unsupported reader type", slices[i].obj)
+				cmn.Assertf(false, "unsupported reader type: %v", slices[i].obj)
 			}
 		}
 		if err != nil {
@@ -559,7 +556,8 @@ func (c *putJogger) sendSlices(req *Request, meta *Metadata) ([]*slice, error) {
 			return
 		}
 
-		mcopy := *meta
+		mcopy := &Metadata{}
+		cmn.CopyStruct(mcopy, meta)
 		mcopy.SliceID = i + 1
 		mcopy.ObjVersion = req.LOM.Version()
 		if mcopy.SliceID != 0 && slices[i].cksum != nil {
@@ -570,7 +568,7 @@ func (c *putJogger) sendSlices(req *Request, meta *Metadata) ([]*slice, error) {
 			reader:   reader,
 			size:     sliceSize,
 			obj:      data,
-			metadata: &mcopy,
+			metadata: mcopy,
 			isSlice:  true,
 			reqType:  reqPut,
 		}

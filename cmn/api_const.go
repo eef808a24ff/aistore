@@ -41,11 +41,13 @@ const (
 	ActDestroyLB      = "destroylb"
 	ActRenameLB       = "renamelb"
 	ActCopyBucket     = "copybck"
+	ActETLBucket      = "etlbck"
 	ActRegisterCB     = "registercb"
 	ActEvictCB        = "evictcb"
 	ActSetConfig      = "setconfig"
 	ActSetBprops      = "setbprops"
 	ActResetBprops    = "resetbprops"
+	ActResyncBprops   = "resyncbprops"
 	ActListObjects    = "listobj"
 	ActQueryObjects   = "queryobj"
 	ActInvalListCache = "invallistobjcache"
@@ -74,10 +76,15 @@ const (
 	ActRecoverBck     = "recoverbck"
 	ActAttach         = "attach"
 	ActDetach         = "detach"
+	// Node maintenance
+	ActStartMaintenance = "startmaitenance" // put into maintenance state
+	ActStopMaintenance  = "stopmaintenance" // cancel maintenance state
+	ActDecommission     = "decommission"    // start rebalance and remove node from Smap when it finishes
 	// IC
 	ActSendOwnershipTbl  = "ic-send-ownership-tbl"
 	ActListenToNotif     = "watch-xaction"
 	ActMergeOwnershipTbl = "merge-ownership-tbl"
+	ActRegGlobalXaction  = "reg-global-xaction"
 )
 
 const (
@@ -111,6 +118,9 @@ const (
 	HeaderBackendBckName     = HeaderBackendBck + ".name"
 	HeaderBackendBckProvider = HeaderBackendBck + "." + HeaderCloudProvider
 
+	HeaderOrigURLBck  = "orig_url_bck"     // see BucketProps.OrigURLBck
+	HeaderCloudRegion = "cloud_bck_region" // see BucketProps.CloudRegion
+
 	HeaderCloudProvider    = "provider"           // ProviderAmazon et al. - see cmn/bucket.go
 	HeaderCloudOffline     = "cloud.offline"      // when accessing cached cloud bucket with no Cloud connectivity
 	HeaderRemoteAisOffline = "remote.ais.offline" // when accessing cached cloud bucket with no Cloud connectivity
@@ -131,7 +141,8 @@ const (
 	HeaderObjECMeta    = "ec_meta"        // Info about EC object/slice/replica
 
 	// intra-cluster: control
-	HeaderCallerID          = "caller.id"
+	HeaderCallerID          = "caller.id" // it is a marker of intra-cluster request (see cmn.IsInternalReq)
+	HeaderPutterID          = "putter.id"
 	HeaderCallerName        = "caller.name"
 	HeaderCallerSmapVersion = "caller.smap.ver"
 
@@ -197,6 +208,9 @@ const (
 
 	// notification target's node ID (usually, the node that initiates the operation)
 	URLParamNotifyMe = "nft"
+
+	// HTTP bucket support
+	URLParamOrigURL = "origurl"
 )
 
 // enum: task action (cmn.URLParamTaskAction)
@@ -223,6 +237,7 @@ const (
 	QueryXactStats      = "qryxstats" // stats(all-matching-xactions)
 	GetWhatStatus       = "status"    // JTX status by uuid
 	GetWhatICBundle     = "ic-bundle"
+	GetWhatTargetIPs    = "target_ips"
 )
 
 // SelectMsg.TimeFormat enum
@@ -302,15 +317,16 @@ const (
 	Voteres      = "result"
 	VoteInit     = "init"
 	Mountpaths   = "mountpaths"
-	Summary      = "summary"
 	AllBuckets   = "*"
 
 	// common
-	Init  = "init"
-	Start = "start"
-	Stop  = "stop"
-	Abort = "abort"
-	Sort  = "sort"
+	Init     = "init"
+	Start    = "start"
+	Stop     = "stop"
+	Abort    = "abort"
+	Sort     = "sort"
+	Finished = "finished"
+	Progress = "progress"
 
 	// dSort, downloader, query
 	Metrics     = "metrics"
@@ -331,10 +347,13 @@ const (
 	GetTargetObjects = "objects"
 
 	// ETL
-	EtlInit = Init
-	EtlList = List
-	EtlStop = Stop
-	ETL     = "etl"
+	ETL       = "etl"
+	ETLInit   = Init
+	ETLBuild  = "build"
+	ETLList   = List
+	ETLLogs   = "logs"
+	ETLObject = "object"
+	ETLStop   = Stop
 )
 
 // enum: compression

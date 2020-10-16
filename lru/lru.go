@@ -22,7 +22,8 @@ import (
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/stats"
-	"github.com/NVIDIA/aistore/xaction/demand"
+	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 // The LRU module implements a well-known least-recently-used cache replacement policy.
@@ -47,6 +48,8 @@ import (
 const (
 	minEvictThresh = 10 * cmn.MiB
 	capCheckThresh = 256 * cmn.MiB // capacity checking threshold, when exceeded may result in lru throttling
+
+	xactIdleTime = 30 * time.Second
 )
 
 type (
@@ -94,12 +97,43 @@ type (
 		throttle    bool
 		allowDelObj bool
 	}
+
+	XactProvider struct {
+		registry.BaseGlobalEntry
+		xact *Xaction
+
+		id string
+	}
+
 	Xaction struct {
-		demand.XactDemandBase
+		xaction.XactDemandBase
 		Renewed           chan struct{}
 		OkRemoveMisplaced func() bool
 	}
 )
+
+func init() {
+	registry.Registry.RegisterGlobalXact(&XactProvider{})
+}
+
+func (*XactProvider) New(args registry.XactArgs) registry.GlobalEntry {
+	return &XactProvider{id: args.UUID}
+}
+
+func (p *XactProvider) Start(_ cmn.Bck) error {
+	p.xact = &Xaction{
+		XactDemandBase: *xaction.NewXactDemandBase(p.id, cmn.ActLRU, xactIdleTime),
+		Renewed:        make(chan struct{}, 10),
+		OkRemoveMisplaced: func() bool {
+			g, l := registry.GetRebMarked(), registry.GetResilverMarked()
+			return !g.Interrupted && !l.Interrupted && g.Xact == nil && l.Xact == nil
+		},
+	}
+	p.xact.InitIdle()
+	return nil
+}
+func (p *XactProvider) Kind() string      { return cmn.ActLRU }
+func (p *XactProvider) Get() cluster.Xact { return p.xact }
 
 func Run(ini *InitLRU) {
 	var (
@@ -129,9 +163,8 @@ func Run(ini *InitLRU) {
 			p:         parent,
 		}
 	}
-	for provider := range cmn.Providers {
-		providers = append(providers, provider) // in random order
-	}
+
+	providers = cmn.Providers.Keys()
 
 repeat:
 	xlru.XactDemandBase.IncPending()
@@ -541,7 +574,7 @@ func (j *lruJ) sortBsize(bcks []cmn.Bck) {
 
 func (j *lruJ) allow() (ok bool, err error) {
 	var (
-		bowner = j.ini.T.GetBowner()
+		bowner = j.ini.T.Bowner()
 		b      = cluster.NewBckEmbed(j.bck)
 	)
 	if err = b.Init(bowner, j.ini.T.Snode()); err != nil {
@@ -555,12 +588,10 @@ func (j *lruJ) allow() (ok bool, err error) {
 // min-heap //
 //////////////
 
-func (h minHeap) Len() int           { return len(h) }
-func (h minHeap) Less(i, j int) bool { return h[i].Atime().Before(h[j].Atime()) }
-func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-
+func (h minHeap) Len() int            { return len(h) }
+func (h minHeap) Less(i, j int) bool  { return h[i].Atime().Before(h[j].Atime()) }
+func (h minHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
 func (h *minHeap) Push(x interface{}) { *h = append(*h, x.(*cluster.LOM)) }
-
 func (h *minHeap) Pop() interface{} {
 	old := *h
 	n := len(old)

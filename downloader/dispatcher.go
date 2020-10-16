@@ -30,6 +30,7 @@ type (
 		joggers  map[string]*jogger     // mpath -> jogger
 		abortJob map[string]*cmn.StopCh // jobID -> abort job chan
 
+		adminCh            chan *request
 		dispatchDownloadCh chan DlJob
 
 		stopCh *cmn.StopCh
@@ -38,43 +39,64 @@ type (
 )
 
 func newDispatcher(parent *Downloader) *dispatcher {
-	initInfoStore(parent.t.GetDB()) // it will be initialized only once
+	initInfoStore(parent.t.DB()) // it will be initialized only once
 	return &dispatcher{
 		parent:  parent,
 		joggers: make(map[string]*jogger, 8),
 
 		dispatchDownloadCh: make(chan DlJob, jobsChSize),
-		stopCh:             cmn.NewStopCh(),
-		abortJob:           make(map[string]*cmn.StopCh, jobsChSize),
+
+		stopCh:   cmn.NewStopCh(),
+		abortJob: make(map[string]*cmn.StopCh, jobsChSize),
+		adminCh:  make(chan *request),
 	}
 }
 
-func (d *dispatcher) init() {
-	availablePaths, _ := fs.Get()
-	for mpath := range availablePaths {
-		d.addJogger(mpath)
-	}
-
-	go d.run()
-}
-
-func (d *dispatcher) run() {
+func (d *dispatcher) run() (err error) {
 	var (
 		// Number of concurrent job dispatches - it basically limits the number
 		// of goroutines so they won't go out of hand.
 		sema       = cmn.NewDynSemaphore(5 * fs.NumAvail())
 		group, ctx = errgroup.WithContext(context.Background())
 	)
+
+	availablePaths, _ := fs.Get()
+	for mpath := range availablePaths {
+		d.addJogger(mpath)
+	}
+
+Loop:
 	for {
 		select {
+		case <-d.parent.IdleTimer():
+			glog.Infof("%s has timed out. Exiting...", d.parent.Name())
+			break Loop
+		case <-d.parent.ChanAbort():
+			glog.Infof("%s has been aborted. Exiting...", d.parent.Name())
+			break Loop
+		case req := <-d.adminCh:
+			switch req.action {
+			case actStatus:
+				d.dispatchStatus(req)
+			case actAbort:
+				d.dispatchAbort(req)
+			case actRemove:
+				d.dispatchRemove(req)
+			case actList:
+				d.dispatchList(req)
+			default:
+				cmn.Assertf(false, "%v; %v", req, req.action)
+			}
 		case <-ctx.Done():
-			d.stop()
-			group.Wait()
-			return
+			break Loop
 		case job := <-d.dispatchDownloadCh:
 			// Start dispatching each job in new goroutine to make sure that
 			// all joggers are busy downloading the tasks (jobs with limits
 			// may not saturate the full downloader throughput).
+			d.Lock()
+			d.abortJob[job.ID()] = cmn.NewStopCh()
+			d.Unlock()
+
 			sema.Acquire()
 			group.Go(func() error {
 				defer sema.Release()
@@ -83,20 +105,16 @@ func (d *dispatcher) run() {
 				}
 				return nil
 			})
-		case <-d.stopCh.Listen():
-			d.stop()
-			return
 		}
 	}
-}
-
-func (d *dispatcher) Abort() {
-	d.stopCh.Close()
+	d.stop()
+	return group.Wait()
 }
 
 // stop running joggers
 // no need to cleanup maps, dispatcher should not be used after stop()
 func (d *dispatcher) stop() {
+	d.stopCh.Close()
 	for _, jogger := range d.joggers {
 		jogger.stop()
 	}
@@ -126,14 +144,6 @@ func (d *dispatcher) cleanUpAborted(jobID string) {
 	d.Unlock()
 }
 
-func (d *dispatcher) ScheduleForDownload(job DlJob) {
-	d.Lock()
-	d.abortJob[job.ID()] = cmn.NewStopCh()
-	d.Unlock()
-
-	d.dispatchDownloadCh <- job
-}
-
 /*
  * dispatcher's dispatch methods (forwards request to jogger)
  */
@@ -141,17 +151,15 @@ func (d *dispatcher) ScheduleForDownload(job DlJob) {
 func (d *dispatcher) dispatchDownload(job DlJob) (ok bool) {
 	defer func() {
 		d.waitFor(job)
-		job.cleanup()
 		d.cleanUpAborted(job.ID())
+		job.cleanup()
 	}()
 
 	if aborted := d.checkAborted(); aborted || d.checkAbortedJob(job) {
 		return !aborted
 	}
 
-	var (
-		diffResolver = NewDiffResolver(nil)
-	)
+	diffResolver := NewDiffResolver(nil)
 
 	diffResolver.Start()
 
@@ -302,6 +310,7 @@ func (d *dispatcher) dispatchDownload(job DlJob) (ok bool) {
 				return ok
 			}
 			if !ok {
+				dlStore.setAborted(job.ID())
 				return false
 			}
 		case DiffResolverSend:
@@ -347,7 +356,7 @@ func (d *dispatcher) checkAborted() bool {
 // returns false if dispatcher encountered hard error, true otherwise
 func (d *dispatcher) blockingDispatchDownloadSingle(task *singleObjectTask) (err error, ok bool) {
 	bck := cluster.NewBckEmbed(task.job.Bck())
-	if err := bck.Init(d.parent.t.GetBowner(), d.parent.t.Snode()); err != nil {
+	if err := bck.Init(d.parent.t.Bowner(), d.parent.t.Snode()); err != nil {
 		return err, true
 	}
 
@@ -420,26 +429,33 @@ func (d *dispatcher) dispatchAbort(req *request) {
 }
 
 func (d *dispatcher) dispatchStatus(req *request) {
+	var (
+		finishedTasks []TaskDlInfo
+		dlErrors      []TaskErrInfo
+	)
+
 	jInfo, err := d.parent.checkJob(req)
-	if err != nil || jInfo == nil {
+	if err != nil {
 		return
 	}
 
 	currentTasks := d.activeTasks(req.id)
-	finishedTasks, err := dlStore.getTasks(req.id)
-	if err != nil {
-		req.writeErrResp(err, http.StatusInternalServerError)
-		return
+	if !req.onlyActive {
+		finishedTasks, err = dlStore.getTasks(req.id)
+		if err != nil {
+			req.writeErrResp(err, http.StatusInternalServerError)
+			return
+		}
+
+		dlErrors, err = dlStore.getErrors(req.id)
+		if err != nil {
+			req.writeErrResp(err, http.StatusInternalServerError)
+			return
+		}
+		sort.Sort(TaskErrByName(dlErrors))
 	}
 
-	dlErrors, err := dlStore.getErrors(req.id)
-	if err != nil {
-		req.writeErrResp(err, http.StatusInternalServerError)
-		return
-	}
-	sort.Sort(TaskErrByName(dlErrors))
-
-	req.writeResp(DlStatusResp{
+	req.writeResp(&DlStatusResp{
 		DlJobInfo:     jInfo.ToDlJobInfo(),
 		CurrentTasks:  currentTasks,
 		FinishedTasks: finishedTasks,
@@ -485,11 +501,9 @@ func (d *dispatcher) pending(reqID string) bool {
 	return false
 }
 
+// PRECONDITION: All tasks should be dispatched.
 func (d *dispatcher) waitFor(job DlJob) {
-	// PRECONDITION: all tasks should be dispatched.
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for range ticker.C {
+	for ; ; time.Sleep(time.Second) {
 		if !d.pending(job.ID()) {
 			break
 		}

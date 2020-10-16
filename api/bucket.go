@@ -21,19 +21,32 @@ const (
 	maxPollInterval     = 10 * time.Second
 )
 
-// SetBucketProps API
-//
-// Set the properties of a bucket using the bucket name and the entire bucket
-// property structure to be set.
+type (
+	// ProgressInfo to notify a caller about an operation progress. The operation
+	// returns negative values for data that unavailable(e.g, Total or Percent for ListObjects).
+	ProgressInfo struct {
+		Percent float64
+		Count   int
+		Total   int
+	}
+	ProgressContext struct {
+		startTime time.Time // time when operation was started
+		callAfter time.Time // call a callback only after this point in time
+		callback  ProgressCallback
+
+		info ProgressInfo
+	}
+	ProgressCallback = func(pi *ProgressContext)
+)
+
+// SetBucketProps sets the properties of a bucket.
 // Validation of the properties passed in is performed by AIStore Proxy.
 func SetBucketProps(baseParams BaseParams, bck cmn.Bck, props cmn.BucketPropsToUpdate, query ...url.Values) (string, error) {
 	b := cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActSetBprops, Value: props})
 	return patchBucketProps(baseParams, bck, b, query...)
 }
 
-// ResetBucketProps API
-//
-// Reset the properties of a bucket, identified by its name, to the global configuration.
+// ResetBucketProps resets the properties of a bucket to the global configuration.
 func ResetBucketProps(baseParams BaseParams, bck cmn.Bck, query ...url.Values) (string, error) {
 	b := cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActResetBprops})
 	return patchBucketProps(baseParams, bck, b, query...)
@@ -46,19 +59,17 @@ func patchBucketProps(baseParams BaseParams, bck cmn.Bck, body []byte, query ...
 	}
 	q = cmn.AddBckToQuery(q, bck)
 	baseParams.Method = http.MethodPatch
-	path := cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name)
+	path := cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name)
 	err = DoHTTPRequest(ReqParams{BaseParams: baseParams, Path: path, Body: body, Query: q}, &xactID)
 	return
 }
 
-// HeadBucket API
-//
-// Returns the properties of a bucket specified by its name.
+// HeadBucket returns the properties of a bucket specified by its name.
 // Converts the string type fields returned from the HEAD request to their
-// corresponding counterparts in the BucketProps struct
+// corresponding counterparts in the cmn.BucketProps struct.
 func HeadBucket(baseParams BaseParams, bck cmn.Bck, query ...url.Values) (p *cmn.BucketProps, err error) {
 	var (
-		path = cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name)
+		path = cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name)
 		q    url.Values
 	)
 	p = &cmn.BucketProps{}
@@ -79,14 +90,13 @@ func HeadBucket(baseParams BaseParams, bck cmn.Bck, query ...url.Values) (p *cmn
 	return
 }
 
-// ListBuckets API
-//
-// provider takes one of Cloud Provider enum names (see cmn/bucket.go). If provider is empty, return all names.
-// Otherwise, return cloud or ais bucket names.
+// ListBuckets returns bucket names for the given provider. Provider takes one
+// of Cloud Provider enum names (see cmn/bucket.go). If provider is empty,
+// return all names. Otherwise, return cloud or ais bucket names.
 func ListBuckets(baseParams BaseParams, queryBcks cmn.QueryBcks) (cmn.BucketNames, error) {
 	var (
 		bucketNames = cmn.BucketNames{}
-		path        = cmn.URLPath(cmn.Version, cmn.Buckets, cmn.AllBuckets)
+		path        = cmn.JoinWords(cmn.Version, cmn.Buckets, cmn.AllBuckets)
 		query       = cmn.AddBckToQuery(nil, cmn.Bck(queryBcks))
 	)
 
@@ -98,9 +108,8 @@ func ListBuckets(baseParams BaseParams, queryBcks cmn.QueryBcks) (cmn.BucketName
 	return bucketNames, nil
 }
 
-// GetBucketsSummaries API
-//
-// Returns bucket summaries for the specified bucket provider (and all bucket summaries for unspecified ("") provider).
+// GetBucketsSummaries returns bucket summaries for the specified bucket provider
+// (and all bucket summaries for unspecified ("") provider).
 func GetBucketsSummaries(baseParams BaseParams, query cmn.QueryBcks, msg *cmn.BucketSummaryMsg) (cmn.BucketsSummaries, error) {
 	if msg == nil {
 		msg = &cmn.BucketSummaryMsg{}
@@ -109,7 +118,7 @@ func GetBucketsSummaries(baseParams BaseParams, query cmn.QueryBcks, msg *cmn.Bu
 
 	reqParams := ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Buckets, query.Name),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Buckets, query.Name),
 		Header:     http.Header{cmn.HeaderContentType: []string{cmn.ContentJSON}},
 		Query:      cmn.AddBckToQuery(nil, cmn.Bck(query)),
 	}
@@ -121,9 +130,7 @@ func GetBucketsSummaries(baseParams BaseParams, query cmn.QueryBcks, msg *cmn.Bu
 	return summaries, nil
 }
 
-// CreateBucket API
-//
-// CreateBucket sends a HTTP request to a proxy to create an ais bucket with the given name
+// CreateBucket sends a HTTP request to a proxy to create an AIS bucket with the given name.
 func CreateBucket(baseParams BaseParams, bck cmn.Bck, ops ...cmn.BucketPropsToUpdate) error {
 	if len(ops) > 1 {
 		return fmt.Errorf("only a single BucketPropsToUpdate parameter can be accepted")
@@ -135,28 +142,24 @@ func CreateBucket(baseParams BaseParams, bck cmn.Bck, ops ...cmn.BucketPropsToUp
 	baseParams.Method = http.MethodPost
 	return DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name),
 		Body:       cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActCreateLB, Value: value}),
 		Query:      cmn.AddBckToQuery(nil, bck),
 	})
 }
 
-// DestroyBucket API
-//
-// DestroyBucket sends a HTTP request to a proxy to remove an ais bucket with the given name
+// DestroyBucket sends a HTTP request to a proxy to remove an AIS bucket with the given name.
 func DestroyBucket(baseParams BaseParams, bck cmn.Bck) error {
 	baseParams.Method = http.MethodDelete
 	return DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name),
 		Body:       cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActDestroyLB}),
 		Query:      cmn.AddBckToQuery(nil, bck),
 	})
 }
 
-// DoesBucketExist API
-//
-// DoesBucketExist queries a proxy or target to get a list of all ais buckets,
+// DoesBucketExist queries a proxy or target to get a list of all AIS buckets,
 // returns true if the bucket is present in the list.
 func DoesBucketExist(baseParams BaseParams, query cmn.QueryBcks) (bool, error) {
 	bcks, err := ListBuckets(baseParams, query)
@@ -166,83 +169,77 @@ func DoesBucketExist(baseParams BaseParams, query cmn.QueryBcks) (bool, error) {
 	return bcks.Contains(query), nil
 }
 
-// CopyBucket API
-//
-// CopyBucket creates a new ais bucket newName and
-// copies into it contents of the existing oldName bucket
-func CopyBucket(baseParams BaseParams, fromBck, toBck cmn.Bck) (xactID string, err error) {
+// CopyBucket copies existing `fromBck` bucket to the destination `toBck` thus,
+// effectively, creating a copy of the `fromBck`.
+// * AIS will create `toBck` on the fly but only if the destination bucket does not
+//   exist and is provided by AIStore (note that Cloud-based `toBck` must exist
+//   for the copy operation to be successful)
+// * There are no limitations on copying buckets across Cloud providers:
+//   you can copy AIS bucket to (or from) AWS bucket, and the latter to Google or Azure
+//   bucket, etc.
+// * Copying multiple buckets to the same destination bucket is also permitted.
+func CopyBucket(baseParams BaseParams, fromBck, toBck cmn.Bck, msgs ...*cmn.CopyBckMsg) (xactID string, err error) {
+	msg := &cmn.CopyBckMsg{}
+	if len(msgs) > 0 && msgs[0] != nil {
+		msg = msgs[0]
+	}
+	msg.BckTo = toBck
 	baseParams.Method = http.MethodPost
 	err = DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Buckets, fromBck.Name),
-		Body:       cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActCopyBucket, Name: toBck.Name}),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Buckets, fromBck.Name),
+		Body:       cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActCopyBucket, Value: msg}),
 	}, &xactID)
 	return
 }
 
-// RenameBucket API
-//
-// RenameBucket changes the name of a bucket from oldName to newBucketName
+// RenameBucket changes the name of a bucket from `oldBck` to `newBck`.
 func RenameBucket(baseParams BaseParams, oldBck, newBck cmn.Bck) (xactID string, err error) {
 	baseParams.Method = http.MethodPost
 	err = DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Buckets, oldBck.Name),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Buckets, oldBck.Name),
 		Body:       cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActRenameLB, Name: newBck.Name}),
 	}, &xactID)
 	return
 }
 
-// DeleteList API
-//
-// DeleteList sends a HTTP request to remove a list of objects from a bucket
-func DeleteList(baseParams BaseParams, bck cmn.Bck, fileslist []string) (string, error) {
-	deleteMsg := cmn.ListMsg{ObjNames: fileslist}
+// DeleteList sends a HTTP request to remove a list of objects from a bucket.
+func DeleteList(baseParams BaseParams, bck cmn.Bck, filesList []string) (string, error) {
+	deleteMsg := cmn.ListMsg{ObjNames: filesList}
 	return doListRangeRequest(baseParams, bck, cmn.ActDelete, deleteMsg)
 }
 
-// DeleteRange API
-//
-// DeleteRange sends a HTTP request to remove a range of objects from a bucket
+// DeleteRange sends a HTTP request to remove a range of objects from a bucket.
 func DeleteRange(baseParams BaseParams, bck cmn.Bck, rng string) (string, error) {
 	deleteMsg := cmn.RangeMsg{Template: rng}
 	return doListRangeRequest(baseParams, bck, cmn.ActDelete, deleteMsg)
 }
 
-// PrefetchList API
-//
-// PrefetchList sends a HTTP request to prefetch a list of objects from a cloud bucket
+// PrefetchList sends a HTTP request to prefetch a list of objects from a cloud bucket.
 func PrefetchList(baseParams BaseParams, bck cmn.Bck, fileslist []string) (string, error) {
 	prefetchMsg := cmn.ListMsg{ObjNames: fileslist}
 	return doListRangeRequest(baseParams, bck, cmn.ActPrefetch, prefetchMsg)
 }
 
-// PrefetchRange API
-//
-// PrefetchRange sends a HTTP request to prefetch a range of objects from a cloud bucket
+// PrefetchRange sends a HTTP request to prefetch a range of objects from a cloud bucket.
 func PrefetchRange(baseParams BaseParams, bck cmn.Bck, rng string) (string, error) {
 	prefetchMsg := cmn.RangeMsg{Template: rng}
 	return doListRangeRequest(baseParams, bck, cmn.ActPrefetch, prefetchMsg)
 }
 
-// EvictList API
-//
-// EvictList sends a HTTP request to evict a list of objects from a cloud bucket
+// EvictList sends a HTTP request to evict a list of objects from a cloud bucket.
 func EvictList(baseParams BaseParams, bck cmn.Bck, fileslist []string) (string, error) {
 	evictMsg := cmn.ListMsg{ObjNames: fileslist}
 	return doListRangeRequest(baseParams, bck, cmn.ActEvictObjects, evictMsg)
 }
 
-// EvictRange API
-//
-// EvictRange sends a HTTP request to evict a range of objects from a cloud bucket
+// EvictRange sends a HTTP request to evict a range of objects from a cloud bucket.
 func EvictRange(baseParams BaseParams, bck cmn.Bck, rng string) (string, error) {
 	evictMsg := cmn.RangeMsg{Template: rng}
 	return doListRangeRequest(baseParams, bck, cmn.ActEvictObjects, evictMsg)
 }
 
-// EvictCloudBucket API
-//
 // EvictCloudBucket sends a HTTP request to a proxy to evict an entire cloud bucket from the AIStore
 // - the operation results in eliminating all traces of the specified cloud bucket in the AIStore
 func EvictCloudBucket(baseParams BaseParams, bck cmn.Bck, query ...url.Values) error {
@@ -250,13 +247,11 @@ func EvictCloudBucket(baseParams BaseParams, bck cmn.Bck, query ...url.Values) e
 	if len(query) > 0 {
 		q = query[0]
 	}
-	if bck.Provider == "" {
-		bck.Provider = cmn.AnyCloud
-	}
+
 	baseParams.Method = http.MethodDelete
 	return DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name),
 		Body:       cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActEvictCB}),
 		Query:      cmn.AddBckToQuery(q, bck),
 	})
@@ -315,72 +310,57 @@ func waitForAsyncReqComplete(reqParams ReqParams, action string, msg *cmn.Bucket
 	return err
 }
 
-// ListObjects API
-
-// ListObjects returns list of objects in a bucket. numObjects is the
-// maximum number of objects returned by ListObjects (0 - return all objects in a bucket)
-func ListObjects(baseParams BaseParams, bck cmn.Bck, smsg *cmn.SelectMsg, numObjects uint) (*cmn.BucketList, error) {
+// ListObjects returns list of objects in a bucket. `numObjects` is the
+// maximum number of objects returned (0 - return all objects in a bucket).
+func ListObjects(baseParams BaseParams, bck cmn.Bck, smsg *cmn.SelectMsg, numObjects uint,
+	args ...*ProgressContext) (bckList *cmn.BucketList, err error) {
 	baseParams.Method = http.MethodPost
-
 	if smsg == nil {
 		smsg = &cmn.SelectMsg{}
-	}
-
-	// An optimization to read as few objects from bucket as possible.
-	// `toRead` is the current number of objects `ListObjects` must read before
-	// returning the list. Every cycle the loop reads objects by pages and
-	// decreases `toRead` by the number of received objects. When `toRead` gets less
-	// than `pageSize`, the loop does the final request with reduced `pageSize`.
-	toRead := numObjects
-	pageSize := smsg.PageSize
-	if pageSize == 0 {
-		pageSize = numObjects
 	}
 
 	// NOTE: No need to preallocate bucket entries slice, we use msgpack so it will do it for us!
 
 	var (
-		err  error
-		q    = cmn.AddBckToQuery(url.Values{}, bck)
-		path = cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name)
+		ctx *ProgressContext
 
-		bckList = &cmn.BucketList{} // List with final result.
-		tmpPage = &cmn.BucketList{} // Temporary page for intermediate results.
+		path      = cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name)
+		hdr       = http.Header{cmn.HeaderAccept: []string{cmn.ContentMsgPack}}
+		q         = cmn.AddBckToQuery(url.Values{}, bck)
+		reqParams = ReqParams{BaseParams: baseParams, Path: path, Header: hdr, Query: q}
+
+		nextPage = &cmn.BucketList{}
+		toRead   = numObjects
+		listAll  = numObjects == 0
 	)
-
+	bckList = &cmn.BucketList{}
 	smsg.UUID = ""
 	smsg.ContinuationToken = ""
+	if len(args) != 0 {
+		ctx = args[0]
+	}
 
-	for iter := 1; ; iter++ {
-		if toRead != 0 && toRead <= pageSize {
+	// `rem` holds the remaining number of objects to list (that is, unless we are listing
+	// the entire bucket). Each iteration lists a page of objects and reduces the `rem`
+	// counter accordingly. When the latter gets below page size, we perform the final
+	// iteration for the reduced page.
+	for pageNum := 1; listAll || toRead > 0; pageNum++ {
+		if !listAll {
 			smsg.PageSize = toRead
 		}
+		actMsg := cmn.ActionMsg{Action: cmn.ActListObjects, Value: smsg}
+		reqParams.Body = cmn.MustMarshal(actMsg)
+		page := nextPage
 
-		var (
-			actMsg    = cmn.ActionMsg{Action: cmn.ActListObjects, Value: smsg}
-			reqParams = ReqParams{
-				BaseParams: baseParams,
-				Path:       path,
-				Header:     http.Header{cmn.HeaderAccept: []string{cmn.ContentMsgPack}},
-				Query:      q,
-				Body:       cmn.MustMarshal(actMsg),
-			}
-		)
-
-		page := tmpPage
-		if iter == 1 {
-			// On first iteration use just `bckList` to prevent additional allocations.
+		if pageNum == 1 {
 			page = bckList
-		} else if iter > 1 {
-			cmn.Assert(smsg.UUID != "")
-			// NOTE: do not try to optimize this code by allocating the page
-			//  on the second iteration and reusing it - it will not work since
-			//  the Unmarshaler/Decoder will reuse the entry pointers what will
-			//  result in duplications and incorrect output.
+		} else {
+			// Do not try to optimize by reusing allocated page as `Unmarshaler`/`Decoder`
+			// will reuse the entry pointers what will result in duplications.
 			page.Entries = nil
 		}
 
-		// Retry with bigger timeout when deadline was exceeded.
+		// Retry with increasing timeout.
 		for i := 0; i < 5; i++ {
 			if _, err = doHTTPRequestGetResp(reqParams, page); err != nil {
 				if errors.Is(err, context.DeadlineExceeded) {
@@ -397,26 +377,27 @@ func ListObjects(baseParams BaseParams, bck cmn.Bck, smsg *cmn.SelectMsg, numObj
 			return nil, err
 		}
 
-		// First iteration uses `bckList` directly so there is no need to append.
-		if iter > 1 {
+		// The first iteration uses the `bckList` directly so there is no need to append.
+		if pageNum > 1 {
 			bckList.Entries = append(bckList.Entries, page.Entries...)
 			bckList.ContinuationToken = page.ContinuationToken
 		}
 
-		if page.ContinuationToken == "" {
+		if ctx != nil && ctx.mustFire() {
+			ctx.info.Count = len(bckList.Entries)
+			if page.ContinuationToken == "" {
+				ctx.finish()
+			}
+			ctx.callback(ctx)
+		}
+
+		if page.ContinuationToken == "" { // Listed all objects.
 			smsg.ContinuationToken = ""
 			break
 		}
 
-		// NOTE: `toRead == 0` means reading all objects with no limit
-		if toRead > 0 {
-			if n := int(toRead) - len(page.Entries); n <= 0 {
-				break
-			} else {
-				toRead = uint(n)
-			}
-		}
-
+		toRead = uint(cmn.Max(int(toRead)-len(page.Entries), 0))
+		cmn.Assert(page.UUID != "")
 		smsg.UUID = page.UUID
 		smsg.ContinuationToken = page.ContinuationToken
 	}
@@ -425,7 +406,7 @@ func ListObjects(baseParams BaseParams, bck cmn.Bck, smsg *cmn.SelectMsg, numObj
 }
 
 // ListObjectsPage returns the first page of bucket objects.
-// On success the function updates smsg.ContinuationToken, so a client can reuse
+// On success the function updates `smsg.ContinuationToken`, so a client can reuse
 // the message to fetch the next page.
 func ListObjectsPage(baseParams BaseParams, bck cmn.Bck, smsg *cmn.SelectMsg) (*cmn.BucketList, error) {
 	baseParams.Method = http.MethodPost
@@ -437,7 +418,7 @@ func ListObjectsPage(baseParams BaseParams, bck cmn.Bck, smsg *cmn.SelectMsg) (*
 		actMsg    = cmn.ActionMsg{Action: cmn.ActListObjects, Value: smsg}
 		reqParams = ReqParams{
 			BaseParams: baseParams,
-			Path:       cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name),
+			Path:       cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name),
 			Header:     http.Header{cmn.HeaderAccept: []string{cmn.ContentMsgPack}},
 			Query:      cmn.AddBckToQuery(url.Values{}, bck),
 			Body:       cmn.MustMarshal(actMsg),
@@ -458,7 +439,7 @@ func ListObjectsPage(baseParams BaseParams, bck cmn.Bck, smsg *cmn.SelectMsg) (*
 func ListObjectsInvalidateCache(params BaseParams, bck cmn.Bck) error {
 	params.Method = http.MethodPost
 	var (
-		path = cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name)
+		path = cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name)
 		q    = url.Values{}
 	)
 	return DoHTTPRequest(ReqParams{
@@ -482,7 +463,7 @@ func doListRangeRequest(baseParams BaseParams, bck cmn.Bck, action string, listR
 	}
 	err = DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name),
 		Body:       cmn.MustMarshal(cmn.ActionMsg{Action: action, Value: listRangeMsg}),
 		Header: http.Header{
 			cmn.HeaderContentType: []string{cmn.ContentJSON},
@@ -494,13 +475,50 @@ func doListRangeRequest(baseParams BaseParams, bck cmn.Bck, action string, listR
 
 func ECEncodeBucket(baseParams BaseParams, bck cmn.Bck, data, parity int) (xactID string, err error) {
 	baseParams.Method = http.MethodPost
-	// without `string` conversion it makes base64 from []byte in `Body`
+	// Without `string` conversion it makes base64 from []byte in `Body`.
 	ecConf := string(cmn.MustMarshal(&cmn.ECConfToUpdate{DataSlices: &data, ParitySlices: &parity}))
 	err = DoHTTPRequest(ReqParams{
 		BaseParams: baseParams,
-		Path:       cmn.URLPath(cmn.Version, cmn.Buckets, bck.Name),
+		Path:       cmn.JoinWords(cmn.Version, cmn.Buckets, bck.Name),
 		Body:       cmn.MustMarshal(cmn.ActionMsg{Action: cmn.ActECEncode, Value: ecConf}),
 		Query:      cmn.AddBckToQuery(nil, bck),
 	}, &xactID)
 	return
+}
+
+func NewProgressContext(cb ProgressCallback, after time.Duration) *ProgressContext {
+	ctx := &ProgressContext{
+		info:      ProgressInfo{Count: -1, Total: -1, Percent: -1.0},
+		startTime: time.Now(),
+		callback:  cb,
+	}
+	if after != 0 {
+		ctx.callAfter = ctx.startTime.Add(after)
+	}
+	return ctx
+}
+
+func (ctx *ProgressContext) finish() {
+	ctx.info.Percent = 100.0
+	if ctx.info.Total > 0 {
+		ctx.info.Count = ctx.info.Total
+	}
+}
+
+func (ctx *ProgressContext) IsFinished() bool {
+	return ctx.info.Percent >= 100.0 ||
+		(ctx.info.Total != 0 && ctx.info.Total == ctx.info.Count)
+}
+
+func (ctx *ProgressContext) Elapsed() time.Duration {
+	return time.Since(ctx.startTime)
+}
+
+func (ctx *ProgressContext) mustFire() bool {
+	return ctx.callAfter.IsZero() ||
+		ctx.callAfter.Before(time.Now())
+}
+
+func (ctx *ProgressContext) Info() ProgressInfo {
+	return ctx.info
 }

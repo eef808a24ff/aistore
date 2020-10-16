@@ -17,10 +17,8 @@ import (
 	"github.com/NVIDIA/aistore/fs"
 )
 
-var (
-	// interface guard
-	_ ExtractCreator = &targzExtractCreator{}
-)
+// interface guard
+var _ ExtractCreator = &targzExtractCreator{}
 
 type targzExtractCreator struct {
 	t cluster.Target
@@ -40,9 +38,7 @@ func (t *targzExtractCreator) ExtractShard(lom *cluster.LOM, r *io.SectionReader
 	if err != nil {
 		return 0, 0, err
 	}
-	defer func() {
-		debug.AssertNoErr(gzr.Close())
-	}()
+	defer cmn.Close(gzr)
 	tr := tar.NewReader(gzr)
 
 	// extract to .tar
@@ -52,11 +48,11 @@ func (t *targzExtractCreator) ExtractShard(lom *cluster.LOM, r *io.SectionReader
 	}
 	tw := tar.NewWriter(f)
 	defer func() {
-		debug.AssertNoErr(tw.Close())
-		debug.AssertNoErr(f.Close())
+		cmn.Close(tw)
+		cmn.Close(f)
 	}()
 
-	buf, slab := t.t.GetMMSA().Alloc(r.Size())
+	buf, slab := t.t.MMSA().Alloc(r.Size())
 	defer slab.Free(buf)
 
 	offset := int64(0)
@@ -85,7 +81,7 @@ func (t *targzExtractCreator) ExtractShard(lom *cluster.LOM, r *io.SectionReader
 		} else if header.Typeflag == tar.TypeReg {
 			data := cmn.NewSizedReader(tr, header.Size)
 
-			var extractMethod = ExtractToMem
+			extractMethod := ExtractToMem
 			if toDisk {
 				extractMethod = ExtractToDisk
 			}
@@ -135,8 +131,8 @@ func (t *targzExtractCreator) CreateShard(s *Shard, tarball io.Writer, loadConte
 
 	defer func() {
 		rdReader.free()
-		debug.AssertNoErr(tw.Close())
-		debug.AssertNoErr(gzw.Close())
+		cmn.Close(tw)
+		cmn.Close(gzw)
 	}()
 
 	for _, rec := range s.Records.All() {

@@ -14,9 +14,18 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/transport/bundle"
+	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 type (
+	// Implements `registry.BucketEntry` and `registry.BucketEntryProvider` interface.
+	xactGetProvider struct {
+		registry.BaseBckEntry
+		xact *XactGet
+	}
+
 	// Erasure coding runner: accepts requests and dispatches them to
 	// a correct mountpath runner. Runner uses dedicated to EC memory manager
 	// inherited by dependent mountpath runners
@@ -25,21 +34,34 @@ type (
 		xactReqBase
 		getJoggers map[string]*getJogger // mountpath joggers for GET
 	}
-)
 
-type (
 	bgProcess = func(req *Request, toDisk bool, cb func(error))
 )
+
+func (*xactGetProvider) New(_ registry.XactArgs) registry.BucketEntry { return &xactGetProvider{} }
+func (p *xactGetProvider) Start(bck cmn.Bck) error {
+	var (
+		xec      = ECM.NewGetXact(bck)
+		idleTime = cmn.GCO.Get().Timeout.SendFile
+	)
+	xec.XactDemandBase = *xaction.NewXactDemandBaseBck(p.Kind(), bck, idleTime)
+	xec.InitIdle()
+	p.xact = xec
+	go xec.Run()
+	return nil
+}
+func (*xactGetProvider) Kind() string        { return cmn.ActECGet }
+func (p *xactGetProvider) Get() cluster.Xact { return p.xact }
 
 //
 // XactGet
 //
 
-func NewGetXact(t cluster.Target, bck cmn.Bck, reqBundle, respBundle *transport.StreamBundle) *XactGet {
+func NewGetXact(t cluster.Target, bck cmn.Bck, reqBundle, respBundle *bundle.Streams) *XactGet {
 	XactCount.Inc()
 	availablePaths, disabledPaths := fs.Get()
 	totalPaths := len(availablePaths) + len(disabledPaths)
-	smap, si := t.GetSowner(), t.Snode()
+	smap, si := t.Sowner(), t.Snode()
 
 	runner := &XactGet{
 		getJoggers:  make(map[string]*getJogger, totalPaths),
@@ -287,7 +309,7 @@ func (r *XactGet) removeMpath(mpath string) {
 }
 
 type GetTargetStats struct {
-	cmn.BaseXactStats
+	xaction.BaseXactStats
 	Ext ExtECGetStats `json:"ext"`
 }
 
@@ -298,13 +320,11 @@ type ExtECGetStats struct {
 	AvgQueueLen float64          `json:"ec.queue.len.n"`
 }
 
-var (
-	// interface guard
-	_ cmn.XactStats = &GetTargetStats{}
-)
+// interface guard
+var _ cluster.XactStats = &GetTargetStats{}
 
-func (r *XactGet) Stats() cmn.XactStats {
-	baseStats := r.XactBase.Stats().(*cmn.BaseXactStats)
+func (r *XactGet) Stats() cluster.XactStats {
+	baseStats := r.XactBase.Stats().(*xaction.BaseXactStats)
 	getStats := GetTargetStats{BaseXactStats: *baseStats}
 	st := r.stats.stats()
 	getStats.Ext.AvgTime = cmn.DurationJSON(st.DecodeTime.Nanoseconds())

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/containers"
@@ -31,7 +32,8 @@ const (
 )
 
 var (
-	proxyURLReadOnly string // user-defined primary proxy URL - it is read-only variable and tests mustn't change it
+	proxyURLReadOnly string          // user-defined primary proxy URL - it is read-only variable and tests mustn't change it
+	pmapReadOnly     cluster.NodeMap // initial proxy map - it is read-only variable
 
 	transportArgs = cmn.TransportArgs{
 		Timeout:          600 * time.Second,
@@ -66,16 +68,19 @@ func init() {
 	HTTPClientGetPut = cmn.NewClient(transportArgs)
 
 	initProxyURL()
+	initPmap()
 	initRemoteCluster()
 	initAuthToken()
 }
 
 func initProxyURL() {
-	envVars := cmn.ParseEnvVariables(dockerEnvFile)                    // Gets the fields from the .env file from which the docker was deployed
-	primaryHostIP, port := envVars["PRIMARY_HOST_IP"], envVars["PORT"] // Host IP and port of primary cluster
+	// Gets the fields from the .env file from which the docker was deployed
+	envVars := cmn.ParseEnvVariables(dockerEnvFile)
+	// Host IP and port of primary cluster
+	primaryHostIP, port := envVars["PRIMARY_HOST_IP"], envVars["PORT"]
 
 	proxyURLReadOnly = proxyURL
-	if containers.DockerRunning() && proxyURLReadOnly == proxyURL {
+	if containers.DockerRunning() {
 		proxyURLReadOnly = "http://" + primaryHostIP + ":" + port
 	}
 
@@ -93,9 +98,29 @@ func initProxyURL() {
 	// Finds who is the current primary proxy.
 	primary, err := GetPrimaryProxy(proxyURLReadOnly)
 	if err != nil {
-		cmn.Exitf("Failed to get primary proxy, err = %v", err)
+		fmt.Printf("Failed to reach primary proxy at %s\n", proxyURLReadOnly)
+		fmt.Printf("Error: %s\n", strings.TrimSuffix(err.Error(), "\n"))
+		fmt.Println("Environment variables:")
+		fmt.Printf("\t%s:\t%s\n", cmn.EnvVars.Endpoint, os.Getenv(cmn.EnvVars.Endpoint))
+		fmt.Printf("\t%s:\t%s\n", cmn.EnvVars.PrimaryID, os.Getenv(cmn.EnvVars.PrimaryID))
+		fmt.Printf("\t%s:\t%s\n", cmn.EnvVars.SkipVerifyCrt, os.Getenv(cmn.EnvVars.SkipVerifyCrt))
+		fmt.Printf("\t%s:\t%s\n", cmn.EnvVars.UseHTTPS, os.Getenv(cmn.EnvVars.UseHTTPS))
+		if len(envVars) > 0 {
+			fmt.Println("Docker Environment:")
+			for k, v := range envVars {
+				fmt.Printf("\t%s:\t%s\n", k, v)
+			}
+		}
+		cmn.Exitf("")
 	}
 	proxyURLReadOnly = primary.URL(cmn.NetworkPublic)
+}
+
+func initPmap() {
+	baseParams := BaseAPIParams(proxyURLReadOnly)
+	smap, err := waitForStartup(baseParams)
+	cmn.AssertNoErr(err)
+	pmapReadOnly = smap.Pmap
 }
 
 func initRemoteCluster() {

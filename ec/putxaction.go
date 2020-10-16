@@ -12,10 +12,18 @@ import (
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/transport/bundle"
+	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xaction/registry"
 )
 
 type (
+	// Implements `registry.BucketEntryProvider` and `registry.BucketEntry` interface.
+	xactPutProvider struct {
+		registry.BaseBckEntry
+		xact *XactPut
+	}
+
 	// Erasure coding runner: accepts requests and dispatches them to
 	// a correct mountpath runner. Runner uses dedicated to EC memory manager
 	// inherited by dependent mountpath runners
@@ -26,15 +34,30 @@ type (
 	}
 )
 
+func (*xactPutProvider) New(_ registry.XactArgs) registry.BucketEntry { return &xactPutProvider{} }
+func (p *xactPutProvider) Start(bck cmn.Bck) error {
+	var (
+		xec      = ECM.NewPutXact(bck)
+		idleTime = cmn.GCO.Get().Timeout.SendFile
+	)
+	xec.XactDemandBase = *xaction.NewXactDemandBaseBck(p.Kind(), bck, idleTime)
+	xec.InitIdle()
+	p.xact = xec
+	go xec.Run()
+	return nil
+}
+func (*xactPutProvider) Kind() string        { return cmn.ActECPut }
+func (p *xactPutProvider) Get() cluster.Xact { return p.xact }
+
 //
-// XactGet
+// XactPut
 //
 
-func NewPutXact(t cluster.Target, bck cmn.Bck, reqBundle, respBundle *transport.StreamBundle) *XactPut {
+func NewPutXact(t cluster.Target, bck cmn.Bck, reqBundle, respBundle *bundle.Streams) *XactPut {
 	XactCount.Inc()
 	availablePaths, disabledPaths := fs.Get()
 	totalPaths := len(availablePaths) + len(disabledPaths)
-	smap, si := t.GetSowner(), t.Snode()
+	smap, si := t.Sowner(), t.Snode()
 	runner := &XactPut{
 		putJoggers:  make(map[string]*putJogger, totalPaths),
 		xactECBase:  newXactECBase(t, smap, si, bck, reqBundle, respBundle),
@@ -215,7 +238,7 @@ func (r *XactPut) dispatchRequest(req *Request) {
 }
 
 type PutTargetStats struct {
-	cmn.BaseXactStats
+	xaction.BaseXactStats
 	Ext ExtECPutStats `json:"ext"`
 }
 
@@ -231,13 +254,11 @@ type ExtECPutStats struct {
 	AvgQueueLen    float64          `json:"ec.queue.len.n"`
 }
 
-var (
-	// interface guard
-	_ cmn.XactStats = &PutTargetStats{}
-)
+// interface guard
+var _ cluster.XactStats = &PutTargetStats{}
 
-func (r *XactPut) Stats() cmn.XactStats {
-	baseStats := r.XactBase.Stats().(*cmn.BaseXactStats)
+func (r *XactPut) Stats() cluster.XactStats {
+	baseStats := r.XactBase.Stats().(*xaction.BaseXactStats)
 	putStats := PutTargetStats{BaseXactStats: *baseStats}
 	st := r.stats.stats()
 	putStats.Ext.AvgEncodeTime = cmn.DurationJSON(st.EncodeTime.Nanoseconds())

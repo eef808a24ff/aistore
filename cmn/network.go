@@ -19,9 +19,7 @@ const (
 	NetworkIntraData    = "intra_data"
 )
 
-var (
-	KnownNetworks = []string{NetworkPublic, NetworkIntraControl, NetworkIntraData}
-)
+var KnownNetworks = []string{NetworkPublic, NetworkIntraControl, NetworkIntraData}
 
 type (
 	// Options to create a transport for HTTP client
@@ -51,10 +49,13 @@ func ParsePort(p string) (int, error) {
 		return 0, err
 	}
 
+	return ValidatePort(port)
+}
+
+func ValidatePort(port int) (int, error) {
 	if port <= 0 || port >= (1<<16) {
 		return 0, fmt.Errorf("port number (%d) should be between 1 and 65535", port)
 	}
-
 	return port, nil
 }
 
